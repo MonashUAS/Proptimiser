@@ -1,0 +1,12 @@
+pyvista
+trame
+trame-vtk
+trame-vuetify
+trame-matplotlib
+matplotlib
+numpy
+jax
+jaxopt
+optax
+scipy
+equinox
