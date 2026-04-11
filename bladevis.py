@@ -13,7 +13,7 @@ state, ctrl = server.state, server.controller
 # --- Initial State ---
 state.header_title = "Proptimiser: Blade Flow Visualisation"
 state.N = 2
-state.R = 1.0
+state.R = 0.3
 state.chord_root = 0.2
 state.chord_tip = 0.05
 state.beta_root = 45

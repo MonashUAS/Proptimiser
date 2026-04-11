@@ -15,7 +15,7 @@ from dataclasses import replace
 # Internal Libraries
 from init import Inputs, Params
 from airfoil import aero_coeffs
-from airflow import tip_root_loss_factors, inflow_model
+from airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskEfficiency
 
 
 ### Integrand Functions
@@ -59,7 +59,7 @@ def dT_blade(V_ia, params):
     C_L, C_D, C_M = aero_coeffs(V_ia, params)
 
     # Tip and Root Loss Factors
-    tip_loss, root_loss = tip_root_loss_factors(params)
+    tip_loss,root_loss = tip_root_loss_factors(V_ia,params)
 
     # Blade Element Theory about annular element
     dT_blade =( 
@@ -194,7 +194,6 @@ def thrust(V_ia, params):
 
     # Numerically Compute Double Integral to Solve for Thrust
     T = jnp.trapezoid(jnp.trapezoid(dT, r, axis=0), psi)
-    
     return T
 
 def power(V_ia, params):
@@ -274,6 +273,9 @@ def flatblade(R, c, beta, N, plot=False):
     T = thrust(V_ia, params)
     
     print("Total Thrust:", T)
+
+    actuatorEffiency = equivelantActuatorDiskEfficiency(T,params)
+    print("Actuator effiency:", actuatorEffiency)
     if plot==True:
         # Plot heatmap
         fig, ax = plt.subplots(subplot_kw={"projection": "polar"})
@@ -332,6 +334,5 @@ if __name__ == "__main__":
         plt.show()
 
     elif demo_solve == "flat":
-        c = np.ones_like(r)
+        c = np.ones_like(Inputs.n_r)
         flatblade(1, 0.1, np.pi/8, 2, plot=True)
-

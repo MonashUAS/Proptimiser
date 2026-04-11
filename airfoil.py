@@ -3,7 +3,7 @@ import jax
 from jax import numpy as jnp
 from jax import lax
 import matplotlib.pyplot as plt
-from init import Inputs
+from init import Inputs,Params
 from airflow import calc_phi
 
 ## ---Parametric Coefficients---
@@ -33,7 +33,8 @@ def parametric_coeffs(V_ia, params, plot=False):
 
     # Coefficients in non-stall region
     C_L_unstall = C_La * alphaabs                                                          # Lift Coefficient
-    C_T_unstall = C_D0 * jnp.cos(alphaabs)                                                 # Tangential Force Coefficient
+    C_T_unstall = C_D0 * jnp.cos(alphaabs)
+    C_L_unstall = jnp.minimum(C_La * alphaabs, 1.2) # 1.2 is a typical max Cl for thin airfoils                                                 # Tangential Force Coefficient
     C_N_unstall = (C_L_unstall + C_T_unstall*jnp.sin(alphaabs)) / (jnp.cos(alphaabs))      # Normal Force Coefficient
     C_D_unstall = C_N_unstall * jnp.sin(alphaabs) + C_T_unstall* jnp.cos(alphaabs)         # Drag Coefficient
     C_M_unstall = -C_N_unstall*(0.25-0.175*(1-2*alphaabs/jnp.pi))                          # Moment Coefficient
@@ -84,7 +85,8 @@ def aero_coeffs(V_ia, params):
     return C_L, C_D, C_M
 
 
-if __name__ == "__main__":
-
-    V_ia = 0
-    parametric_coeffs()
+#if __name__ == "__main__":
+#    from propmodel import induced_velocity
+#
+#    V_ia = induced_velocity(Params)
+#    parametric_coeffs()

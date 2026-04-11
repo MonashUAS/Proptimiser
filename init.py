@@ -7,7 +7,7 @@ class Inputs(eqx.Module):
     # Optimisation / design settings which remain constant during execution
 
     # Outer-loop optimisation (Optax / similar)
-    opt_max_iter: int = 200
+    opt_max_iter: int = 100
     opt_tol: float = 1e-3
 
     # Newton solver settings
@@ -17,22 +17,20 @@ class Inputs(eqx.Module):
 
     # Thrust constraint
     solvertype: str = "T"
-    thrust: float = 100.0 # Newtons
+    thrust: float = 15 # Newtons
 
     # Normalisation for Power (update with flat-plate guess)
     power_scale: float = 1000
 
     # Smoothness Constraints
-    lambda_beta_smooth: float = 1e-4*power_scale
-    lambda_chord_smooth: float = 1e-4*power_scale
-
-
+    lambda_beta_smooth: float = 1e-1*power_scale
+    lambda_chord_smooth: float = 1e-1*power_scale
 
     ## Discretisation settings
     # Radial discretisation
-    n_r: int = 15
+    n_r: int = 30
     # Azimuthal discretisation (for skewed inflow)
-    n_psi: int = 20
+    n_psi: int = 30
 
     ## Physical / modelling flags
     use_prandtl_tip_loss: bool = False
@@ -46,7 +44,7 @@ class Inputs(eqx.Module):
     inflow_model: int = 1   # 0 = basic, 1 = Pitt & Peters, 2 = DTU
     coeff_method: int = 0 # 0 = parametric, 1 = lookup table
     tip_loss_model: int = 0 # 0 = none, 1 = Prandtl
-    root_loss_model: int = 0 # 0 = none, 1 = Prandtl
+    root_loss_model: int = 1 # 0 = none, 1 = Prandtl
 
 class Params(eqx.Module):
     '''
@@ -106,5 +104,4 @@ def blade_design_mask(params: Params):
         # Physical properties
         rho=False
     )
-
 

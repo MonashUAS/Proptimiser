@@ -54,28 +54,43 @@ def inflow_model(V_ia_0, params):
     return lax.switch(Inputs.inflow_model, [simple, pitt_peters, dtu_model], V_ia_0, params)
 
 ##  Tip and Root Loss Models (0: No loss, 1: Prandtl) 
-def no_loss(params):
+def no_loss(test):
     ''' 
     Returns a unity loss factor (no loss applied).
     '''
-    return jnp.ones(Inputs.n_r)[:, None]
+    V_ia,params = test
+    return jnp.ones_like(V_ia)
+def prandtl_tip_loss(test):
+    eps = 1e-6
+    V_ia, params = test
+    f_tip = params.N/2 * (params.R - params.r) / (params.r * (jnp.abs(jnp.sin(calc_phi(V_ia, params))) + eps))
+    F_tip = 2/jnp.pi * jnp.arccos(f_tip)
+    return F_tip
 
-def prandtl_tip_loss(params):
-    ''' 
-    Placeholder for the Prandtl tip loss model. 
-    '''
-    return jnp.ones(Inputs.n_r)[:, None]
+def prandtl_root_loss(test):
+    eps = 1e-6
+    V_ia, params = test
+    f_root = params.N/2 * (params.r - 0.05) / (0.05 * (jnp.abs(jnp.sin(calc_phi(V_ia, params))) + eps))
+    
+    # exp(-f_root) can exceed 1.0 slightly due to floating point
+    arg = jnp.clip(jnp.exp(-f_root), -1.0, 1.0)
+    F_root = 2/jnp.pi * jnp.arccos(arg)
+    return F_root
 
-def prandtl_root_loss(params):
-    ''' 
-    Placeholder for the Prandtl root loss model.
-    '''
-    return jnp.ones(Inputs.n_r)[:, None]
-
-def tip_root_loss_factors(params):
+def tip_root_loss_factors(V_ia,params):
     ''' 
     Computes and returns both tip and root loss factors via model selection.
     '''
-    tip_loss = lax.switch(Inputs.tip_loss_model, [no_loss, prandtl_tip_loss], params)
-    root_loss = lax.switch(Inputs.root_loss_model, [no_loss, prandtl_root_loss], params)
+    tip_loss = lax.switch(Inputs.tip_loss_model, [no_loss, prandtl_tip_loss],(V_ia,params))
+    root_loss = lax.switch(Inputs.root_loss_model, [no_loss, prandtl_root_loss], (V_ia,params))
     return tip_loss, root_loss
+
+def equivelantActuatorDiskEfficiency(T,params):
+    '''
+    Computes the equivalent actuator effiency for the given conditions, useful as a measure 
+    of the optimality, with this effiency representing the theoretical maximum effiency (never attainable).
+    '''
+    massFlowRate = jnp.pi*(params.R)**2*params.rho*params.V_x #Mass flow rate (continuity eq.)
+    actuatorDistWakeVelocity = T/massFlowRate - params.V_x
+    equivActEfficiency = params.V_x/ (params.V_x + ((1/2) * (actuatorDistWakeVelocity + params.V_x)))
+    return equivActEfficiency

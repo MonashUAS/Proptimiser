@@ -1,135 +1,180 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 import jaxopt
 import matplotlib.pyplot as plt
-
+from dataclasses import replace
 from init import Params, Inputs
 import propmodel
 
+#Curvature penalty 
 def curvature_penalty(x):
-    '''
-    Discrete Second-Derivative Penalty (Approximation)
-    '''
-    d2 = x[2:]-2.0*x[1:-1]+x[:-2]
+    d2 = x[2:] - 2.0 * x[1:-1] + x[:-2]
+    return jnp.mean(d2**2)
 
-    return jnp.sum(d2**2)
+#Returns the power, thrust error and smoothness penalty
+def base_objective(c, beta, params_static):
+    params = replace(params_static, c=c, beta=beta)
+    V_ia   = propmodel.induced_velocity(params)
 
+    power  = jnp.squeeze(propmodel.power(V_ia, params))
+    thrust = jnp.squeeze(propmodel.thrust(V_ia, params))
 
+    thrust_err = thrust - Inputs.thrust
+
+    smooth_penalty = (
+        Inputs.lambda_beta_smooth  * curvature_penalty(beta[:,0]) +
+        Inputs.lambda_chord_smooth * curvature_penalty(c[:,0])
+    )
+    return power, thrust_err, smooth_penalty
+
+#Scaled Aug. lagrangian, returns the actual Lagrangian 
+def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, lmbda, mu):
+    c_scaled, beta_scaled = opt_vars_scaled
+
+    c = c_scaled*c_scale
+    beta = beta_scaled*beta_scale
+
+    power, thrust_err, smooth_penalty = base_objective(c, beta, params_static)
+
+    return (
+        power
+        + lmbda * thrust_err
+        + 0.5 * mu * thrust_err**2
+        + smooth_penalty
+    )
+
+#Gradient scaling (compute c and beta scales)
+def compute_gradient_scales(init_c, init_beta, params_static):
+    def unscaled_loss(vars_unscaled):
+        c, beta = vars_unscaled
+        power, thrust_err, smooth_penalty = base_objective(c, beta, params_static)
+        return power + 0.5 * thrust_err**2 + smooth_penalty
+
+    grad_fn = jax.grad(unscaled_loss)
+    grad_c, grad_beta = grad_fn((init_c, init_beta))
+
+    norm_c = jnp.linalg.norm(grad_c)
+    norm_beta = jnp.linalg.norm(grad_beta)
+
+    c_scale    = 1/(norm_c + 1e-8)
+    beta_scale = 1/(norm_beta + 1e-8)
+
+    return c_scale, beta_scale
+
+# Optimisation
 def run_optimization():
-    '''
-    WIP. Code currently doesn't solve, and a re-implementation is required.
-    '''
-    # 64 Bit Precision, otherwise thrust residuals don't converge
     jax.config.update("jax_enable_x64", True)
-    # --- 1. Setup ---
+
+    # Geometry setup
     psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
-    r, dr = propmodel.radial_stops(0.5, 0.05, Inputs.n_r)
-    V_ia_0 = jnp.full_like(r, 10.0)
+    r, dr = propmodel.radial_stops(0.35, 0.05, Inputs.n_r)
 
-    # Initial Guesses
     init_c = jnp.full((len(r), 1), 0.01)
-    init_beta = jnp.full((len(r), 1), jnp.radians(10.0))
-    init_vars = (init_c, init_beta)
+    init_beta = jnp.full((len(r), 1), jnp.radians(10))
 
-    # Initial static parameters
     params_static = Params(
-        N=2.0, R=jnp.array([0.15]),
+        N=2,
+        R=jnp.array([0.35]),
         c=init_c,
         beta=init_beta,
         r=r[:, None], dr=dr,
         psi=psi[None, :], dpsi=dpsi,
-        V_x=jnp.array([10.0]), V_yz=jnp.array([2.0]),
-        omega=jnp.array([400.0]),
-        V_ia_0=V_ia_0[:, None]
+        V_x=jnp.array([10]), V_yz=jnp.array([2]),
+        omega=jnp.array([400]),
+        V_ia_0=jnp.full_like(r[:, None], 10)
     )
 
-    # --- 2. Define Bounds ---
-    # Chord: 1mm to 50mm | Beta: 2 deg to 70 deg
-    lower_bounds = (jnp.full_like(init_c, 0.001), jnp.full_like(init_beta, jnp.radians(2.0)))
-    upper_bounds = (jnp.full_like(init_c, 0.050), jnp.full_like(init_beta, jnp.radians(70.0)))
+    #Calculate the gradient scales
+    c_scale, beta_scale = compute_gradient_scales(init_c, init_beta, params_static)
 
-    # --- 3. Objective Function (with Penalty) ---
-    def objective_fn(opt_vars, lmbda, mu):
-        c, beta = opt_vars
-        if Inputs.verbose:
-            jax.debug.print("Current Mean Chord: {x}", x=jnp.mean(c))
-        
-        # Build the param object for the model
-        params = params_static.__replace__(c=c, beta=beta)
-        
-        # Solve for induced velocity
-        V_ia = propmodel.induced_velocity(params)
-        
-        # Calculate performance
-        power = jnp.squeeze(propmodel.power(V_ia, params))
-        thrust = jnp.squeeze(propmodel.thrust(V_ia, params))
-        
-        # Penalty Function for Thrust
-        thrust_err = thrust - Inputs.thrust
-
-        # Smoothness/Continuity Penalty 
-        smooth_beta = curvature_penalty(beta)
-        smooth_chord = curvature_penalty(c)
-
-        smooth_penalty = (
-            Inputs.lambda_beta_smooth*smooth_beta+
-            Inputs.lambda_chord_smooth*smooth_chord
+    # Scale initial variables
+    vars_scaled = (
+        init_c/c_scale,
+        init_beta/beta_scale
+    )
+    #Bounds (chord + beta pairs) (scaled)
+    bounds = (
+        (
+            jnp.full_like(init_c, 0.001/c_scale),
+            jnp.full_like(init_beta, jnp.radians(2) / beta_scale),
+        ),
+        (
+            jnp.full_like(init_c, 0.05/c_scale),
+            jnp.full_like(init_beta, jnp.radians(70) / beta_scale),
         )
-        
-        # Augmented Lagrangian: Obj + (L * err) + (mu/2 * err^2)
-        # Using a heavy penalty (mu) ensures the thrust constraint is met
-        return power + lmbda * thrust_err + 0.5 * mu * (thrust_err**2) + smooth_penalty
+    )
+    #Solver
+    solver = jaxopt.ScipyBoundedMinimize(fun=objective_fn,method="L-BFGS-B",tol=1e-8,maxiter=1000
+    )
 
-    # --- 4. Optimization Loop ---
-    # (L-BFGS-B) for outer loop optimisation allows implementing constraints, 
-    solver = jaxopt.ScipyBoundedMinimize(fun=objective_fn, method="L-BFGS-B", tol=Inputs.opt_tol)
-    
-    '''
-    Janky initial solver loop just to get a propeller converging.
-    '''
-    
-    curr_vars = init_vars
-    lmbda = 0.0
-    mu = 10.0 # Initial stiffness for thrust
+    #Augmented Lagrangian params
+    lmbda = 0
+    mu = 1
+    mu_max = 1e7
+    mu_scale = 2
+    eta_tol = 1e-4
 
-    print(f"{'Iter':<6} | {'Total Loss':<12} | {'Thrust Err':<12} | {'Mu':<10}")
-    print("-" * 55)
+    #Set arbtitrarily high to initiate solver 
+    prev_err = 1e12
+    print(f"{'Iter':<6} | {'Power':<12} | {'Thrust Err':<12} | {'Lambda':<12} | {'Mu':<10}")
+    print("-" * 65)
 
-    for i in range(50):
-        # Solve the sub-problem
-        sol = solver.run(curr_vars, bounds=(lower_bounds, upper_bounds), lmbda=lmbda, mu=mu)
-        curr_vars = sol.params
-        
-        # Check physical error
-        c_final, beta_final = curr_vars
-        params_final = params_static.__replace__(c=c_final, beta=beta_final)
-        V_ia_final = propmodel.induced_velocity(params_final)
-        t_final = jnp.squeeze(propmodel.thrust(V_ia_final, params_final))
-        thrust_err = t_final - Inputs.thrust
-        
-        print(f"{i:<6} | {sol.state.fun_val:<12.4f} | {thrust_err:<12.4e} | {mu:<10.1f}")
+    for i in range(100):
+        sol = solver.run(
+            vars_scaled,
+            bounds=bounds,
+            params_static=params_static,
+            c_scale=c_scale,
+            beta_scale=beta_scale,
+            lmbda=lmbda,
+            mu=mu
+        )
 
-        # Update Multipliers
-        lmbda += mu * thrust_err
-        mu *= 2.0  # Aggressively increase penalty stiffness
-        
-        if abs(thrust_err) < 1e-4:
+        vars_scaled = sol.params
+
+        #Unscale
+        c = vars_scaled[0] * c_scale
+        beta = vars_scaled[1] * beta_scale
+
+        power, thrust_err, _ = base_objective(c, beta, params_static)
+
+        print(f"{i:<6} | {float(power):<12.4f} | {float(thrust_err):<12.4e} | {lmbda:<12.4f} | {mu:<10.1f}")
+
+        # Convergence
+        if abs(thrust_err) < eta_tol:
+            print(f"\nConverged at iteration {i} with thrust error {thrust_err:.2e}")
             break
 
-    return params_final
+        #AL update
+        if abs(thrust_err) > 0.25 * prev_err:
+            mu = min(mu * mu_scale, mu_max)
 
+        lmbda += mu * thrust_err
+        prev_err = abs(thrust_err)
+
+    else:
+        print(f"\nWarning: max iterations reached. Final thrust error: {thrust_err:.2e}")
+        
+    return replace(params_static, c=c, beta=beta)
+
+#Run + plotting
 if __name__ == "__main__":
     params_opt = run_optimization()
 
-    # Unpack Parameters
     r = params_opt.r
-    c, beta = params_opt.c, params_opt.beta
-    # --- 5. Visualization ---
-    plt.figure(figsize=(10, 4))
-    plt.subplot(1, 2, 1)
-    plt.plot(r, c)
-    plt.title("Optimized Chord (m)")
-    plt.subplot(1, 2, 2)
-    plt.plot(r, jnp.degrees(beta))
-    plt.title("Optimized Beta (deg)")
+    c = params_opt.c
+    beta = params_opt.beta
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    axes[0].plot(r / params_opt.R, c / params_opt.R)
+    axes[0].set_title("Chord (m)")
+    axes[0].set_xlabel("r/R")
+
+    axes[1].plot(r / params_opt.R, jnp.degrees(beta))
+    axes[1].set_title("Twist (deg)")
+    axes[1].set_xlabel("r/R")
+
+    plt.tight_layout()
     plt.show()
