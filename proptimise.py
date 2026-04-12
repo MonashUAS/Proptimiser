@@ -29,7 +29,6 @@ def base_objective(c, beta, params_static):
 
     thrust_err = thrust - Inputs.thrust
 
-    torque = jnp.squeeze(propmodel.torque(V_ia, params))
     #torque = jnp.squeeze(propmodel.torque(V_ia, params))
 
     smooth_penalty = (
@@ -59,19 +58,8 @@ def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, lmbda, mu)
 
 #Gradient scaling (compute c and beta scales)
 def compute_gradient_scales(init_c, init_beta, params_static):
-    def unscaled_loss(vars_unscaled):
-        c, beta = vars_unscaled
-        power, thrust_err, smooth_penalty = base_objective(c, beta, params_static)
-        return power + 0.5 * thrust_err**2 + smooth_penalty
-
-    grad_fn = jax.grad(unscaled_loss)
-    grad_c, grad_beta = grad_fn((init_c, init_beta))
-
-    norm_c = jnp.linalg.norm(grad_c)
-    norm_beta = jnp.linalg.norm(grad_beta)
-
-    c_scale    = 1/(norm_c + 1e-8)
-    beta_scale = 1/(norm_beta + 1e-8)
+    c_scale    = 1000
+    beta_scale = 1
 
     return c_scale, beta_scale
 
@@ -96,7 +84,8 @@ def run_optimization():
         psi=psi[None, :], dpsi=dpsi,
         V_x=jnp.array([10]), V_yz=jnp.array([2]),
         omega=jnp.array([2*jnp.pi*8000/60]),
-        V_ia_0=jnp.full_like(r[:, None], 14)
+        V_ia_0=jnp.full_like(r[:, None], jnp.array([14.0])) # make sure to enter a floating point number (eg 14.0)
+                                # Tiling and shape adjustment has been moved to inflow model calcs
     )
 
     #Calculate the gradient scales

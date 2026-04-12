@@ -24,9 +24,7 @@ def calc_phi(V_ia, params):
     Computes the inflow angle phi based on local velocity components.
     TODO FInish deprecation of this function
     '''
-    V_x, V_yz, omega, r, psi = params.V_x, params.V_yz, params.omega, params.r, params.psi
-    V_yz_perp = V_yz * jnp.sin(psi)
-    return jnp.arctan((V_x + V_ia) / (omega * r + V_yz_perp))
+    raise(NotImplementedError("This function has been deprecated, please modify code to use the 'resultantVelocityComponents' function"))
 
 
 ##  Inflow Model Definitions (0: Simple, 1: Pitt-Peters, 2: DTU) 
@@ -39,12 +37,14 @@ def simple(V_ia_0, params):
     Output: 
         V_ia: Inflow velocity at each azimuthal and radial station (size N_r * N_psi)
     '''
-    return jnp.tile(V_ia_0, (1, Inputs.n_psi))
+
+    V_ia = V_ia_0 * jnp.ones([Inputs.n_r, Inputs.n_psi])
+
+    return V_ia
 
 
 def pitt_peters(V_ia_0, params):
     ''' 
-    
     Computes skewed rotor inflow using the Pitt & Peters (1981) model.
 
     Takes in V_ia_0 which is expected to be size N_r
@@ -55,7 +55,10 @@ def pitt_peters(V_ia_0, params):
     V_x, V_yz, r, psi, R = params.V_x, params.V_yz, params.r, params.psi, params.R
     
     xi = jnp.arctan(V_yz / (V_x + V_ia_0))  # wake skew angle
-    return V_ia_0 * (1 + ((15 * jnp.pi) / 32) * jnp.tan(xi / 2) * (r / R) * jnp.cos(psi))
+    
+    V_ia = V_ia_0 * (1 + ((15 * jnp.pi) / 32) * jnp.tan(xi / 2) * (r / R) * jnp.cos(psi))
+
+    return V_ia
 
 
 def dtu_model(V_ia_0, params):
@@ -72,6 +75,37 @@ def inflow_model(V_ia_0, params):
     Switches between inflow models based on global configuration.
     '''
     return lax.switch(Inputs.inflow_model, [simple_inflow, pitt_peters, dtu_model], *(V_ia_0,params))
+
+
+def resultantVelocityComponents(V_ia, params, plotting=False):
+    '''
+    Calculates the magnitude of the relative velocity at each station of the propeller, and the inflow angle phi
+    
+    As per equation (2) in "A propeller model for general forward flight conditions" [Waqas Khan and Meyer Nolan 2015]
+    
+    Implemented here for purposes of reducing repeated code (helps with debugging!)
+
+    TODO Debug plot implementation
+    '''
+
+    # Unpack params
+    V_x, omega, r, V_yz, psi = params.V_x, params.omega, params.r, params.V_yz, params.psi
+
+    # Calculate the normal component of V_yz from the tocal V_yz
+    V_yz_perp = V_yz * jnp.sin(psi)
+
+    # Calculate V_R from the magnitude of the vector sum of the individual components
+    V_axial_net = V_x + V_ia
+    V_norml_net = omega*r + V_yz_perp
+    V_R = jnp.sqrt(jnp.square(V_axial_net) + jnp.square(V_norml_net))
+
+    # Using the same components we can efficiently calculate phi
+    phi = jnp.arctan(V_axial_net / V_norml_net)
+
+    if plotting:
+        raise(NotImplementedError("Debug plotting not currently supported by the 'resultantVelocityComponents' function (airflow.py)"))
+
+    return V_R, phi
 
 
 ##  Tip and Root Loss Models (0: No loss, 1: Prandtl) 
@@ -94,7 +128,7 @@ def prandtl_tip_loss(V_ia, params):
     B = params.N
     R = params.R
     r = params.r
-    phi = jnp.abs(calc_phi(V_ia, params))
+    phi = jnp.abs(resultantVelocityComponents(V_ia, params)[1]) # get only second output
 
     f_tip = B/2 * (R - r) / (r * jnp.sin(phi)) 
     
@@ -120,7 +154,7 @@ def prandtl_root_loss(V_ia, params):
     B = params.N
     R_hub = 0.05
     r = params.r
-    phi = jnp.abs(calc_phi(V_ia, params))
+    phi = jnp.abs(resultantVelocityComponents(V_ia, params)[1]) # get only second output
 
     f_root = B/2 * (r - R_hub) / (r * jnp.sin(phi) + eps) 
     

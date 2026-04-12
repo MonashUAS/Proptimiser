@@ -14,8 +14,8 @@ from dataclasses import replace
 
 # Internal Libraries
 from init import Inputs, Params
-from airfoil import aero_coeffs
-from airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskEfficiency
+from airfoil import parametric_coeffs
+from airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskEfficiency, resultantVelocityComponents
 
 
 ### Integrand Functions
@@ -55,52 +55,66 @@ def dT_blade(V_ia, params):
 
     Assumes: |V_yz| < |V_x + V_ia| -> Assumption that the annuli do not interact with each other 
     """
+    
     # Unpack parameters
-    N, c, r, psi = params.N, params.c, params.r, params.psi
-    V_x, V_yz, omega = params.V_x, params.V_yz, params.omega
-    rho = params.rho
+    N, c, dr, psi = params.N, params.c, params.dr, params.psi # geometric and positional values
+    rho = params.rho # air density
 
     # Calculate Local Flow Properties
-    V_yz_perp = V_yz * jnp.sin(psi)                                     # Perpendicular component of velocity in yz plane
-    phi = jnp.arctan((V_x + V_ia)/(omega * r + V_yz_perp))              # Angle of attack
-    V_rel = jnp.sqrt((V_x + V_ia) ** 2 + (omega * r + V_yz_perp) ** 2)  # relative velocity
+    V_R, phi = resultantVelocityComponents(V_ia, params)
+    
     # Get Aerodynamic Coefficients
-    C_L, C_D, C_M = aero_coeffs(V_ia, params)
+    C_L, C_D, _ = parametric_coeffs(V_ia, params)
 
     # Tip and Root Loss Factors
-    tip_loss,root_loss = tip_root_loss_factors(V_ia,params)
+    tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
 
-    # Blade Element Theory about annular element
-    dT_blade =( 
-        (N / (4 * jnp.pi)) * rho 
-        * c * V_rel ** 2 
-        * (C_L * jnp.cos(phi) - C_D * jnp.sin(phi))
-        # tip and root loss factors
-        * tip_loss * root_loss
-        )
-    return dT_blade
+    # Calculate the total prandtl loss correction factor
+    F = jnp.multiply(tip_loss, root_loss)
+
+    # Blade Element Theory instantaneous thrust element
+    dT_blade_instantaneous = 0.5 * rho * c * (V_R**2) * (C_L*jnp.cos(phi) - C_D*jnp.sin(phi)) * F * dr[:, None]
+    
+    # Average thrust in each annulus over one rotation (using formulation from the text prior to statement of eqn. 6)
+    # Average thrust per annulus is the integral of the instantaneous thrust element divided by 2*pi
+    dT_blade = 1/(2*jnp.pi) * jnp.trapezoid(dT_blade_instantaneous, psi, axis=1)
+
+    return dT_blade, dT_blade_instantaneous
 
 
 def dT_momentum(V_ia, params):
     """
-    Calculate thrust integrand using momentum theory at radial and azimuthal stops
+    Calculate thrust integrand across each annulus for each radial station using momentum theory
 
-    Uses formulation from (M. Nahon et al., 2015)
+    Uses formulation from (M. Nahon et al., 2015) equation 9
 
-    Outputs: dT_momentum (Nr, Npsi)
+    Outputs: dT_momentum (Nr, 1)
+             dT_momentum_instantaneous w/ size (Nr, Npsi)
+
+    Assumes: |V_yz| < |V_x + V_ia| -> Assumption that the annuli do not interact with each other 
     """
     # Unpack parameters
-    r = params.r
+    r, dr, psi = params.r, params.dr, params.psi
     V_x, V_yz = params.V_x, params.V_yz
     rho = params.rho
 
+    # total velocity through each differential segment
+    V_prime = jnp.sqrt((V_x + V_ia) ** 2 + V_yz ** 2)
+
+    # Tip and Root Loss Factors
+    tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
+
+    # Calculate the total prandtl loss correction factor
+    F = jnp.multiply(tip_loss, root_loss) 
+
     # Momentum theory about annular element 
-    dT_momentum = (2 * rho * r * V_ia * jnp.sqrt((V_x + V_ia) ** 2 + V_yz ** 2))  
+    dT_momentum_instantaneous = 2 * rho * r * V_ia * V_prime * F * dr[:, None]  
+    dT_momentum = jnp.trapezoid(dT_momentum_instantaneous, psi, axis=1)
 
-    return dT_momentum
+    return dT_momentum, dT_momentum_instantaneous
 
 
-def thrust_residual(V_ia_0, params):
+def thrust_residual(V_ia_0_guess, params):
     """
     Calculate thrust residual at radial stops (difference between blade+momentum theory)
 
@@ -111,16 +125,18 @@ def thrust_residual(V_ia_0, params):
     dimensionality of problem is reduced)
     """
 
-    # Unpack Parameters
-    psi = params.psi
-
     # Establish induced velocity from inflow model
-    V_ia = inflow_model(V_ia_0, params)
+    V_ia = inflow_model(V_ia_0_guess, params)
 
-    # Establish thrust residual and integrate about annulus
-    dT_residual = dT_blade(V_ia, params)-dT_momentum(V_ia, params)
-    T_residual = jnp.trapezoid(dT_residual, psi, axis=1)
-    return T_residual[:,None]
+    # Calculate the instantaneous blade element and momentum theory thrust elements:
+
+    dT_BEMT_average, _ = dT_blade(V_ia, params) # get the average elements (1st output) only
+
+    dT_MMNT_average, _ = dT_momentum(V_ia, params) # get the average elements (1st output) only
+
+    dT_residual = dT_BEMT_average - dT_MMNT_average
+    
+    return dT_residual
 
 
 ### Outputs
@@ -136,7 +152,7 @@ def induced_velocity(params):
     '''
 
     # Unpack initial guess for induced velocity distribution
-    V_ia_init = params.V_ia_0   # shape (Nr, 1)
+    V_ia_init = inflow_model(params.V_ia_0, params)
 
     # Debug Check Initial Residuals
     if Inputs.verbose:
@@ -147,13 +163,13 @@ def induced_velocity(params):
         print("Residual min/max:", res_check.min(), res_check.max())
 
     # Newton Solver for Induced Velocity
-    solver = jaxopt.Broyden(fun=thrust_residual, maxiter=100, tol=Inputs.newton_eps, max_stepsize=0.8, implicit_diff=True)
+    solver = jaxopt.Broyden(fun=thrust_residual, maxiter=100, tol=Inputs.newton_eps, max_stepsize=1.0, implicit_diff=True)
     # Input initial guess for induced velocity and solve. (Induced velocity is parametrised per radial stop)
     (V_ia_0, info) = solver.run(V_ia_init, params)
 
     # Debug Check Final Residuals
     if Inputs.verbose:
-        res_check = thrust_residual(V_ia_0, params)
+        res_check = thrust_residual(params.V_ia_0, params)
         print("Residuals Check:", res_check)
 
     V_ia = inflow_model(V_ia_0, params)
@@ -179,7 +195,7 @@ def dQ_blade(V_ia,params):
     phi = jnp.arctan((V_x + V_ia)/(omega * r + V_yz_perp))              # Angle of attack
     V_rel = jnp.sqrt((V_x + V_ia) ** 2 + (omega * r + V_yz_perp) ** 2)  # Relative velocity
     # Get Aerodynamic Coefficients
-    C_L, C_D, C_M = aero_coeffs(V_ia, params)
+    C_L, C_D, C_M = parametric_coeffs(V_ia, params)
 
     # Tip and Root Loss Factors
     tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
@@ -214,11 +230,12 @@ def thrust(V_ia, params):
     '''
     Calculate total thrust from solved induced velocity
     '''
-    r, psi = params.r, params.psi
-    dT = dT_momentum(V_ia,params)
+    r = jnp.squeeze(params.r)
+    dT = dT_momentum(V_ia,params)[0]
 
     # Numerically Compute Double Integral to Solve for Thrust
-    T = jnp.trapezoid(jnp.trapezoid(dT, r, axis=0), psi)
+    T = jnp.trapezoid(dT, r)
+
     return T
 
 
