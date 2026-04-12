@@ -22,6 +22,7 @@ def calc_reynolds(rho, V, c, mu):
 def calc_phi(V_ia, params):
     ''' 
     Computes the inflow angle phi based on local velocity components.
+    TODO FInish deprecation of this function
     '''
     V_x, V_yz, omega, r, psi = params.V_x, params.V_yz, params.omega, params.r, params.psi
     V_yz_perp = V_yz * jnp.sin(psi)
@@ -32,6 +33,11 @@ def calc_phi(V_ia, params):
 def simple(V_ia_0, params):
     ''' 
     Applies a simple uniform inflow model across all azimuthal angles.
+
+    Takes in V_ia_0 which is expected to be size N_r
+
+    Output: 
+        V_ia: Inflow velocity at each azimuthal and radial station (size N_r * N_psi)
     '''
     return jnp.tile(V_ia_0, (1, Inputs.n_psi))
 
@@ -40,24 +46,32 @@ def pitt_peters(V_ia_0, params):
     ''' 
     
     Computes skewed rotor inflow using the Pitt & Peters (1981) model.
+
+    Takes in V_ia_0 which is expected to be size N_r
+
+    Output: 
+        V_ia: Inflow velocity at each azimuthal and radial station (size N_r * N_psi)
     '''
     V_x, V_yz, r, psi, R = params.V_x, params.V_yz, params.r, params.psi, params.R
+    
     xi = jnp.arctan(V_yz / (V_x + V_ia_0))  # wake skew angle
     return V_ia_0 * (1 + ((15 * jnp.pi) / 32) * jnp.tan(xi / 2) * (r / R) * jnp.cos(psi))
 
 
 def dtu_model(V_ia_0, params):
     ''' 
-    Placeholder for the DTU inflow model; currently defaults to uniform inflow.
+    Placeholder for the DTU inflow model; currently defaults to uniform inflow (simple model).
+    TODO Implement DTU model
     '''
-    return jnp.tile(V_ia_0, (1, Inputs.n_psi))
+
+    return simple_inflow(V_ia_0, params)
 
 
 def inflow_model(V_ia_0, params):
     ''' 
     Switches between inflow models based on global configuration.
     '''
-    return lax.switch(Inputs.inflow_model, [simple, pitt_peters, dtu_model], V_ia_0, params)
+    return lax.switch(Inputs.inflow_model, [simple_inflow, pitt_peters, dtu_model], *(V_ia_0,params))
 
 
 ##  Tip and Root Loss Models (0: No loss, 1: Prandtl) 

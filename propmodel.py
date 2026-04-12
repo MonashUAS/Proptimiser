@@ -41,11 +41,19 @@ def angular_stops(n_psi):
 ### Thrust Calculations
 def dT_blade(V_ia, params):
     """
-    Calculate thrust integrand using blade element theory at radial and azimuthal stops
+    Calculate instantaneous thrust force for each radial and azimuthal element
 
-    Uses formulation from (M. Nahon et al., 2015)
+    dT_blade_instantaneous
+    Uses formulation from (M. Nahon et al., 2015) equation 5 modified with the inclusion of the prandtl loss parameter 'F'
 
-    Outputs: dT_blade (Nr, Npsi)
+    dT_blade
+    Uses formulation from (M. Nahon et al., 2015) equation 6 modified with the inclusion of the prandtl loss parameter 'F'
+    
+    Outputs:
+        dT_blade w/ size (Nr, 1) 
+        dT_blade_instantaneous w/ size (Nr, Npsi)
+
+    Assumes: |V_yz| < |V_x + V_ia| -> Assumption that the annuli do not interact with each other 
     """
     # Unpack parameters
     N, c, r, psi = params.N, params.c, params.r, params.psi
@@ -96,6 +104,7 @@ def thrust_residual(V_ia_0, params):
     """
     Calculate thrust residual at radial stops (difference between blade+momentum theory)
 
+    Takes the difference at each azimuthal stop, then integrates in the azimuthal direction
 
     (may extrapolate to radial+azimuthal stops later, 
     but for now skew rotor inflow is most complex and 
@@ -117,9 +126,13 @@ def thrust_residual(V_ia_0, params):
 ### Outputs
 def induced_velocity(params):
     '''
-    Output Induced Velocity from Input Parameters
-
-    Unpack the Induced Velocity, compute thrust residual and then converge using jaxopt.Broyden (L-BFGS-B)
+    Calculates the axial induced velocity (neglects the radial and tangential induced velocity) for
+    the propeller. 
+    
+    Refer to figure 3 of "A propeller model for general forward flight conditions"
+    [Waqas Khan and Meyer Nolan 2015] for insight into variables. 
+    
+    Same paper used for equations
     '''
 
     # Unpack initial guess for induced velocity distribution
@@ -211,8 +224,7 @@ def thrust(V_ia, params):
 
 def power(V_ia, params):
     '''
-    Calculates the arodynamic Power of Propeller (W) in the purely axial direction
-    using Momentum Theory.
+    Calculates the aerodynamic Power of Propeller (W) using Momentum Theory.
 
     DO NOT USE THIS FUNCTION FOR DETERMINING THE POWER INPUT FOR THE PROPELLER
     '''
@@ -234,7 +246,7 @@ def power(V_ia, params):
 
 def mechanicalPower(V_ia, params):
     '''
-    Calculates and returns the shaft power applied to the propeller 
+    Calculates and returns the shaft power (W) applied to the propeller 
     '''    
 
     # Unpack Params
@@ -256,7 +268,13 @@ def actuator_disk_power(V_ia, power):
     Calculate Ideal Actuator Disk Power for same thrust
 
     UNFINISHED CODE
+
+    TODO Implement actuator thrust
+    TODO FInish this code
     '''
+
+    raise(NotImplementedError("This function is yet to be implemented"))
+
     T = actuator_thrust(V_ia,params)
     V_x = params.V_x
 
@@ -269,6 +287,8 @@ def flatblade(R, c, beta, N, plot=False):
     '''
     Flat Blade Demo Model. Inputs a blade of fixed chord and radial distribution 
     and solves+plots induced velocity.
+
+    TODO Fix function (chord and beta not declared properly)
     '''
     # 
     # Debug NAN's and enable 64 bit precision
@@ -331,7 +351,7 @@ if __name__ == "__main__":
     # single is single annulus solver
     # flat is simple flat blade solver
     # input allows importing of a json file 
-    demo_solve = "flat"
+    demo_solve = "single"
 
     # Single Annulus Solver
     if demo_solve == "single":

@@ -8,6 +8,11 @@ from init import Params, Inputs
 import propmodel
 
 
+# Set jax debugging
+jax.config.update("jax_traceback_filtering", "quiet_remove_frames")
+jax.config.update("jax_check_tracer_leaks", "on")
+jax.config.update("jax_disable_jit", True)
+
 #Curvature penalty 
 def curvature_penalty(x):
     d2 = x[2:] - 2.0 * x[1:-1] + x[:-2]
@@ -25,6 +30,7 @@ def base_objective(c, beta, params_static):
     thrust_err = thrust - Inputs.thrust
 
     torque = jnp.squeeze(propmodel.torque(V_ia, params))
+    #torque = jnp.squeeze(propmodel.torque(V_ia, params))
 
     smooth_penalty = (
         Inputs.lambda_beta_smooth  * curvature_penalty(beta[:,0]) +
@@ -78,8 +84,8 @@ def run_optimization():
     psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
     r, dr = propmodel.radial_stops(0.225, 0.05, Inputs.n_r)
 
-    init_c = jnp.full((len(r), 1), 0.01)
-    init_beta = jnp.full((len(r), 1), jnp.radians(10))
+    init_c = jnp.full((Inputs.n_r, 1), 0.02)
+    init_beta = jnp.full((Inputs.n_r, 1), jnp.radians(0))
 
     params_static = Params(
         N=2,
@@ -104,12 +110,12 @@ def run_optimization():
     #Bounds (chord + beta pairs) (scaled)
     bounds = (
         (
-            jnp.full_like(init_c, 0.001/c_scale),
-            jnp.full_like(init_beta, jnp.radians(2) / beta_scale),
+            jnp.full_like(params_static.c, 0.001/c_scale),
+            jnp.full_like(params_static.beta, jnp.radians(2) / beta_scale),
         ),
         (
-            jnp.full_like(init_c, 0.05/c_scale),
-            jnp.full_like(init_beta, jnp.radians(70) / beta_scale),
+            jnp.full_like(params_static.c, 0.05/c_scale),
+            jnp.full_like(params_static.beta, jnp.radians(70) / beta_scale),
         )
     )
     #Solver
@@ -160,6 +166,31 @@ def run_optimization():
 
         lmbda += mu * thrust_err
         prev_err = abs(thrust_err)
+
+
+        V_ia   = propmodel.induced_velocity(params_static)
+
+        dT_mom = propmodel.dT_momentum(V_ia, params_static)[0]
+        dT_bld = propmodel.dT_blade(V_ia, params_static)[0]
+
+        fig, axes = plt.subplots(3, 1, figsize=(6, 10))
+
+        axes[0].plot(r, c)
+        axes[0].stem(r, c)
+        axes[0].set_title("Chord (m)")
+        axes[0].set_xlabel("r/R")
+
+        axes[1].plot(r, jnp.degrees(beta))
+        axes[1].stem(r, jnp.degrees(beta))
+        axes[1].set_title("Twist (deg)")
+        axes[1].set_xlabel("r/R")
+
+        axes[2].plot(r, dT_mom, label="Momentum")
+        axes[2].plot(r, dT_bld, label="BEMT")
+        axes[2].legend()
+
+        plt.tight_layout()
+        plt.show()
 
     else:
         print(f"\nWarning: max iterations reached. Final thrust error: {thrust_err:.2e}")

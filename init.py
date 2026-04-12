@@ -11,13 +11,13 @@ class Inputs(eqx.Module):
     opt_tol: float = 1e-3
 
     # Newton solver settings
-    newton_max_iter: int = 100
-    newton_eps: float = 1e-4
+    newton_max_iter: int = 1000
+    newton_eps: float = 1e-3
     newton_damping: float = 0.1
 
     # Thrust constraint
     solvertype: str = "T"
-    thrust: float = 50 # Newtons
+    thrust: float = 25 # Newtons
 
     # Normalisation for Power (update with flat-plate guess)
     power_scale: float = 1000
@@ -28,16 +28,16 @@ class Inputs(eqx.Module):
 
     ## Discretisation settings
     # Radial discretisation
-    n_r: int = 50
+    n_r: int = 15
     # Azimuthal discretisation (for skewed inflow)
-    n_psi: int = 36
+    n_psi: int = 9
 
     # Diagnostics / debugging
     verbose: bool = False
     record_convergence_history: bool = False
 
     # Model Selection
-    inflow_model: int = 1 # 0 = basic, 1 = Pitt & Peters, 2 = DTU
+    inflow_model: int = 0 # 0 = basic, 1 = Pitt & Peters, 2 = DTU
     coeff_method: int = 0 # 0 = parametric, 1 = lookup table
     tip_loss_model: int = 0 # 0 = none, 1 = Prandtl
     root_loss_model: int = 0 # 0 = none, 1 = Prandtl
@@ -65,10 +65,11 @@ class Params(eqx.Module):
 
     # Inflow / rotor state
     V_x: jnp.ndarray        # axial inflow velocity (ms^{-1})
-    V_yz: jnp.ndarray       # tangential / side inflow velocity (ms^{-1})
+    V_yz: jnp.ndarray       # In plane inflow velocity (ms^{-1})
     omega: jnp.ndarray      # rotational speed (rad/s)
+    #V_R: jnp.ndarray        # Net resultant velocity magnitude (ms^-1) at each radial and azimuthal station
 
-    V_ia_0: jnp.ndarray     # initial guess/storage for V_ia_0 (ms^{-1})
+    V_ia_0: float     # initial guess/storage for V_ia_0 (ms^{-1})
 
     # Physical properties
     rho: float = 1.225      # air density (kgm^{-3})
@@ -91,6 +92,7 @@ def blade_design_mask(params: Params):
         R=False,
         c=True,
         beta=True,
+
         # Inflow / rotor state
         V_x=False,
         V_yz=False,

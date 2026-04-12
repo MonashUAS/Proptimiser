@@ -5,7 +5,6 @@ from jax import lax
 import matplotlib.pyplot as plt
 from init import Inputs,Params
 from airflow import calc_phi
-import propmodel
 
 ## ---Parametric Coefficients---
 # (good for approximate analysis, use LUT for more accuracy)
@@ -14,6 +13,9 @@ def parametric_coeffs(V_ia, params, plot=False):
 
     '''
     Return parametric estimations of lift, drag, and moment coefficients based on angle of attack
+
+    Modelled on the ARAD10 airfoil
+
     Calculate effective angle of attack for the airfoil.
 
     For plots and a rundown of the theory, see (M. Nahon, 2015)
@@ -69,6 +71,7 @@ def parametric_coeffs(V_ia, params, plot=False):
     
     return C_L, C_D, C_M
 
+
 def lookup_coeffs(V_ia, params):
     '''
     Placeholder for future lookup table implementation, 
@@ -91,10 +94,13 @@ def aero_coeffs(V_ia, params):
 
 
 if __name__ == "__main__":
+    # perform this import locally as we only need it for unit tests and could cause
+    # a circular import error if loaded at the top of the file
 
+    import propmodel as pmod
     # Geometry setup
-    psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
-    r, dr = propmodel.radial_stops(0.225, 0.05, Inputs.n_r)
+    psi, dpsi = pmod.angular_stops(Inputs.n_psi)
+    r, dr = pmod.radial_stops(0.225, 0.05, Inputs.n_r)
 
     init_c = jnp.full((len(r), 1), 0.01)
     init_beta = jnp.full((len(r), 1), jnp.radians(10))
