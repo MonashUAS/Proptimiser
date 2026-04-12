@@ -5,6 +5,7 @@ from jax import lax
 import matplotlib.pyplot as plt
 from init import Inputs,Params
 from airflow import calc_phi
+import propmodel
 
 ## ---Parametric Coefficients---
 # (good for approximate analysis, use LUT for more accuracy)
@@ -53,13 +54,17 @@ def parametric_coeffs(V_ia, params, plot=False):
 
     if plot:
         # Debug plot of parametric coefficients
-        plt.plot(jnp.degrees(alpha), C_L)
-        plt.plot(jnp.degrees(alpha), C_D)
-        plt.plot(jnp.degrees(alpha), C_M)
-        plt.legend(["C_L", "C_D"])
-        plt.title("Parametric Lift, Drag and Moment Coefficient vs Angle of Attack")
-        plt.xlabel("Angle of Attack (degrees)")
-        plt.ylabel("Lift Coefficient C_L")
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+        axes[0].plot(jnp.degrees(alpha), C_L)
+        axes[0].set_title("C_L")
+        axes[0].set_xlabel("alpha")
+
+        axes[1].plot(jnp.degrees(alpha), C_D)
+        axes[1].set_title("C_D")
+        axes[1].set_xlabel("alpha")
+
+        plt.tight_layout()
         plt.show()
     
     return C_L, C_D, C_M
@@ -85,8 +90,25 @@ def aero_coeffs(V_ia, params):
     return C_L, C_D, C_M
 
 
-#if __name__ == "__main__":
-#    from propmodel import induced_velocity
-#
-#    V_ia = induced_velocity(Params)
-#    parametric_coeffs()
+if __name__ == "__main__":
+
+    # Geometry setup
+    psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
+    r, dr = propmodel.radial_stops(0.225, 0.05, Inputs.n_r)
+
+    init_c = jnp.full((len(r), 1), 0.01)
+    init_beta = jnp.full((len(r), 1), jnp.radians(10))
+
+    params_static = Params(
+        N=2,
+        R=jnp.array([0.35]),
+        c=init_c,
+        beta=init_beta,
+        r=r[:, None], dr=dr,
+        psi=psi[None, :], dpsi=dpsi,
+        V_x=jnp.array([10]), V_yz=jnp.array([2]),
+        omega=jnp.array([2*jnp.pi*8000/60]),
+        V_ia_0=jnp.full_like(r[:, None], 14)
+    )
+
+    parametric_coeffs(jnp.full_like(r[:, None], 0), params_static, True)

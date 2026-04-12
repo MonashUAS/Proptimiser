@@ -17,7 +17,7 @@ class Inputs(eqx.Module):
 
     # Thrust constraint
     solvertype: str = "T"
-    thrust: float = 15 # Newtons
+    thrust: float = 50 # Newtons
 
     # Normalisation for Power (update with flat-plate guess)
     power_scale: float = 1000
@@ -28,23 +28,19 @@ class Inputs(eqx.Module):
 
     ## Discretisation settings
     # Radial discretisation
-    n_r: int = 30
+    n_r: int = 50
     # Azimuthal discretisation (for skewed inflow)
-    n_psi: int = 30
-
-    ## Physical / modelling flags
-    use_prandtl_tip_loss: bool = False
-    use_prandtl_root_loss: bool = False
+    n_psi: int = 36
 
     # Diagnostics / debugging
     verbose: bool = False
     record_convergence_history: bool = False
 
     # Model Selection
-    inflow_model: int = 1   # 0 = basic, 1 = Pitt & Peters, 2 = DTU
+    inflow_model: int = 1 # 0 = basic, 1 = Pitt & Peters, 2 = DTU
     coeff_method: int = 0 # 0 = parametric, 1 = lookup table
     tip_loss_model: int = 0 # 0 = none, 1 = Prandtl
-    root_loss_model: int = 1 # 0 = none, 1 = Prandtl
+    root_loss_model: int = 0 # 0 = none, 1 = Prandtl
 
 class Params(eqx.Module):
     '''
