@@ -7,26 +7,32 @@ from dataclasses import replace
 from init import Params, Inputs
 import propmodel
 
+
 #Curvature penalty 
 def curvature_penalty(x):
     d2 = x[2:] - 2.0 * x[1:-1] + x[:-2]
     return jnp.mean(d2**2)
+
 
 #Returns the power, thrust error and smoothness penalty
 def base_objective(c, beta, params_static):
     params = replace(params_static, c=c, beta=beta)
     V_ia   = propmodel.induced_velocity(params)
 
-    power  = jnp.squeeze(propmodel.power(V_ia, params))
+    power  = jnp.squeeze(propmodel.mechanicalPower(V_ia, params))
     thrust = jnp.squeeze(propmodel.thrust(V_ia, params))
 
     thrust_err = thrust - Inputs.thrust
+
+    torque = jnp.squeeze(propmodel.torque(V_ia, params))
 
     smooth_penalty = (
         Inputs.lambda_beta_smooth  * curvature_penalty(beta[:,0]) +
         Inputs.lambda_chord_smooth * curvature_penalty(c[:,0])
     )
+
     return power, thrust_err, smooth_penalty
+
 
 #Scaled Aug. lagrangian, returns the actual Lagrangian 
 def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, lmbda, mu):
@@ -43,6 +49,7 @@ def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, lmbda, mu)
         + 0.5 * mu * thrust_err**2
         + smooth_penalty
     )
+
 
 #Gradient scaling (compute c and beta scales)
 def compute_gradient_scales(init_c, init_beta, params_static):
@@ -62,13 +69,14 @@ def compute_gradient_scales(init_c, init_beta, params_static):
 
     return c_scale, beta_scale
 
+
 # Optimisation
 def run_optimization():
     jax.config.update("jax_enable_x64", True)
 
     # Geometry setup
     psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
-    r, dr = propmodel.radial_stops(0.35, 0.05, Inputs.n_r)
+    r, dr = propmodel.radial_stops(0.225, 0.05, Inputs.n_r)
 
     init_c = jnp.full((len(r), 1), 0.01)
     init_beta = jnp.full((len(r), 1), jnp.radians(10))
@@ -81,8 +89,8 @@ def run_optimization():
         r=r[:, None], dr=dr,
         psi=psi[None, :], dpsi=dpsi,
         V_x=jnp.array([10]), V_yz=jnp.array([2]),
-        omega=jnp.array([400]),
-        V_ia_0=jnp.full_like(r[:, None], 10)
+        omega=jnp.array([2*jnp.pi*8000/60]),
+        V_ia_0=jnp.full_like(r[:, None], 14)
     )
 
     #Calculate the gradient scales
@@ -113,7 +121,7 @@ def run_optimization():
     mu = 1
     mu_max = 1e7
     mu_scale = 2
-    eta_tol = 1e-4
+    eta_tol = 1e-3
 
     #Set arbtitrarily high to initiate solver 
     prev_err = 1e12
@@ -158,21 +166,24 @@ def run_optimization():
         
     return replace(params_static, c=c, beta=beta)
 
+
 #Run + plotting
 if __name__ == "__main__":
     params_opt = run_optimization()
 
-    r = params_opt.r
-    c = params_opt.c
+    r = params_opt.r * 1000 # get r in mm
+    c = params_opt.c * 1000 # get c in mm
     beta = params_opt.beta
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
     axes[0].plot(r / params_opt.R, c / params_opt.R)
+    axes[0].stem(r / params_opt.R, c / params_opt.R)
     axes[0].set_title("Chord (m)")
     axes[0].set_xlabel("r/R")
 
     axes[1].plot(r / params_opt.R, jnp.degrees(beta))
+    axes[1].stem(r / params_opt.R, jnp.degrees(beta))
     axes[1].set_title("Twist (deg)")
     axes[1].set_xlabel("r/R")
 

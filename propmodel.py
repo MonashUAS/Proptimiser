@@ -28,6 +28,7 @@ def radial_stops(R, r_hub, n_r):
     dr = jnp.ones_like(r)*(R - r_hub) / n_r
     return r, dr
 
+
 def angular_stops(n_psi):
     '''
     Return angular node centers and dpsi for integration
@@ -71,6 +72,7 @@ def dT_blade(V_ia, params):
         )
     return dT_blade
 
+
 def dT_momentum(V_ia, params):
     """
     Calculate thrust integrand using momentum theory at radial and azimuthal stops
@@ -88,6 +90,7 @@ def dT_momentum(V_ia, params):
     dT_momentum = (2 * rho * r * V_ia * jnp.sqrt((V_x + V_ia) ** 2 + V_yz ** 2))  
 
     return dT_momentum
+
 
 def thrust_residual(V_ia_0, params):
     """
@@ -109,6 +112,7 @@ def thrust_residual(V_ia_0, params):
     dT_residual = dT_blade(V_ia, params)-dT_momentum(V_ia, params)
     T_residual = jnp.trapezoid(dT_residual, psi, axis=1)
     return T_residual[:,None]
+
 
 ### Outputs
 def induced_velocity(params):
@@ -142,13 +146,14 @@ def induced_velocity(params):
     V_ia = inflow_model(V_ia_0, params)
     return V_ia
 
+
 def dQ_blade(V_ia,params):
     '''
     Calculate Torque Integrand using Blade Element Theory at radial and aizmuthal stops.
 
     Uses formulation from (M. Nahon et al., 2015)
 
-    Outputs: dT_momentum (Nr, Npsi)
+    Outputs: dQ_momentum (Nr, Npsi)
     """
     '''
     # Unpack parameters
@@ -164,7 +169,7 @@ def dQ_blade(V_ia,params):
     C_L, C_D, C_M = aero_coeffs(V_ia, params)
 
     # Tip and Root Loss Factors
-    tip_loss, root_loss = tip_root_loss_factors(params)
+    tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
 
     # Blade Element Theory about annular element
     dQ_blade =( 
@@ -176,14 +181,21 @@ def dQ_blade(V_ia,params):
         )
     return dQ_blade
 
+
 def torque(V_ia, params):
     """
     Integrate to find Total Torque of Propeller
     """
-    dQ_blade = dQ_blade(V_ia, params)
+    r, psi = params.r, params.psi
+    dQ = dQ_blade(V_ia, params)
 
-    Q = jnp.trapezoid(jnp.trapezoid(dQ_blade, psi, axis=1)*r, r)
+    # Numerically Compute Double Integral to Solve for Torque
+    inner = jnp.trapezoid(dQ, psi, axis=1)
+    inner_r = jnp.squeeze(inner) * jnp.squeeze(r)
+    Q = jnp.trapezoid(jnp.squeeze(inner_r), jnp.squeeze(r))
+
     return Q
+
 
 def thrust(V_ia, params):
     '''
@@ -196,9 +208,13 @@ def thrust(V_ia, params):
     T = jnp.trapezoid(jnp.trapezoid(dT, r, axis=0), psi)
     return T
 
+
 def power(V_ia, params):
     '''
-    Calculate Power of Propeller (W) using Momentum Theory
+    Calculates the arodynamic Power of Propeller (W) in the purely axial direction
+    using Momentum Theory.
+
+    DO NOT USE THIS FUNCTION FOR DETERMINING THE POWER INPUT FOR THE PROPELLER
     '''
 
     # Unpack Params
@@ -207,13 +223,33 @@ def power(V_ia, params):
     V_x = params.V_x
     V = V_ia+V_x 
 
-    # Elemental Thrust
+    # Elemental torque
     dT = dT_momentum(V_ia, params)
 
     dP = dT*V
 
     P = jnp.trapezoid(jnp.trapezoid(dP,r,axis=0),psi)
     return P
+
+
+def mechanicalPower(V_ia, params):
+    '''
+    Calculates and returns the shaft power applied to the propeller 
+    '''    
+
+    # Unpack Params
+    omega = params.omega
+    # Calculate Local Axial Flow Velocity
+
+    # net torque over one rotation
+    Q = torque(V_ia, params)
+
+    # Net mechanical power (omega in rad/s, torque in Nm)
+    P = Q * omega
+
+    return jnp.squeeze(P)
+
+
 
 def actuator_disk_power(V_ia, power):
     '''
@@ -227,6 +263,7 @@ def actuator_disk_power(V_ia, power):
     V_ind_mean = jnp.mean(V_ia)
 
     return P_actuator
+
 
 def flatblade(R, c, beta, N, plot=False):
     '''
@@ -287,6 +324,7 @@ def flatblade(R, c, beta, N, plot=False):
         plt.show()
 
     return params, V_ia, T
+
 
 if __name__ == "__main__":
     ## Demo Cases of BEMT
