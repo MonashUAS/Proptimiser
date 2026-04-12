@@ -38,7 +38,7 @@ def simple_inflow(V_ia_0, params):
         V_ia: Inflow velocity at each azimuthal and radial station (size N_r * N_psi)
     '''
 
-    V_ia = jnp.tile(V_ia_0, [1, Inputs.n_psi])
+    V_ia = V_ia_0 * jnp.ones_like(params.psi)
 
     return V_ia
 
@@ -74,7 +74,10 @@ def inflow_model(V_ia_0, params):
     ''' 
     Switches between inflow models based on global configuration.
     '''
-    return lax.switch(Inputs.inflow_model, [simple_inflow, pitt_peters, dtu_model], *(V_ia_0,params))
+    # Tile V_ia_0 to (Nr,1) before performing calcs
+
+    V_ia_0 = V_ia_0[:,None]
+    return lax.switch(Inputs.inflow_model, [simple_inflow, pitt_peters, dtu_model], *(V_ia_0, params))
 
 
 def resultantVelocityComponents(V_ia, params, plotting=False):

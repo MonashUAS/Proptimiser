@@ -10,8 +10,8 @@ import propmodel
 
 # Set jax debugging
 jax.config.update("jax_traceback_filtering", "quiet_remove_frames")
-jax.config.update("jax_check_tracer_leaks", "off")
-jax.config.update("jax_disable_jit", False)
+jax.config.update("jax_check_tracer_leaks", "on")
+jax.config.update("jax_disable_jit", True)
 
 #Curvature penalty 
 def curvature_penalty(x):
@@ -21,6 +21,7 @@ def curvature_penalty(x):
 
 #Returns the power, thrust error and smoothness penalty
 def base_objective(c, beta, params_static):
+
     params = replace(params_static, c=c, beta=beta)
     V_ia   = propmodel.induced_velocity(params)
 
@@ -48,12 +49,16 @@ def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, lmbda, mu)
 
     power, thrust_err, smooth_penalty = base_objective(c, beta, params_static)
 
+    print(power)
+
     return (
         power
         + lmbda * thrust_err
         + 0.5 * mu * thrust_err**2
         + smooth_penalty
     )
+
+
 
 
 #Gradient scaling (compute c and beta scales)
@@ -66,7 +71,7 @@ def compute_gradient_scales(init_c, init_beta, params_static):
 
 # Optimisation
 def run_optimization():
-    jax.config.update("jax_enable_x64", True)
+    jax.config.update("jax_enable_x64", True) # Use 64 Bit Precision
 
     # Geometry setup
     psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
@@ -78,13 +83,13 @@ def run_optimization():
     params_static = Params(
         N=2,
         R=jnp.array([0.35]),
-        c=init_c,
-        beta=init_beta,
+        c=init_c[:, None],
+        beta=init_beta[:,None],
         r=r[:, None], dr=dr,
         psi=psi[None, :], dpsi=dpsi,
         V_x=jnp.array([10]), V_yz=jnp.array([2]),
         omega=jnp.array([2*jnp.pi*8000/60]),
-        V_ia_0=jnp.full_like(r[:, None], jnp.array([14.0])) # make sure to enter a floating point number (eg 14.0)
+        V_ia_0 = jnp.full((Inputs.n_r,), jnp.array([4.0])) # make sure to enter a floating point number (eg 14.0)
                                 # Tiling and shape adjustment has been moved to inflow model calcs
     )
 
@@ -108,8 +113,7 @@ def run_optimization():
         )
     )
     #Solver
-    solver = jaxopt.ScipyBoundedMinimize(fun=objective_fn,method="L-BFGS-B",tol=1e-8,maxiter=1000
-    )
+    solver = jaxopt.ScipyBoundedMinimize(fun=objective_fn, method="L-BFGS-B", tol=1e-8, maxiter=1000)
 
     #Augmented Lagrangian params
     lmbda = 0
@@ -136,10 +140,17 @@ def run_optimization():
 
         vars_scaled = sol.params
 
+        
+
         #Unscale
         c = vars_scaled[0] * c_scale
         beta = vars_scaled[1] * beta_scale
 
+        params_warm = replace(params_static, c=c, beta=beta)
+
+        V_ia_converged = propmodel.induced_velocity(params_warm)
+        V_ia_0_new = jnp.mean(V_ia_converged, axis=1) 
+        params_static = replace(params_static, V_ia_0=V_ia_0_new)
         power, thrust_err, _ = base_objective(c, beta, params_static)
 
         print(f"{i:<6} | {float(power):<12.4f} | {float(thrust_err):<12.4e} | {lmbda:<12.4f} | {mu:<10.1f}")
