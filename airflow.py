@@ -38,7 +38,7 @@ def simple_inflow(V_ia_0, params):
         V_ia: Inflow velocity at each azimuthal and radial station (size N_r * N_psi)
     '''
 
-    V_ia = V_ia_0 * jnp.ones([Inputs.n_r, Inputs.n_psi])
+    V_ia = jnp.tile(V_ia_0, [1, Inputs.n_psi])
 
     return V_ia
 

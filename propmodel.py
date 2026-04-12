@@ -152,27 +152,34 @@ def induced_velocity(params):
     '''
 
     # Unpack initial guess for induced velocity distribution
-    V_ia_init = inflow_model(params.V_ia_0, params)
+    #V_ia_init = inflow_model(params.V_ia_0, params)
 
     # Debug Check Initial Residuals
     if Inputs.verbose:
-        res_check = thrust_residual(V_ia_init, params)
+        res_check = thrust_residual(params.V_ia_0, params)
         print(res_check)
 
         print("Residual Shape", jnp.shape(res_check))
         print("Residual min/max:", res_check.min(), res_check.max())
 
+
+    res_check = thrust_residual(params.V_ia_0, params)
+
+
     # Newton Solver for Induced Velocity
     solver = jaxopt.Broyden(fun=thrust_residual, maxiter=100, tol=Inputs.newton_eps, max_stepsize=1.0, implicit_diff=True)
     # Input initial guess for induced velocity and solve. (Induced velocity is parametrised per radial stop)
-    (V_ia_0, info) = solver.run(V_ia_init, params)
+    (V_ia_0_new, info) = solver.run(params.V_ia_0, params)
 
     # Debug Check Final Residuals
     if Inputs.verbose:
-        res_check = thrust_residual(params.V_ia_0, params)
+        res_check = thrust_residual(V_ia_0_new, params)
         print("Residuals Check:", res_check)
+        
 
-    V_ia = inflow_model(V_ia_0, params)
+    print(jnp.shape(V_ia_0_new))
+
+    V_ia = inflow_model(V_ia_0_new, params)
     return V_ia
 
 
@@ -305,7 +312,7 @@ def flatblade(R, c, beta, N, plot=False):
     Flat Blade Demo Model. Inputs a blade of fixed chord and radial distribution 
     and solves+plots induced velocity.
 
-    TODO Fix function (chord and beta not declared properly)
+    TODO Fix function (totally borked)
     '''
     # 
     # Debug NAN's and enable 64 bit precision
@@ -368,46 +375,6 @@ if __name__ == "__main__":
     # single is single annulus solver
     # flat is simple flat blade solver
     # input allows importing of a json file 
-    demo_solve = "single"
-
-    # Single Annulus Solver
-    if demo_solve == "single":
-
-        psi,dpsi = angular_stops(Inputs.n_psi)
-        jax.config.update("jax_enable_x64", True)
-        jax.config.update("jax_debug_nans", True)
-        #Update Parameters Class
-        params = Params(
-                    N = 2,
-                    R = jnp.array([0.5]),
-                    c = jnp.array([0.05]),
-                    beta = jnp.array([jnp.radians(20)]),
-
-                    r = jnp.array([0.3]),
-                    dr = jnp.array([0.05]),
-
-                    psi = psi,
-                    dpsi = dpsi,
-
-                    V_x = jnp.array([10.0]),
-                    V_yz = jnp.array([3.0]),
-                    omega = jnp.array([400]),
-
-                    V_ia_0 = jnp.array([20.0])[:,None]
-                )
-        # Register dataclass as a PyTree
-        #jax.tree_util.register_dataclass(Params)
-
-        # Solve
-        V_ia = induced_velocity(params)
-
-        # Plot Induced Velocity Distribution about singular annulus
-        plt.plot(jnp.degrees(params.psi), V_ia[1])
-        plt.title("Induced Velocity Distribution around Propeller Annulus")
-        plt.xlabel("Angle (degrees)")
-        plt.ylabel("Induced Velocity (m/s)")
-        plt.show()
-
-    elif demo_solve == "flat":
-        c = np.ones_like(Inputs.n_r)
-        flatblade(1, 0.1, np.pi/8, 2, plot=True)
+    
+    # TODO IMPLEMENT
+    raise(NotImplementedError("IMPLEMENT ME PLS"))

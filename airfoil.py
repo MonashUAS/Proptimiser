@@ -9,7 +9,7 @@ from airflow import resultantVelocityComponents
 ## ---Parametric Coefficients---
 # (good for approximate analysis, use LUT for more accuracy)
 
-def parametric_coeffs(V_ia, params, plot=False):
+def parametric_coeffs(V_ia, params):
 
     '''
     Return parametric estimations of lift, drag, and moment coefficients based on angle of attack

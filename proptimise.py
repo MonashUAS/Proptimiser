@@ -10,8 +10,8 @@ import propmodel
 
 # Set jax debugging
 jax.config.update("jax_traceback_filtering", "quiet_remove_frames")
-jax.config.update("jax_check_tracer_leaks", "on")
-jax.config.update("jax_disable_jit", True)
+jax.config.update("jax_check_tracer_leaks", "off")
+jax.config.update("jax_disable_jit", False)
 
 #Curvature penalty 
 def curvature_penalty(x):
