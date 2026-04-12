@@ -21,41 +21,44 @@ def parametric_coeffs(V_ia, params, plot=False):
     For plots and a rundown of the theory, see (M. Nahon, 2015)
     '''
     
-    geometric_angle = params.beta
-
-    _, phi = resultantVelocityComponents(V_ia, params) # get only second output
-    
-    # Coefficient parameters
-    alphaabs = jax.lax.abs(geometric_angle)  # Use absolute value of alpha for symmetry
-
-    # Set piecewise function between 20 and 160 degrees
-    stall_low  = alphaabs >= jnp.radians(20)
-    stall_high = alphaabs >  jnp.radians(180) # Don't model high stall angle, inverse flow is complex
-    stall      = stall_low & ~stall_high   # 20°–160°
-    
+    # Constants:
     C_La = 5.7     # Lift curve slope per rad (ARAD10)
     C_D90 = 1.98    # Drag coefficient at 90 degrees angle of attack (flat plate)
     C_D0 = 0.035    # Zero lift drag coefficient (ARAD10)
+    AoA_0 = jnp.radians(10) # zero lift angle of attack
+
+    # load relevant data from inputs
+    geometric_angle = params.beta
+
+    # calculate aerodynamic incidence
+    _, phi = resultantVelocityComponents(V_ia, params) # get only second output
+    
+    # Angle of attack
+    AoA_eff = geometric_angle - phi + AoA_0
 
     # Coefficients in non-stall region
-    C_L_unstall = C_La * alphaabs                                                          # Lift Coefficient
-    C_T_unstall = C_D0 * jnp.cos(alphaabs)
-    C_L_unstall = jnp.minimum(C_La * alphaabs, 1.2) # 1.2 is a typical max Cl for thin airfoils                                                 # Tangential Force Coefficient
-    C_N_unstall = (C_L_unstall + C_T_unstall*jnp.sin(alphaabs)) / (jnp.cos(alphaabs))      # Normal Force Coefficient
-    C_D_unstall = C_N_unstall * jnp.sin(alphaabs) + C_T_unstall* jnp.cos(alphaabs)         # Drag Coefficient
-    C_M_unstall = -C_N_unstall*(0.25-0.175*(1-2*alphaabs/jnp.pi))                          # Moment Coefficient
+    C_L_unstall = C_La * AoA_eff                                                            # Lift Coefficient in linear region
+    C_T_unstall = C_D0 * jnp.cos(AoA_eff)                                                   # Tangential Force Coefficient
+    C_N_unstall = (C_L_unstall + C_T_unstall*jnp.sin(AoA_eff)) / (jnp.cos(AoA_eff) + 1e-6)  # Normal Force Coefficient
+    C_D_unstall = C_N_unstall * jnp.sin(AoA_eff) + C_T_unstall* jnp.cos(AoA_eff)            # Drag Coefficient
+    C_M_unstall = -C_N_unstall*(0.25-0.175*(1-2*AoA_eff/jnp.pi))                            # Moment Coefficient
     
     # Coefficients in stall region based on flat plate model
-    C_N_stall = C_D90 * (jnp.sin(alphaabs)) / (0.56+0.44*jnp.sin(alphaabs))          # Normal Force Coefficient
-    C_T_stall = 0.5*C_D0 *jnp.cos(alphaabs)                                                # Tangential Force Coefficient
-    C_L_stall = C_N_stall*jnp.cos(alphaabs)-C_T_stall*jnp.sin(alphaabs)                       # Lift Coefficient
-    C_D_stall = C_N_stall*jnp.sin(alphaabs)+C_T_stall*jnp.cos(alphaabs)                       # Drag Coefficient
-    C_M_stall = -C_N_stall*(0.25-0.175*(1-2*alphaabs/jnp.pi))                              # Moment Coefficient
+    C_N_stall = C_D90 * (jnp.sin(AoA_eff)) / (0.56+0.44*jnp.sin(AoA_eff))       # Normal Force Coefficient
+    C_T_stall = 0.5*C_D0 *jnp.cos(AoA_eff)                                      # Tangential Force Coefficient
+    C_L_stall = C_N_stall*jnp.cos(AoA_eff)-C_T_stall*jnp.sin(AoA_eff)           # Lift Coefficient
+    C_D_stall = C_N_stall*jnp.sin(AoA_eff)+C_T_stall*jnp.cos(AoA_eff)           # Drag Coefficient
+    C_M_stall = -C_N_stall*(0.25-0.175*(1-2*AoA_eff/jnp.pi))                   # Moment Coefficient
 
+    # Set piecewise function between 20 and 160 degrees
+    stall_low  = jnp.abs(AoA_eff) >= jnp.radians(20)
+    stall_high = jnp.abs(AoA_eff) >  jnp.radians(180) # Don't model high stall angle, inverse flow is complex
+    stall      = stall_low & ~stall_high   # 20°–160°
+    
     # Piecewise coefficients (stall for 20°–160°)
-    C_L = jnp.sign(geometric_angle)*jnp.where(stall, C_L_stall, C_L_unstall)
+    C_L = jnp.where(stall, C_L_stall, C_L_unstall)
     C_D = jnp.where(stall, C_D_stall, C_D_unstall)
-    C_M = jnp.sign(geometric_angle)*jnp.where(stall, C_M_stall, C_M_unstall)
+    C_M = jnp.where(stall, C_M_stall, C_M_unstall)
     
     return C_L, C_D, C_M
 

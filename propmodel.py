@@ -135,7 +135,7 @@ def thrust_residual(V_ia_0_guess, params):
     dT_MMNT_average, _ = dT_momentum(V_ia, params) # get the average elements (1st output) only
 
     dT_residual = dT_BEMT_average - dT_MMNT_average
-    
+
     return dT_residual
 
 

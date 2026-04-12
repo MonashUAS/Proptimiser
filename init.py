@@ -33,7 +33,7 @@ class Inputs(eqx.Module):
     n_psi: int = 9
 
     # Diagnostics / debugging
-    verbose: bool = False
+    verbose: bool = True
     record_convergence_history: bool = False
 
     # Model Selection

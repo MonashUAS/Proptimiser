@@ -28,7 +28,7 @@ def calc_phi(V_ia, params):
 
 
 ##  Inflow Model Definitions (0: Simple, 1: Pitt-Peters, 2: DTU) 
-def simple(V_ia_0, params):
+def simple_inflow(V_ia_0, params):
     ''' 
     Applies a simple uniform inflow model across all azimuthal angles.
 
