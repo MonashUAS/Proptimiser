@@ -39,7 +39,7 @@ def angular_stops(n_psi):
 
 
 ### Thrust Calculations
-def dT_blade(V_ia, params):
+def dT_blade(V_ia, params, debug=False):
     """
     Calculate instantaneous thrust force for each radial and azimuthal element
 
@@ -74,15 +74,29 @@ def dT_blade(V_ia, params):
 
     # Blade Element Theory instantaneous thrust element
     dT_blade_instantaneous = 0.5 * rho * c * (V_R**2) * (C_L*jnp.cos(phi) - C_D*jnp.sin(phi)) * F * dr[:, None]
-    
+
     # Average thrust in each annulus over one rotation (using formulation from the text prior to statement of eqn. 6)
     # Average thrust per annulus is the integral of the instantaneous thrust element divided by 2*pi
-    dT_blade = 1/(2*jnp.pi) * jnp.trapezoid(dT_blade_instantaneous, psi, axis=1)
+    dT_blade = N/(2*jnp.pi) * jnp.trapezoid(dT_blade_instantaneous, psi, axis=1)
+
+    if debug:
+        print("------dT_blade DEBUG------")
+
+        print("dT Shapes (inst., ave.):")
+        print((jnp.shape(dT_blade_instantaneous), jnp.shape(dT_blade)))
+
+        print("V_ia shape:")
+        print(jnp.shape(V_ia))
+
+        print("F shape:")
+        print(jnp.shape(F))
+        
+        print("------dT_blade DEBUG------")
 
     return dT_blade, dT_blade_instantaneous
 
 
-def dT_momentum(V_ia, params):
+def dT_momentum(V_ia, params, debug=False):
     """
     Calculate thrust integrand across each annulus for each radial station using momentum theory
 
@@ -111,6 +125,20 @@ def dT_momentum(V_ia, params):
     dT_momentum_instantaneous = 2 * rho * r * V_ia * V_prime * F * dr[:, None]  
     dT_momentum = jnp.trapezoid(dT_momentum_instantaneous, psi, axis=1)
 
+    if debug:
+        print("------dT_momentum DEBUG------")
+
+        print("dT Shapes (inst., ave.):")
+        print((jnp.shape(dT_momentum_instantaneous), jnp.shape(dT_momentum)))
+
+        print("V_ia shape:")
+        print(jnp.shape(V_ia))
+
+        print("F shape:")
+        print(jnp.shape(F))
+        
+        print("------dT_momentum DEBUG------")
+
     return dT_momentum, dT_momentum_instantaneous
 
 
@@ -130,9 +158,9 @@ def thrust_residual(V_ia_0_guess, params):
 
     # Calculate the instantaneous blade element and momentum theory thrust elements:
 
-    dT_BEMT_average, _ = dT_blade(V_ia, params) # get the average elements (1st output) only
+    dT_BEMT_average, _ = dT_blade(V_ia, params, debug=False) # get the average elements (1st output) only
 
-    dT_MMNT_average, _ = dT_momentum(V_ia, params) # get the average elements (1st output) only
+    dT_MMNT_average, _ = dT_momentum(V_ia, params, debug=False) # get the average elements (1st output) only
 
     dT_residual = dT_BEMT_average - dT_MMNT_average
 

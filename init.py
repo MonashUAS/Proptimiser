@@ -42,6 +42,7 @@ class Inputs(eqx.Module):
     tip_loss_model: int = 0 # 0 = none, 1 = Prandtl
     root_loss_model: int = 0 # 0 = none, 1 = Prandtl
 
+
 class Params(eqx.Module):
     '''
     Parameters for a given blade solution.
@@ -55,13 +56,11 @@ class Params(eqx.Module):
     psi: jnp.ndarray        # azimuthal stations
     dpsi: jnp.ndarray       # azimuthal spacing (m)
 
-
     # Geometry & discretization
     N: jnp.ndarray          # number of blades
     R: jnp.ndarray          # propeller radius (m)
     c: jnp.ndarray          # chord length at radial stations (m)
     beta: jnp.ndarray       # blade twist angle (rad)
-
 
     # Inflow / rotor state
     V_x: jnp.ndarray        # axial inflow velocity (ms^{-1})
@@ -73,6 +72,7 @@ class Params(eqx.Module):
 
     # Physical properties
     rho: float = 1.225      # air density (kgm^{-3})
+
 
 def blade_design_mask(params: Params):
     """

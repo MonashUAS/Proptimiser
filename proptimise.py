@@ -10,8 +10,8 @@ import propmodel
 
 # Set jax debugging
 jax.config.update("jax_traceback_filtering", "quiet_remove_frames")
-jax.config.update("jax_check_tracer_leaks", "on")
-jax.config.update("jax_disable_jit", True)
+jax.config.update("jax_check_tracer_leaks", "off")
+jax.config.update("jax_disable_jit", False)
 
 #Curvature penalty 
 def curvature_penalty(x):
@@ -49,7 +49,7 @@ def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, lmbda, mu)
 
     power, thrust_err, smooth_penalty = base_objective(c, beta, params_static)
 
-    print(power)
+    #print(power)
 
     return (
         power
@@ -78,7 +78,7 @@ def run_optimization():
     r, dr = propmodel.radial_stops(0.225, 0.05, Inputs.n_r)
 
     init_c = jnp.full((Inputs.n_r, 1), 0.02)
-    init_beta = jnp.full((Inputs.n_r, 1), jnp.radians(0))
+    init_beta = jnp.full((Inputs.n_psi, 1), jnp.radians(5))
 
     params_static = Params(
         N=2,
@@ -89,8 +89,7 @@ def run_optimization():
         psi=psi[None, :], dpsi=dpsi,
         V_x=jnp.array([10]), V_yz=jnp.array([2]),
         omega=jnp.array([2*jnp.pi*8000/60]),
-        V_ia_0 = jnp.full((Inputs.n_r,), jnp.array([4.0])) # make sure to enter a floating point number (eg 14.0)
-                                # Tiling and shape adjustment has been moved to inflow model calcs
+        V_ia_0 = jnp.full((Inputs.n_r,), jnp.array([4.0]))
     )
 
     #Calculate the gradient scales
@@ -101,6 +100,7 @@ def run_optimization():
         init_c/c_scale,
         init_beta/beta_scale
     )
+
     #Bounds (chord + beta pairs) (scaled)
     bounds = (
         (
@@ -112,6 +112,7 @@ def run_optimization():
             jnp.full_like(params_static.beta, jnp.radians(70) / beta_scale),
         )
     )
+
     #Solver
     solver = jaxopt.ScipyBoundedMinimize(fun=objective_fn, method="L-BFGS-B", tol=1e-8, maxiter=1000)
 
@@ -167,11 +168,19 @@ def run_optimization():
         lmbda += mu * thrust_err
         prev_err = abs(thrust_err)
 
+        
+        V_ia = propmodel.inflow_model(V_ia_0_new, params_static)
 
-        V_ia   = propmodel.induced_velocity(params_static)
+        print("V_ia shape:")
+        print(jnp.shape(V_ia))
 
-        dT_mom = propmodel.dT_momentum(V_ia, params_static)[0]
-        dT_bld = propmodel.dT_blade(V_ia, params_static)[0]
+        dT_mom = propmodel.dT_momentum(V_ia, params_static, debug=True)[0]
+        print("dT_mom shape:")
+        print(jnp.shape(dT_mom))
+
+        dT_bld = propmodel.dT_blade(V_ia, params_static, debug=True)[0]
+        print("dT_bld shape:")
+        print(jnp.shape(dT_bld))
 
         fig, axes = plt.subplots(3, 1, figsize=(6, 10))
 
@@ -191,6 +200,7 @@ def run_optimization():
 
         plt.tight_layout()
         plt.show()
+        
 
     else:
         print(f"\nWarning: max iterations reached. Final thrust error: {thrust_err:.2e}")
