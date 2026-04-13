@@ -136,9 +136,6 @@ def thrust_residual(V_ia_0_guess, params):
 
     dT_residual = dT_BEMT_average - dT_MMNT_average
 
-    print(V_ia_0_guess)
-    print(dT_residual)
-
     return dT_residual
 
 

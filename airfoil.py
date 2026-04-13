@@ -68,7 +68,7 @@ def lookup_coeffs(V_ia, params):
     Placeholder for future lookup table implementation, 
     use parametric for now to allow compile
     '''
-    C_L, C_D, C_M  = parametric_coeffs(V_ia, params)
+    raise(NotImplementedError("FUnction 'lookup_coeffs' in airfoil.py is not implemented yet"))
     # Look up/estimate CL/CD from CFD data tables
 
     # Input parameters of alpha, Re, Ma, airfoil type. Return airfoil with suitable coefficients that minimise chord.
