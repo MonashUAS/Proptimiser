@@ -32,22 +32,17 @@ def base_objective(c, beta, params_static):
 
     #torque = jnp.squeeze(propmodel.torque(V_ia, params))
 
-    smooth_penalty = (
-        Inputs.lambda_beta_smooth  * curvature_penalty(beta[:,0]) +
-        Inputs.lambda_chord_smooth * curvature_penalty(c[:,0])
-    )
-
-    return power, thrust_err, smooth_penalty
+    return power, thrust_err
 
 
 #Scaled Aug. lagrangian, returns the actual Lagrangian 
 def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, lmbda, mu):
     c_scaled, beta_scaled = opt_vars_scaled
-
+    
     c = c_scaled*c_scale
     beta = beta_scaled*beta_scale
 
-    power, thrust_err, smooth_penalty = base_objective(c, beta, params_static)
+    power, thrust_err = base_objective(c, beta, params_static)
 
     #print(power)
 
@@ -55,7 +50,6 @@ def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, lmbda, mu)
         power
         + lmbda * thrust_err
         + 0.5 * mu * thrust_err**2
-        + smooth_penalty
     )
 
 
@@ -63,7 +57,7 @@ def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, lmbda, mu)
 
 #Gradient scaling (compute c and beta scales)
 def compute_gradient_scales(init_c, init_beta, params_static):
-    c_scale    = 1000
+    c_scale    = 1
     beta_scale = 1
 
     return c_scale, beta_scale
@@ -77,8 +71,8 @@ def run_optimization():
     psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
     r, dr = propmodel.radial_stops(0.225, 0.05, Inputs.n_r)
 
-    init_c = jnp.full((Inputs.n_r, 1), 0.02)
-    init_beta = jnp.full((Inputs.n_psi, 1), jnp.radians(5))
+    init_c = jnp.full(Inputs.n_r, 0.02)
+    init_beta = jnp.full(Inputs.n_r, jnp.radians(5))
 
     params_static = Params(
         N=2,
@@ -129,6 +123,7 @@ def run_optimization():
     print("-" * 65)
 
     for i in range(100):
+
         sol = solver.run(
             vars_scaled,
             bounds=bounds,
@@ -140,19 +135,16 @@ def run_optimization():
         )
 
         vars_scaled = sol.params
-
-        
-
         #Unscale
         c = vars_scaled[0] * c_scale
         beta = vars_scaled[1] * beta_scale
 
-        params_warm = replace(params_static, c=c, beta=beta)
+        params_warm = replace(params_static, c=jnp.squeeze(c), beta=jnp.squeeze(beta))
 
         V_ia_converged = propmodel.induced_velocity(params_warm)
         V_ia_0_new = jnp.mean(V_ia_converged, axis=1) 
         params_static = replace(params_static, V_ia_0=V_ia_0_new)
-        power, thrust_err, _ = base_objective(c, beta, params_static)
+        power, thrust_err = base_objective(c, beta, params_static)
 
         print(f"{i:<6} | {float(power):<12.4f} | {float(thrust_err):<12.4e} | {lmbda:<12.4f} | {mu:<10.1f}")
 
@@ -168,19 +160,11 @@ def run_optimization():
         lmbda += mu * thrust_err
         prev_err = abs(thrust_err)
 
-        
-        V_ia = propmodel.inflow_model(V_ia_0_new, params_static)
-
-        print("V_ia shape:")
-        print(jnp.shape(V_ia))
-
-        dT_mom = propmodel.dT_momentum(V_ia, params_static, debug=True)[0]
-        print("dT_mom shape:")
-        print(jnp.shape(dT_mom))
-
-        dT_bld = propmodel.dT_blade(V_ia, params_static, debug=True)[0]
-        print("dT_bld shape:")
-        print(jnp.shape(dT_bld))
+        """
+        # Calculate the new thrust per annulus for blade and momentum equations
+        V_ia = propmodel.inflow_model(V_ia_0_new, params_warm)
+        dT_bld = propmodel.dT_blade(V_ia, params_warm, debug=False)[0]
+        dT_mom = propmodel.dT_momentum(V_ia, params_warm, debug=False)[0]
 
         fig, axes = plt.subplots(3, 1, figsize=(6, 10))
 
@@ -195,11 +179,12 @@ def run_optimization():
         axes[1].set_xlabel("r/R")
 
         axes[2].plot(r, dT_mom, label="Momentum")
-        axes[2].plot(r, dT_bld, label="BEMT")
+        axes[2].plot(r, dT_bld, '--', label="BEMT")
         axes[2].legend()
 
         plt.tight_layout()
         plt.show()
+        """
         
 
     else:

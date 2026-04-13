@@ -28,7 +28,7 @@ def parametric_coeffs(V_ia, params):
     AoA_0 = jnp.radians(10) # zero lift angle of attack
 
     # load relevant data from inputs
-    geometric_angle = params.beta
+    geometric_angle = params.beta[:, None]
 
     # calculate aerodynamic incidence
     _, phi = resultantVelocityComponents(V_ia, params) # get only second output

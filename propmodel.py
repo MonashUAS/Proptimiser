@@ -38,22 +38,26 @@ def angular_stops(n_psi):
     return psi, dpsi
 
 
-### Thrust Calculations
-def dT_blade(V_ia, params, debug=False):
+### Calculate thrust, hub and torque elements
+def dT_blade(V_ia: jnp.ndarray, params: Params, debug: bool=False):
     """
-    Calculate instantaneous thrust force for each radial and azimuthal element
+    Calculates instantaneous thrust at each radial and azimuthal station, 
+    and calculate the average thrust in each annulus over a rotation
 
-    dT_blade_instantaneous
-    Uses formulation from (M. Nahon et al., 2015) equation 5 modified with the inclusion of the prandtl loss parameter 'F'
+    Inputs:
+        V_ia        <- Induced velocity at each radial and azimuthal station
+        params      <- Params object used in the optimisation loop, remains unmodified by function execution
+        debug       <- Boolean to select whether or not to print debug information when function is called
 
-    dT_blade
-    Uses formulation from (M. Nahon et al., 2015) equation 6 modified with the inclusion of the prandtl loss parameter 'F'
-    
     Outputs:
-        dT_blade w/ size (Nr, 1) 
-        dT_blade_instantaneous w/ size (Nr, Npsi)
+        dT_blade_ave w/ size (Nr, 1)                        <- Thrust per annulus 
+        dT_blade_instantaneous w/ size (Nr, Npsi)       <- Thrust per differential element
 
-    Assumes: |V_yz| < |V_x + V_ia| -> Assumption that the annuli do not interact with each other 
+    Assumes: 
+        |V_yz| < |V_x + V_ia|   <- Assumption that the annuli do not interact with each other 
+
+    Uses formulation from (M. Nahon et al., 2015) equations 5 and 6 modified with 
+    the inclusion of the prandtl loss parameter 'F'
     """
     
     # Unpack parameters
@@ -73,17 +77,17 @@ def dT_blade(V_ia, params, debug=False):
     F = jnp.multiply(tip_loss, root_loss)
 
     # Blade Element Theory instantaneous thrust element
-    dT_blade_instantaneous = 0.5 * rho * c * (V_R**2) * (C_L*jnp.cos(phi) - C_D*jnp.sin(phi)) * F * dr[:, None]
+    dT_blade_instantaneous = 0.5 * rho * c[:, None] * (V_R**2) * (C_L*jnp.cos(phi) - C_D*jnp.sin(phi)) * F * dr[:, None] 
 
     # Average thrust in each annulus over one rotation (using formulation from the text prior to statement of eqn. 6)
     # Average thrust per annulus is the integral of the instantaneous thrust element divided by 2*pi
-    dT_blade = N/(2*jnp.pi) * jnp.trapezoid(dT_blade_instantaneous, psi, axis=1)
+    dT_blade_ave = N/(2*jnp.pi) * jnp.trapezoid(dT_blade_instantaneous, psi, axis=1)
 
     if debug:
         print("------dT_blade DEBUG------")
 
         print("dT Shapes (inst., ave.):")
-        print((jnp.shape(dT_blade_instantaneous), jnp.shape(dT_blade)))
+        print((jnp.shape(dT_blade_instantaneous), jnp.shape(dT_blade_ave)))
 
         print("V_ia shape:")
         print(jnp.shape(V_ia))
@@ -93,19 +97,139 @@ def dT_blade(V_ia, params, debug=False):
         
         print("------dT_blade DEBUG------")
 
-    return dT_blade, dT_blade_instantaneous
+    return dT_blade_ave, dT_blade_instantaneous
 
 
+def dH_blade(V_ia, params, debug=False):
+    """
+    Calculates instantaneous hub force at each radial and azimuthal station, 
+    and calculate the average hub force in each annulus over a rotation
+
+    The hub forces are defined as the force element coplanar with the rotor disk 
+    and normal to the radial direction
+
+    Inputs:
+        V_ia        <- Induced velocity at each radial and azimuthal station
+        params      <- Params object used in the optimisation loop, remains unmodified by function execution
+        debug       <- Boolean to select whether or not to print debug information when function is called
+
+    Outputs:
+        dH_blade_ave w/ size (Nr, 1)                        <- Force per annulus 
+        dH_blade_instantaneous w/ size (Nr, Npsi)       <- Force per differential element
+
+    Assumes: 
+        |V_yz| < |V_x + V_ia|   <- Assumption that the annuli do not interact with each other 
+
+    Uses formulation from (M. Nahon et al., 2015) equation 11 modified with 
+    the inclusion of the prandtl loss parameter 'F'
+    """
+    
+    # Unpack parameters
+    N, c, dr, psi = params.N, params.c, params.dr, params.psi # geometric and positional values
+    rho = params.rho # air density
+
+    # Calculate Local Flow Properties
+    V_R, phi = resultantVelocityComponents(V_ia, params)
+    
+    # Get Aerodynamic Coefficients
+    C_L, C_D, _ = parametric_coeffs(V_ia, params)
+
+    # Tip and Root Loss Factors
+    tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
+
+    # Calculate the total prandtl loss correction factor
+    F = jnp.multiply(tip_loss, root_loss)
+
+    # Blade Element Theory instantaneous thrust element
+    dH_blade_instantaneous = 0.5 * rho * c[:, None] * (V_R**2) * (C_L*jnp.cos(phi) + C_D*jnp.sin(phi)) * F * dr[:, None] 
+
+    # Average thrust in each annulus over one rotation (using formulation from the text prior to statement of eqn. 6)
+    # Average thrust per annulus is the integral of the instantaneous thrust element divided by 2*pi
+    dH_blade_ave = N/(2*jnp.pi) * jnp.trapezoid(dH_blade_instantaneous, psi, axis=1)
+
+    if debug:
+        print("------dH_blade DEBUG------")
+
+        print("dH Shapes (inst., ave.):")
+        print((jnp.shape(dH_blade_instantaneous), jnp.shape(dH_blade_ave)))
+
+        print("V_ia shape:")
+        print(jnp.shape(V_ia))
+
+        print("F shape:")
+        print(jnp.shape(F))
+        
+        print("------dH_blade DEBUG------")
+
+    return dH_blade_ave, dH_blade_instantaneous
+
+
+def dQ_blade(V_ia, params, debug=False):
+    """
+    Calculates instantaneous torque at each radial and azimuthal station, 
+    and calculate the average torque in each annulus over a rotation
+
+    Inputs:
+        V_ia        <- Induced velocity at each radial and azimuthal station
+        params      <- Params object used in the optimisation loop, remains unmodified by function execution
+        debug       <- Boolean to select whether or not to print debug information when function is called
+
+    Outputs:
+        dQ_blade w/ size (Nr, 1)                        <- Torque per annulus 
+        dQ_blade_instantaneous w/ size (Nr, Npsi)       <- Torque per differential element
+
+    Assumes: 
+        |V_yz| < |V_x + V_ia|   <- Assumption that the annuli do not interact with each other 
+
+    Uses formulation from (M. Nahon et al., 2015) equation 12
+    """
+    
+    r = params.r
+
+    # Calculate the hub force elements dH
+    dH_blade_ave, dH_blade_instantaneous = dH_blade(V_ia, params, debug)
+
+    # Use equation 12 to calculate the torque elements from the hub elements
+    dQ_blade_ave = -dH_blade_ave * jnp.squeeze(r)
+    dQ_blade_instantaneous = -dH_blade_instantaneous * r
+
+    if debug:
+        print("------dQ_blade DEBUG------")
+
+        print("dQ Shapes (inst., ave.):")
+        print((jnp.shape(dQ_blade_instantaneous), jnp.shape(dQ_blade_ave)))
+
+        print("V_ia shape:")
+        print(jnp.shape(V_ia))
+        
+        print("------dT_blade DEBUG------")
+
+    return dQ_blade_ave, dQ_blade_instantaneous
+
+
+### Calculate thrust elements using momentum imparted to the air
 def dT_momentum(V_ia, params, debug=False):
     """
-    Calculate thrust integrand across each annulus for each radial station using momentum theory
+    Calculates instantaneous thrust at each radial and azimuthal station, 
+    and calculate the average thrust in each annulus over a rotation
+
+    Unlike dT_blade, dT_momentum uses the momentum change in the air as it passes through the 
+    blade element and is accelerated rather than the forces on the blade element to determine
+    thrust 
+
+    Inputs:
+        V_ia        <- Induced velocity at each radial and azimuthal station
+        params      <- Params object used in the optimisation loop, remains unmodified by function execution
+        debug       <- Boolean to select whether or not to print debug information when function is called
+
+    Outputs:
+        dT_momentum w/ size (Nr, 1)                        <- Thrust per annulus 
+        dT_momentum_instantaneous w/ size (Nr, Npsi)       <- Thrust per differential element
+
+    Assumes: 
+        |V_yz| < |V_x + V_ia|   <- Assumption that the annuli do not interact with each other 
 
     Uses formulation from (M. Nahon et al., 2015) equation 9
-
-    Outputs: dT_momentum (Nr, 1)
-             dT_momentum_instantaneous w/ size (Nr, Npsi)
-
-    Assumes: |V_yz| < |V_x + V_ia| -> Assumption that the annuli do not interact with each other 
     """
     # Unpack parameters
     r, dr, psi = params.r, params.dr, params.psi
@@ -201,52 +325,30 @@ def induced_velocity(params):
     return V_ia
 
 
-def dQ_blade(V_ia,params):
-    '''
-    Calculate Torque Integrand using Blade Element Theory at radial and aizmuthal stops.
-
-    Uses formulation from (M. Nahon et al., 2015)
-
-    Outputs: dQ_momentum (Nr, Npsi)
+def torque(V_ia, params, debug=False):
     """
-    '''
-    # Unpack parameters
-    N, c, r, psi = params.N, params.c, params.r, params.psi
-    V_x, V_yz, omega = params.V_x, params.V_yz, params.omega
-    rho = params.rho
+    Calculates the total torque on the propeller by integrating the average torque per annulus per rotation
+    along the radial direction
+    
+    Inputs:
+        V_ia        <- Induced velocity at each radial and azimuthal station
+        params      <- Params object used in the optimisation loop, remains unmodified by function execution
+        debug       <- Boolean to select whether or not to print debug information when function is called
 
-    # Calculate Local Flow Properties
-    V_yz_perp = V_yz * jnp.sin(psi)                                     # Perpendicular component of velocity in yz plane
-    phi = jnp.arctan((V_x + V_ia)/(omega * r + V_yz_perp))              # Angle of attack
-    V_rel = jnp.sqrt((V_x + V_ia) ** 2 + (omega * r + V_yz_perp) ** 2)  # Relative velocity
-    # Get Aerodynamic Coefficients
-    C_L, C_D, C_M = parametric_coeffs(V_ia, params)
-
-    # Tip and Root Loss Factors
-    tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
-
-    # Blade Element Theory about annular element
-    dQ_blade =( 
-        (N / (4 * jnp.pi)) * rho 
-        * c * V_rel ** 2 
-        * (C_L * jnp.cos(phi) + C_D * jnp.sin(phi))
-        # tip and root loss factors
-        * tip_loss * root_loss
-        )
-    return dQ_blade
-
-
-def torque(V_ia, params):
+    Outputs:
+        Q <- Net torque per rotation of the propeller
+    
+    Assumes: 
+        |V_yz| < |V_x + V_ia|   <- Assumption that the annuli do not interact with each other 
     """
-    Integrate to find Total Torque of Propeller
-    """
-    r, psi = params.r, params.psi
-    dQ = dQ_blade(V_ia, params)
+    
+    r = jnp.squeeze(params.r)
 
-    # Numerically Compute Double Integral to Solve for Torque
-    inner = jnp.trapezoid(dQ, psi, axis=1)
-    inner_r = jnp.squeeze(inner) * jnp.squeeze(r)
-    Q = jnp.trapezoid(jnp.squeeze(inner_r), jnp.squeeze(r))
+    # Get the average torque per rotation in each annulus using the dQ_blade function
+    dQ_blade_ave = dQ_blade(V_ia, params, debug)[0]
+
+    # Use trapezoidal integration in the radial direction to compute the total torque
+    Q = jnp.trapezoid(dQ_blade_ave, r)
 
     return Q
 
@@ -296,7 +398,7 @@ def mechanicalPower(V_ia, params):
     # Calculate Local Axial Flow Velocity
 
     # net torque over one rotation
-    Q = torque(V_ia, params)
+    Q = torque(V_ia, params, debug=False)
 
     # Net mechanical power (omega in rad/s, torque in Nm)
     P = Q * omega

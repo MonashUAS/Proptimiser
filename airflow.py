@@ -74,10 +74,12 @@ def inflow_model(V_ia_0, params):
     ''' 
     Switches between inflow models based on global configuration.
     '''
-    # Tile V_ia_0 to (Nr,1) before performing calcs
 
     V_ia_0 = V_ia_0[:,None]
-    return lax.switch(Inputs.inflow_model, [simple_inflow, pitt_peters, dtu_model], *(V_ia_0, params))
+
+    V_ia = lax.switch(Inputs.inflow_model, [simple_inflow, pitt_peters, dtu_model], *(V_ia_0, params))
+
+    return V_ia
 
 
 def resultantVelocityComponents(V_ia, params, plotting=False):
