@@ -43,6 +43,17 @@ class Inputs(eqx.Module):
     root_loss_model: int = 0 # 0 = none, 1 = Prandtl
 
 
+
+    ## Curve smoothing parameters
+    # Set the highest power in the numerator and denominator of the chord smoothing function
+    Ord_Denominator_c = 3
+    Ord_Numerator_c = 2
+    # Set the highest power in the numerator and denominator of the beta smoothing function
+    Ord_Denominator_beta = 2
+    Ord_Numerator_beta = 3
+    # Set whether the smoothing function reports on quality of the smoothing attempt
+    Smoothing_log = False
+
 class Params(eqx.Module):
     '''
     Parameters for a given blade solution.
