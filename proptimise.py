@@ -33,7 +33,7 @@ def minimumInducedLossCost(V_ia_0, scale=1):
     return rms_err*scale
 
 #Returns the power, thrust error and smoothness penalty
-def base_objective(c, beta, params_static):
+def base_objective(c, beta, params_static, milScale=1, thrScale=1):
 
     params = replace(params_static, c=c, beta=beta)
     V_ia, V_ia_0   = propmodel.induced_velocity(params)
@@ -43,23 +43,22 @@ def base_objective(c, beta, params_static):
 
     thrust_err = thrust - Inputs.thrust
 
-    rms_MIL_err = minimumInducedLossCost(V_ia_0, scale=1)
+    rms_MIL_err = minimumInducedLossCost(V_ia_0, scale=milScale)
 
-    return power, thrust_err, thrust, rms_MIL_err
+    return power, thrust_err*thrScale, thrust, rms_MIL_err
 
 
 #Scaled Aug. lagrangian, returns the actual Lagrangian 
-def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, lmbda, mu):
+def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_err=1, scale_THR_err=1):
     c_scaled, beta_scaled = opt_vars_scaled
     
     c = c_scaled*c_scale
     beta = beta_scaled*beta_scale
 
-    power, thrust_err, _, rms_MIL_err = base_objective(c, beta, params_static)
+    power, thrust_err, _, rms_MIL_err = base_objective(c, beta, params_static, scale_MIL_err, scale_THR_err)
     #print(power)
 
-    return (rms_MIL_err**2*1000 + thrust_err**2)
-
+    return jnp.sqrt(thrust_err**2 + rms_MIL_err**2)
 
 
 
@@ -84,7 +83,7 @@ def run_optimization():
 
     params_static = Params(
         N=2,
-        R=jnp.array([0.35]),
+        R=jnp.max(r),
         c=init_c[:, None],
         beta=init_beta[:,None],
         r=r[:, None], dr=dr,
@@ -107,11 +106,11 @@ def run_optimization():
     bounds = (
         (
             jnp.full_like(params_static.c, 0.005/c_scale),
-            jnp.full_like(params_static.beta, jnp.radians(-5) / beta_scale),
+            jnp.full_like(params_static.beta, jnp.radians(0) / beta_scale),
         ),
         (
             jnp.full_like(params_static.c, 0.05/c_scale),
-            jnp.full_like(params_static.beta, jnp.radians(25) / beta_scale),
+            jnp.full_like(params_static.beta, jnp.radians(30) / beta_scale),
         )
     )
 
@@ -121,16 +120,13 @@ def run_optimization():
     #Augmented Lagrangian params
     lmbda = 0
     mu = 1
-    mu_max = 1e7
-    mu_scale = 2
     eta_tol = 1e-3
 
-    #Set arbtitrarily high to initiate solver 
-    prev_err = 1e12
+    #Set arbtitrarily high to initiate solver
     print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Lambda':<12} | {'Mu':<10}")
     print("-" * 117)
 
-    for i in range(5):
+    for i in range(50):
 
         sol = solver.run(
             vars_scaled,
@@ -138,8 +134,8 @@ def run_optimization():
             params_static=params_static,
             c_scale=c_scale,
             beta_scale=beta_scale,
-            lmbda=lmbda,
-            mu=mu
+            scale_MIL_err=1,
+            scale_THR_err=1
         )
 
         vars_scaled = sol.params

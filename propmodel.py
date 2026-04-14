@@ -14,7 +14,7 @@ from dataclasses import replace
 
 # Internal Libraries
 from init import Inputs, Params
-from airfoil import parametric_coeffs
+from airfoil import aero_coeffs
 from airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskEfficiency, resultantVelocityComponents
 
 
@@ -61,14 +61,14 @@ def dT_blade(V_ia: jnp.ndarray, params: Params, debug: bool=False):
     """
     
     # Unpack parameters
-    N, c, dr, psi = params.N, params.c, params.dr, params.psi # geometric and positional values
+    N, c, psi = params.N, params.c, params.psi # geometric and positional values
     rho = params.rho # air density
 
     # Calculate Local Flow Properties
     V_R, phi = resultantVelocityComponents(V_ia, params)
     
     # Get Aerodynamic Coefficients
-    C_L, C_D, _ = parametric_coeffs(V_ia, params)
+    C_L, C_D, _ = aero_coeffs(V_ia, params)
 
     # Tip and Root Loss Factors
     tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
@@ -77,11 +77,11 @@ def dT_blade(V_ia: jnp.ndarray, params: Params, debug: bool=False):
     F = jnp.multiply(tip_loss, root_loss)
 
     # Blade Element Theory instantaneous thrust element
-    dT_blade_instantaneous = 0.5 * rho * c[:, None] * (V_R**2) * (C_L*jnp.cos(phi) - C_D*jnp.sin(phi)) * F * dr[:, None] 
+    dT_blade_instantaneous = 0.5 * rho * c[:, None] * (V_R**2) * (C_L*jnp.cos(phi) - C_D*jnp.sin(phi)) * F 
 
     # Average thrust in each annulus over one rotation (using formulation from the text prior to statement of eqn. 6)
     # Average thrust per annulus is the integral of the instantaneous thrust element divided by 2*pi
-    dT_blade_ave = N/(2*jnp.pi) * jnp.trapezoid(dT_blade_instantaneous, psi, axis=1)
+    dT_blade_ave = N/(2*jnp.pi) * jnp.trapezoid(dT_blade_instantaneous, x=psi, axis=1)
 
     if debug:
         print("------dT_blade DEBUG------")
@@ -125,14 +125,14 @@ def dH_blade(V_ia, params, debug=False):
     """
     
     # Unpack parameters
-    N, c, dr, psi = params.N, params.c, params.dr, params.psi # geometric and positional values
+    N, c, psi = params.N, params.c, params.psi # geometric and positional values
     rho = params.rho # air density
 
     # Calculate Local Flow Properties
     V_R, phi = resultantVelocityComponents(V_ia, params)
     
     # Get Aerodynamic Coefficients
-    C_L, C_D, _ = parametric_coeffs(V_ia, params)
+    C_L, C_D, _ = aero_coeffs(V_ia, params)
 
     # Tip and Root Loss Factors
     tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
@@ -145,10 +145,7 @@ def dH_blade(V_ia, params, debug=False):
 
     # Average thrust in each annulus over one rotation (using formulation from the text prior to statement of eqn. 6)
     # Average thrust per annulus is the integral of the instantaneous thrust element divided by 2*pi
-    A = N/(4*jnp.pi) * rho * c
-    B = jnp.trapezoid(inner, psi, axis=1)
-    C = dr 
-    dH_blade_ave = A * B * C
+    dH_blade_ave = N/(4*jnp.pi) * rho * c * jnp.trapezoid(inner, x=psi, axis=1) #* dr
 
     if debug:
         print("------dH_blade DEBUG------")
@@ -235,7 +232,7 @@ def dT_momentum(V_ia, params, debug=False):
     Uses formulation from (M. Nahon et al., 2015) equation 9
     """
     # Unpack parameters
-    r, dr, psi = params.r, params.dr, params.psi
+    r, psi = params.r, params.psi
     V_x, V_yz = params.V_x, params.V_yz
     rho = params.rho
 
@@ -249,7 +246,7 @@ def dT_momentum(V_ia, params, debug=False):
     F = jnp.multiply(tip_loss, root_loss) 
 
     # Momentum theory about annular element
-    dT_momentum = 2 * rho * jnp.squeeze(r) * jnp.trapezoid(V_ia * V_prime * F, psi, axis=1) * dr
+    dT_momentum = 2 * rho * jnp.squeeze(r) * jnp.trapezoid(V_ia * V_prime * F, x=psi, axis=1) #* dr
 
     if debug:
         print("------dT_momentum DEBUG------")
@@ -278,7 +275,7 @@ def thrust_residual(V_ia_0_guess, params):
     but for now skew rotor inflow is most complex and 
     dimensionality of problem is reduced)
     """
-
+    
     # Establish induced velocity from inflow model
     V_ia = inflow_model(V_ia_0_guess, params)
 
@@ -354,7 +351,7 @@ def torque(V_ia, params, debug=False):
     dQ_blade_ave = dQ_blade(V_ia, params, debug)
 
     # Use trapezoidal integration in the radial direction to compute the total torque
-    Q = jnp.trapezoid(dQ_blade_ave, r)
+    Q = jnp.trapezoid(dQ_blade_ave, x=r)
 
     return Q
 
@@ -364,10 +361,10 @@ def thrust(V_ia, params):
     Calculate total thrust from solved induced velocity
     '''
     r = jnp.squeeze(params.r)
-    dT = dT_momentum(V_ia,params)
+    dT = dT_blade(V_ia,params)[0]
 
     # Numerically Compute Double Integral to Solve for Thrust
-    T = jnp.trapezoid(dT, r)
+    T = jnp.trapezoid(dT, x=r)
 
     return T
 
@@ -390,7 +387,7 @@ def power(V_ia, params):
 
     dP = dT*V
 
-    P = jnp.trapezoid(jnp.trapezoid(dP,r,axis=0),psi)
+    P = jnp.trapezoid(jnp.trapezoid(dP,x=r,axis=0),x=psi)
     return P
 
 

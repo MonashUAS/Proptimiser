@@ -32,15 +32,19 @@ def parametric_coeffs(V_ia, params):
 
     # calculate aerodynamic incidence
     _, phi = resultantVelocityComponents(V_ia, params) # get only second output
-    
+
     # Angle of attack
     AoA_eff = geometric_angle - phi + AoA_0
+
+    # Do some conditioning of the effective AoA
+    #AoA_eff = jnp.where(AoA_eff==jnp.pi/2, AoA_eff+jnp.radians(0.05), AoA_eff)
+    #AoA_eff = jnp.where(AoA_eff==jnp.pi, AoA_eff-jnp.radians(0.05), AoA_eff)
 
     # Coefficients in non-stall region
     C_L_unstall = C_La * AoA_eff                                                            # Lift Coefficient in linear region
     C_T_unstall = C_D0 * jnp.cos(AoA_eff)                                                   # Tangential Force Coefficient
-    C_N_unstall = (C_L_unstall + C_T_unstall*jnp.sin(AoA_eff)) / (jnp.cos(AoA_eff) + 1e-6)  # Normal Force Coefficient
-    C_D_unstall = C_N_unstall * jnp.sin(AoA_eff) + C_T_unstall* jnp.cos(AoA_eff)            # Drag Coefficient
+    C_N_unstall = (C_L_unstall + C_T_unstall*jnp.sin(AoA_eff)) / (jnp.cos(AoA_eff))  # Normal Force Coefficient
+    C_D_unstall = C_N_unstall * jnp.sin(AoA_eff) + C_T_unstall * jnp.cos(AoA_eff)            # Drag Coefficient
     C_M_unstall = -C_N_unstall*(0.25-0.175*(1-2*AoA_eff/jnp.pi))                            # Moment Coefficient
     
     # Coefficients in stall region based on flat plate model
@@ -52,7 +56,7 @@ def parametric_coeffs(V_ia, params):
 
     # Set piecewise function between 20 and 160 degrees
     stall_low  = jnp.abs(AoA_eff) >= jnp.radians(20)
-    stall_high = jnp.abs(AoA_eff) >  jnp.radians(180) # Don't model high stall angle, inverse flow is complex
+    stall_high = jnp.abs(AoA_eff) >  jnp.radians(160) # Don't model high stall angle, inverse flow is complex
     stall      = stall_low & ~stall_high   # 20°–160°
     
     # Piecewise coefficients (stall for 20°–160°)
@@ -68,13 +72,11 @@ def lookup_coeffs(V_ia, params):
     Placeholder for future lookup table implementation, 
     use parametric for now to allow compile
     '''
-    raise(NotImplementedError("FUnction 'lookup_coeffs' in airfoil.py is not implemented yet"))
+    #raise(NotImplementedError("FUnction 'lookup_coeffs' in airfoil.py is not implemented yet"))
     # Look up/estimate CL/CD from CFD data tables
 
     # Input parameters of alpha, Re, Ma, airfoil type. Return airfoil with suitable coefficients that minimise chord.
-
-
-    return C_L, C_D, C_M
+    return parametric_coeffs(V_ia, params)
 
 def aero_coeffs(V_ia, params):
     # Select Method to Establish Aerodynamic Coefficients
