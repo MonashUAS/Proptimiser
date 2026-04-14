@@ -140,18 +140,21 @@ def dH_blade(V_ia, params, debug=False):
     # Calculate the total prandtl loss correction factor
     F = jnp.multiply(tip_loss, root_loss)
 
-    # Blade Element Theory instantaneous thrust element
-    dH_blade_instantaneous = 0.5 * rho * c[:, None] * (V_R**2) * (C_L*jnp.cos(phi) + C_D*jnp.sin(phi)) * F * dr[:, None] 
+    # Inner integral term
+    inner = (V_R**2) * (C_L*jnp.sin(phi) + C_D*jnp.cos(phi))
 
     # Average thrust in each annulus over one rotation (using formulation from the text prior to statement of eqn. 6)
     # Average thrust per annulus is the integral of the instantaneous thrust element divided by 2*pi
-    dH_blade_ave = N/(2*jnp.pi) * jnp.trapezoid(dH_blade_instantaneous, psi, axis=1)
+    A = N/(4*jnp.pi) * rho * c
+    B = jnp.trapezoid(inner, psi, axis=1)
+    C = dr 
+    dH_blade_ave = A * B * C
 
     if debug:
         print("------dH_blade DEBUG------")
 
-        print("dH Shapes (inst., ave.):")
-        print((jnp.shape(dH_blade_instantaneous), jnp.shape(dH_blade_ave)))
+        print("dH Shapes (ave.):")
+        print((jnp.shape(dH_blade_ave)))
 
         print("V_ia shape:")
         print(jnp.shape(V_ia))
@@ -161,7 +164,7 @@ def dH_blade(V_ia, params, debug=False):
         
         print("------dH_blade DEBUG------")
 
-    return dH_blade_ave, dH_blade_instantaneous
+    return dH_blade_ave
 
 
 def dQ_blade(V_ia, params, debug=False):
@@ -187,24 +190,24 @@ def dQ_blade(V_ia, params, debug=False):
     r = params.r
 
     # Calculate the hub force elements dH
-    dH_blade_ave, dH_blade_instantaneous = dH_blade(V_ia, params, debug)
+    dH_blade_ave = dH_blade(V_ia, params, debug)
 
     # Use equation 12 to calculate the torque elements from the hub elements
-    dQ_blade_ave = -dH_blade_ave * jnp.squeeze(r)
-    dQ_blade_instantaneous = -dH_blade_instantaneous * r
+    # Technically these should be the negative, but its easier to work with if they arent
+    dQ_blade_ave = dH_blade_ave * jnp.squeeze(r)
 
     if debug:
         print("------dQ_blade DEBUG------")
 
         print("dQ Shapes (inst., ave.):")
-        print((jnp.shape(dQ_blade_instantaneous), jnp.shape(dQ_blade_ave)))
+        print((jnp.shape(dQ_blade_ave)))
 
         print("V_ia shape:")
         print(jnp.shape(V_ia))
         
         print("------dT_blade DEBUG------")
 
-    return dQ_blade_ave, dQ_blade_instantaneous
+    return dQ_blade_ave
 
 
 ### Calculate thrust elements using momentum imparted to the air
@@ -245,15 +248,14 @@ def dT_momentum(V_ia, params, debug=False):
     # Calculate the total prandtl loss correction factor
     F = jnp.multiply(tip_loss, root_loss) 
 
-    # Momentum theory about annular element 
-    dT_momentum_instantaneous = 2 * rho * r * V_ia * V_prime * F * dr[:, None]  
-    dT_momentum = jnp.trapezoid(dT_momentum_instantaneous, psi, axis=1)
+    # Momentum theory about annular element
+    dT_momentum = 2 * rho * jnp.squeeze(r) * jnp.trapezoid(V_ia * V_prime * F, psi, axis=1) * dr
 
     if debug:
         print("------dT_momentum DEBUG------")
 
-        print("dT Shapes (inst., ave.):")
-        print((jnp.shape(dT_momentum_instantaneous), jnp.shape(dT_momentum)))
+        print("dT Shapes (ave.):")
+        print(jnp.shape(dT_momentum))
 
         print("V_ia shape:")
         print(jnp.shape(V_ia))
@@ -263,7 +265,7 @@ def dT_momentum(V_ia, params, debug=False):
         
         print("------dT_momentum DEBUG------")
 
-    return dT_momentum, dT_momentum_instantaneous
+    return dT_momentum
 
 
 def thrust_residual(V_ia_0_guess, params):
@@ -284,7 +286,7 @@ def thrust_residual(V_ia_0_guess, params):
 
     dT_BEMT_average, _ = dT_blade(V_ia, params, debug=False) # get the average elements (1st output) only
 
-    dT_MMNT_average, _ = dT_momentum(V_ia, params, debug=False) # get the average elements (1st output) only
+    dT_MMNT_average = dT_momentum(V_ia, params, debug=False) # get the average elements (1st output) only
 
     dT_residual = dT_BEMT_average - dT_MMNT_average
 
@@ -301,6 +303,10 @@ def induced_velocity(params):
     [Waqas Khan and Meyer Nolan 2015] for insight into variables. 
     
     Same paper used for equations
+
+    Returns:
+        V_ia: Induced velocity at each azimuthal and radial point (size[n_r, n_psi])
+        V_ia_0: Velocity induced by each annulus at the center of the propeller (size[n_r, ])
     '''
 
     # Debug Check Initial Residuals
@@ -322,7 +328,7 @@ def induced_velocity(params):
         print("Residuals Check:", res_check)
 
     V_ia = inflow_model(V_ia_0, params)
-    return V_ia
+    return V_ia, V_ia_0
 
 
 def torque(V_ia, params, debug=False):
@@ -345,7 +351,7 @@ def torque(V_ia, params, debug=False):
     r = jnp.squeeze(params.r)
 
     # Get the average torque per rotation in each annulus using the dQ_blade function
-    dQ_blade_ave = dQ_blade(V_ia, params, debug)[0]
+    dQ_blade_ave = dQ_blade(V_ia, params, debug)
 
     # Use trapezoidal integration in the radial direction to compute the total torque
     Q = jnp.trapezoid(dQ_blade_ave, r)
@@ -358,7 +364,7 @@ def thrust(V_ia, params):
     Calculate total thrust from solved induced velocity
     '''
     r = jnp.squeeze(params.r)
-    dT = dT_momentum(V_ia,params)[0]
+    dT = dT_momentum(V_ia,params)
 
     # Numerically Compute Double Integral to Solve for Thrust
     T = jnp.trapezoid(dT, r)
@@ -468,7 +474,7 @@ def flatblade(R, c, beta, N, plot=False):
     #jax.tree_util.register_dataclass(Params) (depreciated for now)
     
     # Solve Induced Velocity
-    V_ia = induced_velocity(params)  # shape (Nr, Npsi)
+    V_ia, _ = induced_velocity(params)  # shape (Nr, Npsi)
 
     # Calculate total thrust
     T = thrust(V_ia, params)
@@ -526,7 +532,7 @@ if __name__ == "__main__":
         #jax.tree_util.register_dataclass(Params)
 
         # Solve
-        V_ia = induced_velocity(params)
+        V_ia, _ = induced_velocity(params)
 
         # Plot Induced Velocity Distribution about singular annulus
         plt.plot(jnp.degrees(params.psi), V_ia[1])

@@ -17,7 +17,7 @@ class Inputs(eqx.Module):
 
     # Thrust constraint
     solvertype: str = "T"
-    thrust: float = 25 # Newtons
+    thrust: float = 100 # Newtons
 
     # Normalisation for Power (update with flat-plate guess)
     power_scale: float = 1000
@@ -28,9 +28,9 @@ class Inputs(eqx.Module):
 
     ## Discretisation settings
     # Radial discretisation
-    n_r: int = 15
+    n_r: int = 50
     # Azimuthal discretisation (for skewed inflow)
-    n_psi: int = 9
+    n_psi: int = 36
 
     # Diagnostics / debugging
     verbose: bool = False

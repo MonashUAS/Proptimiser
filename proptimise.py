@@ -18,21 +18,34 @@ def curvature_penalty(x):
     d2 = x[2:] - 2.0 * x[1:-1] + x[:-2]
     return jnp.mean(d2**2)
 
+def minimumInducedLossCost(V_ia_0, scale=1):
+    """
+    Returns the cost function of minimum induced loss, that is the RMS of the 
+    variation of the induced velocity at the center of the propeller by each annulus
+    """
+
+    mean_V_ia = jnp.mean(V_ia_0)
+
+    squared_err = (mean_V_ia - V_ia_0)**2
+
+    rms_err = jnp.sqrt(jnp.sum(squared_err))
+
+    return rms_err*scale
 
 #Returns the power, thrust error and smoothness penalty
 def base_objective(c, beta, params_static):
 
     params = replace(params_static, c=c, beta=beta)
-    V_ia   = propmodel.induced_velocity(params)
+    V_ia, V_ia_0   = propmodel.induced_velocity(params)
 
     power  = jnp.squeeze(propmodel.mechanicalPower(V_ia, params))
     thrust = jnp.squeeze(propmodel.thrust(V_ia, params))
 
     thrust_err = thrust - Inputs.thrust
 
-    #torque = jnp.squeeze(propmodel.torque(V_ia, params))
+    rms_MIL_err = minimumInducedLossCost(V_ia_0, scale=1)
 
-    return power, thrust_err
+    return power, thrust_err, thrust, rms_MIL_err
 
 
 #Scaled Aug. lagrangian, returns the actual Lagrangian 
@@ -42,15 +55,10 @@ def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, lmbda, mu)
     c = c_scaled*c_scale
     beta = beta_scaled*beta_scale
 
-    power, thrust_err = base_objective(c, beta, params_static)
-
+    power, thrust_err, _, rms_MIL_err = base_objective(c, beta, params_static)
     #print(power)
 
-    return (
-        power
-        + lmbda * thrust_err
-        + 0.5 * mu * thrust_err**2
-    )
+    return (rms_MIL_err**2*1000 + thrust_err**2)
 
 
 
@@ -71,8 +79,8 @@ def run_optimization():
     psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
     r, dr = propmodel.radial_stops(0.225, 0.05, Inputs.n_r)
 
-    init_c = jnp.full(Inputs.n_r, 0.02)
-    init_beta = jnp.full(Inputs.n_r, jnp.radians(5))
+    init_c = jnp.full(Inputs.n_r, 0.010)
+    init_beta = jnp.full(Inputs.n_r, jnp.radians(2))
 
     params_static = Params(
         N=2,
@@ -81,8 +89,8 @@ def run_optimization():
         beta=init_beta[:,None],
         r=r[:, None], dr=dr,
         psi=psi[None, :], dpsi=dpsi,
-        V_x=jnp.array([10]), V_yz=jnp.array([2]),
-        omega=jnp.array([2*jnp.pi*8000/60]),
+        V_x=jnp.array([0]), V_yz=jnp.array([0]),
+        omega=jnp.array([840]), # rad/s
         V_ia_0 = jnp.full((Inputs.n_r,), jnp.array([4.0]))
     )
 
@@ -98,12 +106,12 @@ def run_optimization():
     #Bounds (chord + beta pairs) (scaled)
     bounds = (
         (
-            jnp.full_like(params_static.c, 0.001/c_scale),
-            jnp.full_like(params_static.beta, jnp.radians(2) / beta_scale),
+            jnp.full_like(params_static.c, 0.005/c_scale),
+            jnp.full_like(params_static.beta, jnp.radians(-5) / beta_scale),
         ),
         (
             jnp.full_like(params_static.c, 0.05/c_scale),
-            jnp.full_like(params_static.beta, jnp.radians(70) / beta_scale),
+            jnp.full_like(params_static.beta, jnp.radians(25) / beta_scale),
         )
     )
 
@@ -119,10 +127,10 @@ def run_optimization():
 
     #Set arbtitrarily high to initiate solver 
     prev_err = 1e12
-    print(f"{'Iter':<6} | {'Power':<12} | {'Thrust Err':<12} | {'Lambda':<12} | {'Mu':<10}")
-    print("-" * 65)
+    print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Lambda':<12} | {'Mu':<10}")
+    print("-" * 117)
 
-    for i in range(100):
+    for i in range(5):
 
         sol = solver.run(
             vars_scaled,
@@ -141,12 +149,11 @@ def run_optimization():
 
         params_warm = replace(params_static, c=jnp.squeeze(c), beta=jnp.squeeze(beta))
 
-        V_ia_converged = propmodel.induced_velocity(params_warm)
-        V_ia_0_new = jnp.mean(V_ia_converged, axis=1) 
+        V_ia_converged, V_ia_0_new = propmodel.induced_velocity(params_warm)
         params_static = replace(params_static, V_ia_0=V_ia_0_new)
-        power, thrust_err = base_objective(c, beta, params_static)
+        power, thrust_err, thrust, rms_MIL_err = base_objective(c, beta, params_static)
 
-        print(f"{i:<6} | {float(power):<12.4f} | {float(thrust_err):<12.4e} | {lmbda:<12.4f} | {mu:<10.1f}")
+        print(f"{i:<6} | {float(power):<12.4f} | {float(thrust):<12.4f} | {float(thrust_err):<12.4f} | {rms_MIL_err:<10.1f} | {lmbda:<12.4f} | {mu:<10.1f}")
 
         # Convergence
         if abs(thrust_err) < eta_tol:
@@ -154,10 +161,7 @@ def run_optimization():
             break
 
         #AL update
-        if abs(thrust_err) > 0.25 * prev_err:
-            mu = min(mu * mu_scale, mu_max)
 
-        lmbda += mu * thrust_err
         prev_err = abs(thrust_err)
 
         """
@@ -165,22 +169,29 @@ def run_optimization():
         V_ia = propmodel.inflow_model(V_ia_0_new, params_warm)
         dT_bld = propmodel.dT_blade(V_ia, params_warm, debug=False)[0]
         dT_mom = propmodel.dT_momentum(V_ia, params_warm, debug=False)[0]
+        dQ_bld = propmodel.dQ_blade(V_ia, params_warm, debug=False)[0]
 
-        fig, axes = plt.subplots(3, 1, figsize=(6, 10))
+        fig, axes = plt.subplots(2, 2, figsize=(4, 4))
 
-        axes[0].plot(r, c)
-        axes[0].stem(r, c)
-        axes[0].set_title("Chord (m)")
-        axes[0].set_xlabel("r/R")
+        axes[0][0].plot(r, c)
+        axes[0][0].stem(r, c)
+        axes[0][0].set_ylabel("Chord (m)")
+        axes[0][0].set_xlabel("r (m)")
 
-        axes[1].plot(r, jnp.degrees(beta))
-        axes[1].stem(r, jnp.degrees(beta))
-        axes[1].set_title("Twist (deg)")
-        axes[1].set_xlabel("r/R")
+        axes[0][1].plot(r, jnp.degrees(beta))
+        axes[0][1].stem(r, jnp.degrees(beta))
+        axes[0][1].set_ylabel("Twist (deg)")
+        axes[0][1].set_xlabel("r (m)")
 
-        axes[2].plot(r, dT_mom, label="Momentum")
-        axes[2].plot(r, dT_bld, '--', label="BEMT")
-        axes[2].legend()
+        axes[1][0].plot(r, dT_mom, label="Momentum")
+        axes[1][0].plot(r, dT_bld, '--', label="BEMT")
+        axes[1][0].set_ylabel("Local thrust (N/m)")
+        axes[1][0].set_xlabel("r (m)")
+        axes[1][0].legend()
+        
+        axes[1][1].plot(r, dQ_bld)
+        axes[1][1].set_ylabel("Local torque (Nm/m)")
+        axes[1][1].set_xlabel("r (m)")
 
         plt.tight_layout()
         plt.show()
@@ -203,15 +214,15 @@ if __name__ == "__main__":
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
-    axes[0].plot(r / params_opt.R, c / params_opt.R)
-    axes[0].stem(r / params_opt.R, c / params_opt.R)
-    axes[0].set_title("Chord (m)")
-    axes[0].set_xlabel("r/R")
+    axes[0].plot(r, c)
+    axes[0].stem(r, c)
+    axes[0].set_title("Chord (mm)")
+    axes[0].set_xlabel("r (mm)")
 
-    axes[1].plot(r / params_opt.R, jnp.degrees(beta))
-    axes[1].stem(r / params_opt.R, jnp.degrees(beta))
+    axes[1].plot(r, jnp.degrees(beta))
+    axes[1].stem(r, jnp.degrees(beta))
     axes[1].set_title("Twist (deg)")
-    axes[1].set_xlabel("r/R")
+    axes[0].set_xlabel("r (mm)")
 
     plt.tight_layout()
     plt.show()
