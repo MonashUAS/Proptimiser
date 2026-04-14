@@ -135,9 +135,9 @@ def run_optimization():
 
     #Set arbtitrarily high to initiate solver
     print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Lambda':<12} | {'Mu':<10}")
-    print("-" * 117)
+    print("-" * 90)
 
-    for i in range(50):
+    for i in range(3):
 
         sol = solver.run(
             vars_scaled,
@@ -154,6 +154,25 @@ def run_optimization():
         c = vars_scaled[0] * c_scale
         beta = vars_scaled[1] * beta_scale
 
+        # The dirtiest, jankiest, most intrusive fix ever part 1:
+        # Record the shape of the c_final and beta_final arrays
+        c_shape = c.shape
+        beta_shape = beta.shape
+
+        # Use the foil interpolators to generate rational functions for the chord and beta distribution
+        # Refer to https://www.itl.nist.gov/div898/handbook/pmd/section8/pmd812b.htm for choosing P and Q
+        c_fit_params = RationalFunctionInterp(r, jnp.squeeze(c), P_c, Q_c, verbose=Smoothing_log, extendedChecking=True, method='dogbox')
+        beta_fit_params = RationalFunctionInterp(r, jnp.squeeze(beta), P_beta, Q_beta, verbose=Smoothing_log, extendedChecking=True, method='trf')
+
+        # Use the fit params to calculate smoothed beta and chord distributions
+        c_smoothed = RationalFunction(r, list(c_fit_params[0:P_c]), list(c_fit_params[P_c:len(c_fit_params)]))
+        beta_smoothed = RationalFunction(r, list(beta_fit_params[0:P_beta]), list(beta_fit_params[P_beta:len(beta_fit_params)]))
+
+        # The dirtiest, jankiest, most intrusive fix ever part 2:
+        # Enforce the recorded shape of the c_final and beta_final arrays
+        c = jnp.reshape(c_smoothed, c_shape)
+        beta = jnp.reshape(beta_smoothed, beta_shape)
+
         params_warm = replace(params_static, c=jnp.squeeze(c), beta=jnp.squeeze(beta))
 
         V_ia_converged, V_ia_0_new = propmodel.induced_velocity(params_warm)
@@ -162,25 +181,6 @@ def run_optimization():
 
         print(f"{i:<6} | {float(power):<12.4f} | {float(thrust):<12.4f} | {float(thrust_err):<12.4f} | {rms_MIL_err:<10.1f} | {lmbda:<12.4f} | {mu:<10.1f}")
 
-    #TODO Add over-relaxation param for chord and beta using last chord and beta and new chord and beta guesses, add this after the new chord and beta are estimated and before the smoothing occurs
-        # The dirtiest, jankiest, most intrusive fix ever part 1:
-        # Record the shape of the c_final and beta_final arrays
-        c_shape = c_final.shape
-        beta_shape = beta_final.shape
-
-        # Use the foil interpolators to generate rational functions for the chord and beta distribution
-        # Refer to https://www.itl.nist.gov/div898/handbook/pmd/section8/pmd812b.htm for choosing P and Q
-        c_fit_params = RationalFunctionInterp(r, jnp.squeeze(c_final), P_c, Q_c, verbose=Smoothing_log, extendedChecking=True, method='dogbox')
-        beta_fit_params = RationalFunctionInterp(r, jnp.squeeze(beta_final), P_beta, Q_beta, verbose=Smoothing_log, extendedChecking=True, method='trf')
-
-        # Use the fit params to calculate smoothed beta and chord distributions
-        c_final = RationalFunction(r, list(c_fit_params[0:P_c]), list(c_fit_params[P_c:len(c_fit_params)]))
-        beta_final = RationalFunction(r, list(beta_fit_params[0:P_beta]), list(beta_fit_params[P_beta:len(beta_fit_params)]))
-
-        # The dirtiest, jankiest, most intrusive fix ever part 2:
-        # Enforce the recorded shape of the c_final and beta_final arrays
-        c_final = jnp.reshape(c_final, c_shape)
-        beta_final = jnp.reshape(beta_final, beta_shape)
         # Convergence
         if abs(thrust_err) < eta_tol:
             print(f"\nConverged at iteration {i} with thrust error {thrust_err:.2e}")
