@@ -1,0 +1,100 @@
+close all; clear all; clc;
+
+%% Inputs
+fileloca = "ARAD10\Polars\";
+smoothingparam = 0.7;
+debug = true; % to print debug plots or not
+verbose = true; % to print EXTRA debug plots or not
+
+files = dir(fileloca);
+files = files(~[files.isdir]); % eliminate non file files from the list
+
+fitalphas = -90:0.5:90;
+
+fitdatacls = zeros(length(fitalphas), length(files));
+fitdatacds = zeros(length(fitalphas), length(files));
+fitdataRE = zeros(length(files), 1);
+fitdataMA = zeros(length(files), 1);
+
+for ff = 1:length(files)
+    % Get the data from that airfoil
+
+    foildata = importdata(strcat(fileloca, files(ff).name));
+    
+    foilalphas = foildata.data(:, 1);
+    foilCls = foildata.data(:, 2);
+    foilCds = foildata.data(:, 3);
+    
+    if debug
+        %figure('name', "Airfoil data and curve fits")
+        subplot(2, 1, 1)
+        plot(foilalphas, foilCls, '*', foilalphas, foilCds, '*')
+        xlabel("alpha")
+        legend("Cl", "Cd")
+        subplot(2, 1, 2)
+        plot(foilalphas, foilCls./foilCds, '*')
+        xlabel("alpha")
+        legend("Cl / Cd")
+    end
+
+    % extend the foil data, first get the step size in alpha
+    alpha_step_size = mode(foilalphas(2:end)-foilalphas(1:end-1));
+    preamble = -90:alpha_step_size:foilalphas(1); preamble = preamble(1:end-1);
+    postamble = foilalphas(end):alpha_step_size:90; postamble = postamble(2:end);
+    foilalphas = [preamble, foilalphas(1:end).', postamble];
+    foilCls = [NaN(size(preamble)), foilCls.', NaN(size(postamble))];
+    foilCds = [NaN(size(preamble)), foilCds.', NaN(size(postamble))];
+    
+    % We have a bunch of nan values filling in our data, lets replace those
+    % with either: 1-cos(alpha) with matching cD at limit of XFLR5 data
+    % or with: sin(alpha)*max(CL) for CL
+    fillerCL = sind(foilalphas) * max(foilCls);
+    fillerCD = cosd(foilalphas) * max(foilCds) / (1 - cosd(postamble(1)));
+
+    % Apply our fillers wherever foil data is nan
+    foil
+
+    % ensure you have curve fitting toolbox available
+    foilClsfit = fit(foilalphas.', foilCls.', 'smoothingspline', 'SmoothingParam', smoothingparam);
+    foilCls = feval(foilClsfit, fitalphas);
+    
+    foilCdsfit = fit(foilalphas.', foilCds.', 'smoothingspline', 'SmoothingParam', smoothingparam);
+    foilCds = feval(foilCdsfit, fitalphas);
+    
+    if debug
+        subplot(2, 1, 1)
+        hold on
+        plot(fitalphas, foilCls, fitalphas, foilCds)
+        xlabel("alpha")
+        legend("Cl", "Cd")
+        xline(0, 'k')
+        yline(0, 'k')
+        subplot(2, 1, 2)
+        hold on
+        plot(fitalphas, foilCls./foilCds)
+        xlabel("alpha")
+        legend("Cl / Cd")
+        xline(0, 'k')
+        yline(0, 'k')
+    end
+    
+    fitdatacls(:, ff) = foilCls;
+    fitdatacds(:, ff) = foilCds;
+    
+    mIndex = strfind(files(ff).name, "_M");
+    mIndex = mIndex(end); % Get the last _m in the name (will always be mach number)
+    rIndex = strfind(files(ff).name, "_Re");
+    rIndex = rIndex(end); % Get the last _Re in the name (will always be mach number)
+
+    fitdataMA(ff) = str2double(files(ff).name(mIndex+2:mIndex+5));
+    fitdataRE(ff) = str2double(files(ff).name(rIndex+3:rIndex+7))*1000000;
+end
+
+% Need to now interpolate in 3D
+fitdataRE = unique(fitdataRE);
+fitdataMA = unique(fitdataMA);
+
+fitalphas = fitalphas.';
+
+fitdatacls = reshape(fitdatacls, [length(fitalphas), length(fitdataRE), length(fitdataMA)]);
+fitdatacds = reshape(fitdatacds, [length(fitalphas), length(fitdataRE), length(fitdataMA)]);
