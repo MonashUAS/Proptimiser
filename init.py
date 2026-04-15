@@ -50,7 +50,7 @@ class Inputs(eqx.Module):
     Ord_Numerator_c = 2
     # Set the highest power in the numerator and denominator of the beta smoothing function
     Ord_Denominator_beta = 2
-    Ord_Numerator_beta = 3
+    Ord_Numerator_beta = 1
     # Set whether the smoothing function reports on quality of the smoothing attempt
     Smoothing_log = False
 

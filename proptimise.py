@@ -10,6 +10,9 @@ import propmodel
 from Foil_Interpolators import RationalFunctionInterp, RationalFunction
 
 
+import airflow as afl
+
+
 # Set jax debugging
 jax.config.update("jax_traceback_filtering", "quiet_remove_frames")
 jax.config.update("jax_check_tracer_leaks", "off")
@@ -131,13 +134,13 @@ def run_optimization():
     #Augmented Lagrangian params
     lmbda = 0
     mu = 1
-    eta_tol = 1e-3
+    eta_tol = 1e0
 
     #Set arbtitrarily high to initiate solver
     print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Lambda':<12} | {'Mu':<10}")
     print("-" * 90)
 
-    for i in range(3):
+    for i in range(50):
 
         sol = solver.run(
             vars_scaled,
@@ -170,8 +173,8 @@ def run_optimization():
 
         # The dirtiest, jankiest, most intrusive fix ever part 2:
         # Enforce the recorded shape of the c_final and beta_final arrays
-        c = jnp.reshape(c_smoothed, c_shape)
-        beta = jnp.reshape(beta_smoothed, beta_shape)
+        c = c_smoothed#jnp.reshape(c_smoothed, c_shape)
+        beta = beta_smoothed#jnp.reshape(beta_smoothed, beta_shape)
 
         params_warm = replace(params_static, c=jnp.squeeze(c), beta=jnp.squeeze(beta))
 
@@ -190,13 +193,18 @@ def run_optimization():
 
         prev_err = abs(thrust_err)
 
-        """
+        
         # Calculate the new thrust per annulus for blade and momentum equations
         V_ia = propmodel.inflow_model(V_ia_0_new, params_warm)
         dT_bld = propmodel.dT_blade(V_ia, params_warm, debug=False)[0]
-        dT_mom = propmodel.dT_momentum(V_ia, params_warm, debug=False)[0]
-        dQ_bld = propmodel.dQ_blade(V_ia, params_warm, debug=False)[0]
+        dT_mom = propmodel.dT_momentum(V_ia, params_warm, debug=False)
+        dQ_bld = propmodel.dQ_blade(V_ia, params_warm, debug=False)
 
+        F_tip = afl.prandtl_tip_loss(V_ia, params_warm)
+
+        plt.contourf(psi, r, F_tip)
+
+        """
         fig, axes = plt.subplots(2, 2, figsize=(4, 4))
 
         axes[0][0].plot(r, c)
@@ -218,10 +226,10 @@ def run_optimization():
         axes[1][1].plot(r, dQ_bld)
         axes[1][1].set_ylabel("Local torque (Nm/m)")
         axes[1][1].set_xlabel("r (m)")
+        """
 
         plt.tight_layout()
         plt.show()
-        """
         
 
     else:

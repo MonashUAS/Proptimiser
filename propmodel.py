@@ -361,7 +361,7 @@ def thrust(V_ia, params):
     Calculate total thrust from solved induced velocity
     '''
     r = jnp.squeeze(params.r)
-    dT = dT_blade(V_ia,params)[0]
+    dT = dT_momentum(V_ia,params)
 
     # Numerically Compute Double Integral to Solve for Thrust
     T = jnp.trapezoid(dT, x=r)
