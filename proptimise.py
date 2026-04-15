@@ -8,7 +8,7 @@ from init import Params, Inputs
 import propmodel
 
 from Foil_Interpolators import RationalFunctionInterp, RationalFunction
-
+from airflow import resultantVelocityComponents, tip_root_loss_factors
 
 import airflow as afl
 
@@ -75,6 +75,71 @@ def compute_gradient_scales(init_c, init_beta, params_static):
     return c_scale, beta_scale
 
 
+def debugPlotting(V_ia_0_new, params):
+    # Unpack relevant props from params
+    r, c, beta = params.r, params.c, params.beta
+
+    # Calculate the new thrust per annulus for blade and momentum equations
+    V_ia = propmodel.inflow_model(V_ia_0_new, params)
+    dT_bld = propmodel.dT_blade(V_ia, params, debug=False)[0]
+    dT_mom = propmodel.dT_momentum(V_ia, params, debug=False)
+    dQ_bld = propmodel.dQ_blade(V_ia, params, debug=False)
+
+    # Tip and Root Loss Factors
+    tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
+
+    # Calculate the total prandtl loss correction factor
+    F = jnp.multiply(tip_loss, root_loss) 
+
+    # Calculate the average value of F across each annulus
+    F_means_annuli = jnp.mean(F, axis=1)
+
+    # calculate aerodynamic incidence
+    _, phi = resultantVelocityComponents(V_ia, params) # get only second output
+
+    # load relevant data from inputs
+    geometric_angle = beta[:, None]
+
+    # Angle of attack
+    AoA_eff = geometric_angle - phi
+
+    fig, axes = plt.subplots(3, 2, figsize=(4, 4))
+
+    axes[0][0].plot(r, c)
+    axes[0][0].stem(r, c)
+    axes[0][0].set_ylabel("Chord (m)")
+    axes[0][0].set_xlabel("r (m)")
+    axes[0][0].set_title("Propeller chord dist.")
+
+    axes[0][1].plot(r, jnp.degrees(beta), 'b', label="Twist angle")
+    axes[0][1].plot(r, jnp.degrees(AoA_eff), 'r', label="Aerodynamic angle")
+    axes[0][1].set_ylabel("Angle (deg)")
+    axes[0][1].set_xlabel("r (m)")
+    axes[0][1].set_title("Propeller twist (blue) and AoA dist. (red)")
+
+    axes[1][0].plot(r, dT_mom, label="Momentum")
+    axes[1][0].plot(r, dT_bld, '--', label="BEMT")
+    axes[1][0].set_ylabel("Local thrust (N/m)")
+    axes[1][0].set_xlabel("r (m)")
+    axes[1][0].legend()
+    axes[1][0].set_title("Propeller annulus thrust dist.")
+
+    axes[1][1].plot(r, dQ_bld)
+    axes[1][1].set_ylabel("Local torque (Nm/m)")
+    axes[1][1].set_xlabel("r (m)")
+    axes[1][1].set_title("Propeller annulus torque dist.")
+
+    axes[2][0].plot(r, F_means_annuli)
+    axes[2][0].set_ylabel("Local loss factor F")
+    axes[2][0].set_xlabel("r (m)")
+    axes[2][0].set_title("Propeller annulus average Prandtl factor (F)")
+
+    axes[2][1].set_title("--- UNUSED ---")
+
+    plt.tight_layout()
+    plt.show()
+
+
 # Optimisation
 def run_optimization():
     jax.config.update("jax_enable_x64", True) # Use 64 Bit Precision
@@ -83,8 +148,8 @@ def run_optimization():
     psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
     r, dr = propmodel.radial_stops(0.225, 0.05, Inputs.n_r)
 
-    init_c = jnp.full(Inputs.n_r, 0.010)
-    init_beta = jnp.full(Inputs.n_r, jnp.radians(2))
+    init_c = jnp.full(Inputs.n_r, 0.020)
+    init_beta = jnp.full(Inputs.n_r, jnp.radians(5))
 
     params_static = Params(
         N=2,
@@ -153,7 +218,8 @@ def run_optimization():
         )
 
         vars_scaled = sol.params
-        #Unscale
+
+        #Unscale C and beta
         c = vars_scaled[0] * c_scale
         beta = vars_scaled[1] * beta_scale
 
@@ -187,44 +253,9 @@ def run_optimization():
 
         prev_err = abs(thrust_err)
 
+        if Inputs.interIterationDebug:
+            debugPlotting(V_ia_0_new, params_warm)
         
-        # Calculate the new thrust per annulus for blade and momentum equations
-        V_ia = propmodel.inflow_model(V_ia_0_new, params_warm)
-        dT_bld = propmodel.dT_blade(V_ia, params_warm, debug=False)[0]
-        dT_mom = propmodel.dT_momentum(V_ia, params_warm, debug=False)
-        dQ_bld = propmodel.dQ_blade(V_ia, params_warm, debug=False)
-
-        #F_tip = afl.prandtl_tip_loss(V_ia, params_warm)
-
-        #plt.contourf(psi, r, F_tip)
-
-        
-        fig, axes = plt.subplots(2, 2, figsize=(4, 4))
-
-        axes[0][0].plot(r, c)
-        axes[0][0].stem(r, c)
-        axes[0][0].set_ylabel("Chord (m)")
-        axes[0][0].set_xlabel("r (m)")
-
-        axes[0][1].plot(r, jnp.degrees(beta))
-        axes[0][1].stem(r, jnp.degrees(beta))
-        axes[0][1].set_ylabel("Twist (deg)")
-        axes[0][1].set_xlabel("r (m)")
-
-        axes[1][0].plot(r, dT_mom, label="Momentum")
-        axes[1][0].plot(r, dT_bld, '--', label="BEMT")
-        axes[1][0].set_ylabel("Local thrust (N/m)")
-        axes[1][0].set_xlabel("r (m)")
-        axes[1][0].legend()
-        
-        axes[1][1].plot(r, dQ_bld)
-        axes[1][1].set_ylabel("Local torque (Nm/m)")
-        axes[1][1].set_xlabel("r (m)")
-
-        plt.tight_layout()
-        plt.show()
-        
-
     else:
         print(f"\nWarning: max iterations reached. Final thrust error: {thrust_err:.2e}")
         

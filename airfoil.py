@@ -24,7 +24,7 @@ def parametric_coeffs(V_ia, params):
     # Constants:
     C_La = 5.7     # Lift curve slope per rad (ARAD10)
     C_D90 = 1.98    # Drag coefficient at 90 degrees angle of attack (flat plate)
-    C_D0 = 0.035    # Zero lift drag coefficient (ARAD10)
+    C_D0 = 0.0175    # Zero lift drag coefficient (ARA-D 10)
     AoA_0 = jnp.radians(10) # zero lift angle of attack
 
     # load relevant data from inputs
