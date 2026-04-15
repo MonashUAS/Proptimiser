@@ -145,7 +145,7 @@ def dH_blade(V_ia, params, debug=False):
 
     # Average thrust in each annulus over one rotation (using formulation from the text prior to statement of eqn. 6)
     # Average thrust per annulus is the integral of the instantaneous thrust element divided by 2*pi
-    dH_blade_ave = N/(4*jnp.pi) * rho * c * jnp.trapezoid(inner, x=psi, axis=1) #* dr
+    dH_blade_ave = N/(4*jnp.pi) * rho * c * jnp.trapezoid(inner, x=psi, axis=1)
 
     if debug:
         print("------dH_blade DEBUG------")
@@ -246,7 +246,7 @@ def dT_momentum(V_ia, params, debug=False):
     F = jnp.multiply(tip_loss, root_loss) 
 
     # Momentum theory about annular element
-    dT_momentum = 2 * rho * jnp.squeeze(r) * jnp.trapezoid(V_ia * V_prime * F, x=psi, axis=1) #* dr
+    dT_momentum = 2 * rho * jnp.squeeze(r) * jnp.trapezoid(V_ia * V_prime * F, x=psi, axis=1)
 
     if debug:
         print("------dT_momentum DEBUG------")
