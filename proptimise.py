@@ -103,6 +103,9 @@ def debugPlotting(V_ia_0_new, params):
     # Angle of attack
     AoA_eff = geometric_angle - phi
 
+    # Calculate the average value of V_ia across each annulus
+    V_ia_means = jnp.mean(V_ia, axis=1)
+
     fig, axes = plt.subplots(3, 2, figsize=(4, 4))
 
     axes[0][0].plot(r, c)
@@ -134,7 +137,10 @@ def debugPlotting(V_ia_0_new, params):
     axes[2][0].set_xlabel("r (m)")
     axes[2][0].set_title("Propeller annulus average Prandtl factor (F)")
 
-    axes[2][1].set_title("--- UNUSED ---")
+    axes[2][1].plot(r, V_ia_means)
+    axes[2][1].set_ylabel("Local induced axial velocity (m/s)")
+    axes[2][1].set_xlabel("r (m)")
+    axes[2][1].set_title("Propeller annulus average axial induced velocity")
 
     plt.tight_layout()
     plt.show()
