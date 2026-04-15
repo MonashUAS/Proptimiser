@@ -135,12 +135,12 @@ def prandtl_tip_loss(V_ia, params):
     r = params.r
     phi = jnp.abs(resultantVelocityComponents(V_ia, params)[1]) # get only second output
 
-    f_tip = B/2 * (R - r) / (r * jnp.sin(phi)) + eps
+    f_tip = B/2 * (R - r) / (r * jnp.sin(phi))
     
     # exp(-f_root) can exceed 1.0 slightly due to floating point error, we 
-    # need to clip this to guarantee that arccos functions as expected
-    f = jnp.clip(jnp.exp(-f_tip), -1.0, 1.0)
-    #f = f.at[len(f)].set(0)
+    # need to clip this to guarantee that arccos functions as expected. To prevent
+    # NaN errors, upper bound should be eps lower than 1.0. 
+    f = jnp.clip(jnp.exp(-f_tip), -1.0, 1.0 - eps)
     
     F_tip = (2/jnp.pi) * jnp.arccos(f)
 
@@ -161,12 +161,11 @@ def prandtl_root_loss(V_ia, params):
     r = params.r
     phi = jnp.abs(resultantVelocityComponents(V_ia, params)[1]) # get only second output
 
-    f_root = B/2 * (r - R_hub) / (r * jnp.sin(phi)) + eps 
+    f_root = B/2 * (r - R_hub) / (r * jnp.sin(phi))
     
     # exp(-f_root) can exceed 1.0 slightly due to floating point error, we 
     # need to clip this to guarantee that arccos functions as expected
-    f = jnp.abs(jnp.clip(jnp.exp(-f_root), -1.0, 1.0))
-    #f = f.at[1].set(0)
+    f = jnp.abs(jnp.clip(jnp.exp(-f_root), -1.0, 1.0 - eps))
 
     F_root = (2/jnp.pi) * jnp.arccos(f)
 
