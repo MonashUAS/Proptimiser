@@ -54,7 +54,7 @@ def base_objective(c, beta, params_static, milScale=1, thrScale=1):
 
 
 #Scaled Aug. lagrangian, returns the actual Lagrangian 
-def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_err=1, scale_THR_err=1):
+def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_err=1, scale_THR_err=1, scale_POW_cost=0.00025):
     c_scaled, beta_scaled = opt_vars_scaled
     
     c = c_scaled*c_scale
@@ -63,7 +63,9 @@ def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_
     power, thrust_err, _, rms_MIL_err = base_objective(c, beta, params_static, scale_MIL_err, scale_THR_err)
     #print(power)
 
-    return jnp.sqrt(thrust_err**2 + rms_MIL_err**2)
+    power_cost = power*scale_POW_cost
+
+    return jnp.sqrt(thrust_err**2 + rms_MIL_err**2 + power_cost**2)
 
 
 
@@ -205,13 +207,13 @@ def run_optimization():
     #Augmented Lagrangian params
     lmbda = 0
     mu = 1
-    eta_tol = 1e0
+    eta_tol = 1e-1
 
     #Set arbtitrarily high to initiate solver
     print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Lambda':<12} | {'Mu':<10}")
     print("-" * 90)
 
-    for i in range(5):
+    for i in range(15):
 
         sol = solver.run(
             vars_scaled,
@@ -272,21 +274,5 @@ def run_optimization():
 if __name__ == "__main__":
     params_opt = run_optimization()
 
-    r = params_opt.r * 1000 # get r in mm
-    c = params_opt.c * 1000 # get c in mm
-    beta = params_opt.beta
-
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-
-    axes[0].plot(r, c)
-    axes[0].stem(r, c)
-    axes[0].set_title("Chord (mm)")
-    axes[0].set_xlabel("r (mm)")
-
-    axes[1].plot(r, jnp.degrees(beta))
-    axes[1].stem(r, jnp.degrees(beta))
-    axes[1].set_title("Twist (deg)")
-    axes[0].set_xlabel("r (mm)")
-
-    plt.tight_layout()
-    plt.show()
+    V_ia_converged, V_ia_0_new = propmodel.induced_velocity(params_opt)
+    debugPlotting(V_ia_0_new, params_opt)

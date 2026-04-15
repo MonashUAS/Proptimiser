@@ -35,7 +35,7 @@ class Inputs(eqx.Module):
     # Diagnostics / debugging
     verbose: bool = False
     record_convergence_history: bool = False
-    interIterationDebug: bool = True
+    interIterationDebug: bool = False
 
     # Model Selection
     inflow_model: int = 0 # 0 = basic, 1 = Pitt & Peters, 2 = DTU
