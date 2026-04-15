@@ -39,8 +39,8 @@ class Inputs(eqx.Module):
     # Model Selection
     inflow_model: int = 0 # 0 = basic, 1 = Pitt & Peters, 2 = DTU
     coeff_method: int = 0 # 0 = parametric, 1 = lookup table
-    tip_loss_model: int = 0 # 0 = none, 1 = Prandtl
-    root_loss_model: int = 0 # 0 = none, 1 = Prandtl
+    tip_loss_model: int = 1 # 0 = none, 1 = Prandtl
+    root_loss_model: int = 1 # 0 = none, 1 = Prandtl
 
 
 

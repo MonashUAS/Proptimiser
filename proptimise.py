@@ -140,7 +140,7 @@ def run_optimization():
     print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Lambda':<12} | {'Mu':<10}")
     print("-" * 90)
 
-    for i in range(50):
+    for i in range(5):
 
         sol = solver.run(
             vars_scaled,
@@ -194,11 +194,11 @@ def run_optimization():
         dT_mom = propmodel.dT_momentum(V_ia, params_warm, debug=False)
         dQ_bld = propmodel.dQ_blade(V_ia, params_warm, debug=False)
 
-        F_tip = afl.prandtl_tip_loss(V_ia, params_warm)
+        #F_tip = afl.prandtl_tip_loss(V_ia, params_warm)
 
-        plt.contourf(psi, r, F_tip)
+        #plt.contourf(psi, r, F_tip)
 
-        """
+        
         fig, axes = plt.subplots(2, 2, figsize=(4, 4))
 
         axes[0][0].plot(r, c)
@@ -220,7 +220,6 @@ def run_optimization():
         axes[1][1].plot(r, dQ_bld)
         axes[1][1].set_ylabel("Local torque (Nm/m)")
         axes[1][1].set_xlabel("r (m)")
-        """
 
         plt.tight_layout()
         plt.show()

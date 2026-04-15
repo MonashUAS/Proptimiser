@@ -129,13 +129,13 @@ def prandtl_tip_loss(V_ia, params):
     Notation adapted from that source, with variables reallocated for consistency with literature
     '''
 
-    eps = 1e-6
+    eps = 1e-2
     B = params.N
     R = params.R
     r = params.r
     phi = jnp.abs(resultantVelocityComponents(V_ia, params)[1]) # get only second output
 
-    f_tip = B/2 * (R - r) / (r * jnp.sin(phi)) 
+    f_tip = B/2 * (R - r) / (r * jnp.sin(phi)) + eps
     
     # exp(-f_root) can exceed 1.0 slightly due to floating point error, we 
     # need to clip this to guarantee that arccos functions as expected
@@ -155,13 +155,13 @@ def prandtl_root_loss(V_ia, params):
     Notation adapted from that source, with variables reallocated for consistency with literature
     '''
 
-    eps = 1e-6
+    eps = 1e-2
     B = params.N
     R_hub = 0.05
     r = params.r
     phi = jnp.abs(resultantVelocityComponents(V_ia, params)[1]) # get only second output
 
-    f_root = B/2 * (r - R_hub) / (r * jnp.sin(phi) + eps) 
+    f_root = B/2 * (r - R_hub) / (r * jnp.sin(phi)) + eps 
     
     # exp(-f_root) can exceed 1.0 slightly due to floating point error, we 
     # need to clip this to guarantee that arccos functions as expected
