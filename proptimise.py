@@ -157,10 +157,6 @@ def run_optimization():
         c = vars_scaled[0] * c_scale
         beta = vars_scaled[1] * beta_scale
 
-        # The dirtiest, jankiest, most intrusive fix ever part 1:
-        # Record the shape of the c_final and beta_final arrays
-        c_shape = c.shape
-        beta_shape = beta.shape
 
         # Use the foil interpolators to generate rational functions for the chord and beta distribution
         # Refer to https://www.itl.nist.gov/div898/handbook/pmd/section8/pmd812b.htm for choosing P and Q
@@ -171,10 +167,8 @@ def run_optimization():
         c_smoothed = RationalFunction(r, list(c_fit_params[0:P_c]), list(c_fit_params[P_c:len(c_fit_params)]))
         beta_smoothed = RationalFunction(r, list(beta_fit_params[0:P_beta]), list(beta_fit_params[P_beta:len(beta_fit_params)]))
 
-        # The dirtiest, jankiest, most intrusive fix ever part 2:
-        # Enforce the recorded shape of the c_final and beta_final arrays
-        c = c_smoothed#jnp.reshape(c_smoothed, c_shape)
-        beta = beta_smoothed#jnp.reshape(beta_smoothed, beta_shape)
+        c = c_smoothed
+        beta = beta_smoothed
 
         params_warm = replace(params_static, c=jnp.squeeze(c), beta=jnp.squeeze(beta))
 
