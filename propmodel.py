@@ -59,7 +59,7 @@ def dT_blade(V_ia: jnp.ndarray, params: Params, debug: bool=False):
     Uses formulation from (M. Nahon et al., 2015) equations 5 and 6 modified with 
     the inclusion of the prandtl loss parameter 'F'
     """
-    
+
     # Unpack parameters
     N, c, psi = params.N, params.c, params.psi # geometric and positional values
     rho = params.rho # air density
@@ -82,7 +82,7 @@ def dT_blade(V_ia: jnp.ndarray, params: Params, debug: bool=False):
     # Average thrust in each annulus over one rotation (using formulation from the text prior to statement of eqn. 6)
     # Average thrust per annulus is the integral of the instantaneous thrust element divided by 2*pi
     dT_blade_ave = N/(2*jnp.pi) * jnp.trapezoid(dT_blade_instantaneous, x=psi, axis=1)
-
+  
     if debug:
         print("------dT_blade DEBUG------")
 
@@ -94,6 +94,9 @@ def dT_blade(V_ia: jnp.ndarray, params: Params, debug: bool=False):
 
         print("F shape:")
         print(jnp.shape(F))
+
+        print('dt_blade min:', dT_blade_ave.min())
+        print('dt_blade max:', dT_blade_ave.max())
         
         print("------dT_blade DEBUG------")
 
@@ -249,6 +252,7 @@ def dT_momentum(V_ia, params, debug=False):
     dT_momentum = 2 * rho * jnp.squeeze(r) * jnp.trapezoid(V_ia * V_prime * F, x=psi, axis=1)
 
     if debug:
+
         print("------dT_momentum DEBUG------")
 
         print("dT Shapes (ave.):")
@@ -259,7 +263,9 @@ def dT_momentum(V_ia, params, debug=False):
 
         print("F shape:")
         print(jnp.shape(F))
-        
+
+        print('dt_momentum min:', dT_momentum.min())
+        print('dt_momentum max:', dT_momentum.max())
         print("------dT_momentum DEBUG------")
 
     return dT_momentum
@@ -315,7 +321,10 @@ def induced_velocity(params):
         print("Residual min/max:", res_check.min(), res_check.max())
 
     # Newton Solver for Induced Velocity
-    solver = jaxopt.Broyden(fun=thrust_residual, maxiter=100, tol=Inputs.newton_eps, max_stepsize=5.0, implicit_diff=True)
+    solver = jaxopt.Broyden(fun=thrust_residual, maxiter=500, tol=Inputs.newton_eps, max_stepsize=0.50, implicit_diff=True)
+
+
+    
     # Input initial guess for induced velocity and solve. (Induced velocity is parametrised per radial stop)
     (V_ia_0, info) = solver.run(params.V_ia_0, params)
 
@@ -491,6 +500,7 @@ def flatblade(R, c, beta, N, plot=False):
         plt.show()
 
     return params, V_ia, T
+
 
 
 if __name__ == "__main__":

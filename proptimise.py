@@ -39,7 +39,7 @@ def minimumInducedLossCost(V_ia_0, scale=1):
     return rms_err*scale
 
 #Returns the power, thrust error and smoothness penalty
-def base_objective(c, beta, params_static, milScale=1, thrScale=1):
+def base_objective(c, beta, params_static, milScale=0.3, thrScale=1.5):
 
     params = replace(params_static, c=c, beta=beta)
     V_ia, V_ia_0   = propmodel.induced_velocity(params)
@@ -55,7 +55,7 @@ def base_objective(c, beta, params_static, milScale=1, thrScale=1):
 
 
 #Scaled Aug. lagrangian, returns the actual Lagrangian 
-def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_err=1, scale_THR_err=1, scale_POW_cost=0.00025):
+def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_err, scale_THR_err=1.5, scale_POW_cost=0.0005):
     c_scaled, beta_scaled = opt_vars_scaled
     
     c = c_scaled*c_scale
@@ -72,7 +72,7 @@ def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_
 
 #Gradient scaling (compute c and beta scales)
 def compute_gradient_scales(init_c, init_beta, params_static):
-    c_scale    = 1
+    c_scale    = 500
     beta_scale = 1
 
     return c_scale, beta_scale
@@ -198,12 +198,12 @@ def run_optimization():
         ),
         (
             jnp.full_like(params_static.c, 0.05/c_scale),
-            jnp.full_like(params_static.beta, jnp.radians(30) / beta_scale),
+            jnp.full_like(params_static.beta, jnp.radians(45) / beta_scale),
         )
     )
 
     #Solver
-    solver = jaxopt.ScipyBoundedMinimize(fun=objective_fn, method="L-BFGS-B", tol=1e-8, maxiter=1000)
+    solver = jaxopt.ScipyBoundedMinimize(fun=objective_fn, method="L-BFGS-B", tol=1e-4, maxiter=1000)
 
     #Augmented Lagrangian params
     lmbda = 0
@@ -214,7 +214,7 @@ def run_optimization():
     print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Lambda':<12} | {'Mu':<10}")
     print("-" * 90)
 
-    for i in range(2):
+    for i in range(20):
 
         sol = solver.run(
             vars_scaled,
@@ -222,8 +222,8 @@ def run_optimization():
             params_static=params_static,
             c_scale=c_scale,
             beta_scale=beta_scale,
-            scale_MIL_err=1,
-            scale_THR_err=1
+            scale_MIL_err=0.25,
+            scale_THR_err=1.5
         )
 
         vars_scaled = sol.params
@@ -252,6 +252,8 @@ def run_optimization():
         power, thrust_err, thrust, rms_MIL_err = base_objective(c, beta, params_static)
 
         print(f"{i:<6} | {float(power):<12.4f} | {float(thrust):<12.4f} | {float(thrust_err):<12.4f} | {rms_MIL_err:<10.1f} | {lmbda:<12.4f} | {mu:<10.1f}")
+
+        vars_scaled = (c/c_scale,beta_smoothed/beta_scale)
 
         # Convergence
         if abs(thrust_err) < eta_tol:
