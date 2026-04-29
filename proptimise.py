@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from dataclasses import replace
 from init import Params, Inputs
 import propmodel
+import airfoil
 
 from Foil_Interpolators import RationalFunctionInterp, RationalFunction
 from airflow import resultantVelocityComponents, tip_root_loss_factors
@@ -158,19 +159,42 @@ def run_optimization():
 
     init_c = jnp.full(Inputs.n_r, 0.020)
     init_beta = jnp.full(Inputs.n_r, jnp.radians(5))
-
-    params_static = Params(
-        N=2,
-        R=jnp.max(r),
-        c=init_c[:, None],
-        beta=init_beta[:,None],
-        r=r[:, None], dr=dr,
-        psi=psi[None, :], dpsi=dpsi,
-        V_x=jnp.array([0]), V_yz=jnp.array([0]),
-        omega=jnp.array([840]), # rad/s
-        V_ia_0 = jnp.full((Inputs.n_r,), jnp.array([4.0]))
-    )
     
+    # If using a lookup table for airfoil coefficients precompute interpolators
+    if(Inputs.coeff_method):
+        # Define the input tables
+        input_filename = "compiledData-ARAD10.txt"
+
+        # Generate the interpolators
+        cl_interpolator, cd_interpolator = airfoil.loadAirfoilData(input_filename)
+
+        params_static = Params(
+            N=2,
+            R=jnp.max(r),
+            c=init_c[:, None],
+            beta=init_beta[:,None],
+            r=r[:, None], dr=dr,
+            psi=psi[None, :], dpsi=dpsi,
+            V_x=jnp.array([0]), V_yz=jnp.array([0]),
+            omega=jnp.array([840]), # rad/s
+            V_ia_0 = jnp.full((Inputs.n_r,), jnp.array([4.0])),
+            cdInterpolator=cd_interpolator,
+            clInterpolator=cl_interpolator
+        )
+    else:
+        params_static = Params(
+            N=2,
+            R=jnp.max(r),
+            c=init_c[:, None],
+            beta=init_beta[:,None],
+            r=r[:, None], dr=dr,
+            psi=psi[None, :], dpsi=dpsi,
+            V_x=jnp.array([0]), V_yz=jnp.array([0]),
+            omega=jnp.array([840]), # rad/s
+            V_ia_0 = jnp.full((Inputs.n_r,), jnp.array([4.0]))
+        )
+
+
     P_c = Inputs.Ord_Numerator_c
     Q_c = Inputs.Ord_Denominator_c
 

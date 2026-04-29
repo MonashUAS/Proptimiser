@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import equinox as eqx
 import jax.numpy as jnp
+import jax.scipy as jsp
 
 # Freeze configuration parameters at runtime
 class Inputs(eqx.Module):
@@ -39,11 +40,9 @@ class Inputs(eqx.Module):
 
     # Model Selection
     inflow_model: int = 0 # 0 = basic, 1 = Pitt & Peters, 2 = DTU
-    coeff_method: int = 0 # 0 = parametric, 1 = lookup table
+    coeff_method: int = 1 # 0 = parametric, 1 = lookup table
     tip_loss_model: int = 1 # 0 = none, 1 = Prandtl
     root_loss_model: int = 1 # 0 = none, 1 = Prandtl
-
-
 
     ## Curve smoothing parameters
     # Set the highest power in the numerator and denominator of the chord smoothing function
@@ -54,6 +53,7 @@ class Inputs(eqx.Module):
     Ord_Numerator_beta = 1
     # Set whether the smoothing function reports on quality of the smoothing attempt
     Smoothing_log = False
+
 
 class Params(eqx.Module):
     '''
@@ -84,6 +84,12 @@ class Params(eqx.Module):
 
     # Physical properties
     rho: float = 1.225      # air density (kgm^{-3})
+    mu: float = 12.13e-6    # kinematic viscosity of air at 20c (N s/m**2)
+    v_sound:float = 343           # speed of sound in air at standard atm (m/s)
+
+    # Interpolators
+    cdInterpolator: jsp.interpolate.RegularGridInterpolator = None
+    clInterpolator: jsp.interpolate.RegularGridInterpolator = None
 
 
 def blade_design_mask(params: Params):

@@ -2,9 +2,11 @@
 import jax
 from jax import numpy as jnp
 from jax import lax
+import jax.scipy as jsp
 import matplotlib.pyplot as plt
 from init import Inputs,Params
 from airflow import resultantVelocityComponents
+import numpy as np
 
 ## ---Parametric Coefficients---
 # (good for approximate analysis, use LUT for more accuracy)
@@ -25,7 +27,7 @@ def parametric_coeffs(V_ia, params):
     C_La = 5.7     # Lift curve slope per rad (ARAD10)
     C_D90 = 1.98    # Drag coefficient at 90 degrees angle of attack (flat plate)
     C_D0 = 0.0175    # Zero lift drag coefficient (ARA-D 10)
-    AoA_0 = jnp.radians(10) # zero lift angle of attack
+    AoA_0 = jnp.radians(-10) # zero lift angle of attack
 
     # load relevant data from inputs
     geometric_angle = params.beta[:, None]
@@ -34,7 +36,7 @@ def parametric_coeffs(V_ia, params):
     _, phi = resultantVelocityComponents(V_ia, params) # get only second output
 
     # Angle of attack
-    AoA_eff = geometric_angle - phi + AoA_0
+    AoA_eff = geometric_angle - phi - AoA_0
 
     # Do some conditioning of the effective AoA
     #AoA_eff = jnp.where(AoA_eff==jnp.pi/2, AoA_eff+jnp.radians(0.05), AoA_eff)
@@ -72,11 +74,65 @@ def lookup_coeffs(V_ia, params):
     Placeholder for future lookup table implementation, 
     use parametric for now to allow compile
     '''
-    #raise(NotImplementedError("FUnction 'lookup_coeffs' in airfoil.py is not implemented yet"))
-    # Look up/estimate CL/CD from CFD data tables
+    # Unpack params
+    V_x, omega, r, V_yz, psi = params.V_x, params.omega, params.r, params.V_yz, params.psi
+    
+    # Constants:
+    C_D90 = 1.98    # Drag coefficient at 90 degrees angle of attack (flat plate)
+    C_D0 = 0.0175    # Zero lift drag coefficient (ARA-D 10)
+    AoA_0 = jnp.radians(-5) # zero lift angle of attack
 
-    # Input parameters of alpha, Re, Ma, airfoil type. Return airfoil with suitable coefficients that minimise chord.
-    return parametric_coeffs(V_ia, params)
+    # load relevant data from inputs
+    geometric_angle = params.beta[:, None]
+
+    # load interpolators
+    clInterp = params.clInterpolator
+    cdInterp = params.cdInterpolator
+
+    # calculate aerodynamic incidence
+    _, phi = resultantVelocityComponents(V_ia, params) # get only second output
+
+    # Angle of attack
+    AoA_eff = geometric_angle - phi - AoA_0
+
+    # Calculate the normal component of V_yz from the tocal V_yz
+    V_yz_perp = V_yz * jnp.sin(psi)
+
+    # Calculate V_R from the magnitude of the vector sum of the individual components
+    V_axial_net = V_x + V_ia
+    V_norml_net = omega*r + V_yz_perp
+    V_R = jnp.sqrt(jnp.square(V_axial_net) + jnp.square(V_norml_net))
+
+    # calculate the reynolds and mach numbers
+    Re = V_R * params.c[:, None] * params.rho / params.mu
+    Ma = V_R / params.v_sound
+
+    # Coefficients in non-stall region
+    flowParams = jnp.array([jnp.ravel(AoA_eff),jnp.ravel(Re),jnp.ravel(Ma)])
+    #flowParams = jnp.transpose(flowParams)
+    pts = jnp.array([5, 200000, 0.2])
+    C_L_unstall = clInterp((5, 200000, 0.3))
+    C_D_unstall = C_L_unstall
+    
+    # Coefficients in stall region based on flat plate model
+    C_N_stall = C_D90 * (jnp.sin(AoA_eff)) / (0.56+0.44*jnp.sin(AoA_eff))       # Normal Force Coefficient
+    C_T_stall = 0.5*C_D0 *jnp.cos(AoA_eff)                                      # Tangential Force Coefficient
+    C_L_stall = C_N_stall*jnp.cos(AoA_eff)-C_T_stall*jnp.sin(AoA_eff)           # Lift Coefficient
+    C_D_stall = C_N_stall*jnp.sin(AoA_eff)+C_T_stall*jnp.cos(AoA_eff)           # Drag Coefficient
+    C_M_stall = -C_N_stall*(0.25-0.175*(1-2*AoA_eff/jnp.pi))                   # Moment Coefficient
+
+    # Set piecewise function between 20 and 160 degrees
+    stall_low  = jnp.abs(AoA_eff) >= jnp.radians(20)
+    stall_high = jnp.abs(AoA_eff) >  jnp.radians(160) # Don't model high stall angle, inverse flow is complex
+    stall      = stall_low & ~stall_high   # 20°–160°
+    
+    # Piecewise coefficients (stall for 20°–160°)
+    C_L = jnp.where(stall, C_L_stall, C_L_unstall)
+    C_D = jnp.where(stall, C_D_stall, C_D_unstall)
+    C_M = C_M_stall
+    
+    return C_L, C_D, C_M
+
 
 def aero_coeffs(V_ia, params):
     # Select Method to Establish Aerodynamic Coefficients
@@ -84,6 +140,45 @@ def aero_coeffs(V_ia, params):
                     [parametric_coeffs, lookup_coeffs],
                     V_ia, params)
     return C_L, C_D, C_M
+
+
+def loadAirfoilData(filename: str, shape: np.ndarray = np.array([81, 14, 6]), method:str='linear'):
+    """
+    Inputs:
+    
+    Outputs:
+
+    Function description
+    """
+    array = np.loadtxt(filename, dtype='float', delimiter=',')
+
+    numbloks = 5    
+    blocksize = int(np.shape(array)[0]/numbloks)
+
+    # Load the blocks of data from the input file
+    alp = array[0           :   blocksize,      :]
+    rey = array[blocksize   :   blocksize*2,    :]
+    mac = array[blocksize*2 :   blocksize*3,    :]
+    cl  = array[blocksize*3 :   blocksize*4,    :]
+    cd  = array[blocksize*4 :   blocksize*5,    :]
+
+    # Reshape the blocks of data from 2D to 3D, breaking up only the last two dims:
+    alp = jnp.reshape(alp, shape)
+    rey = jnp.reshape(rey, shape)
+    mac = jnp.reshape(mac, shape)
+    cl  = jnp.reshape(cl, shape)
+    cd  = jnp.reshape(cd, shape)
+    
+    # Generate a 3D scipy style interpolator object which can be called like a function to interpolate input points
+    cl_interpolator = jsp.interpolate.RegularGridInterpolator((alp, rey, mac), cl, method=method)
+    cd_interpolator = jsp.interpolate.RegularGridInterpolator((alp, rey, mac), cd, method=method)
+
+    test = cl_interpolator(jnp.array([5, 200000, 0.3]), "linear")
+    test = cd_interpolator((5, 200000, 0.3), "linear")
+
+    return cl_interpolator, cd_interpolator
+
+
 
 
 if __name__ == "__main__":
@@ -110,4 +205,4 @@ if __name__ == "__main__":
         V_ia_0=jnp.full_like(r[:, None], 14)
     )
 
-    parametric_coeffs(jnp.full_like(r[:, None], 0), params_static, True)
+    #parametric_coeffs(jnp.full_like(r[:, None], 0), params_static, True)
