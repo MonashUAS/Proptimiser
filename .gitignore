@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+#propeller geometry files
+*.pts
+
 # Distribution / packaging
 .Python
 build/

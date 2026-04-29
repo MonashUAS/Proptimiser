@@ -6,10 +6,11 @@ import matplotlib.pyplot as plt
 from dataclasses import replace
 from init import Params, Inputs
 import propmodel
+import pandas as pd
 
 from Foil_Interpolators import RationalFunctionInterp, RationalFunction
 from airflow import resultantVelocityComponents, tip_root_loss_factors
-
+from geometry import PropGeomGenerator,UpperLowerPoints
 import airflow as afl
 
 
@@ -213,7 +214,7 @@ def run_optimization():
     print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Lambda':<12} | {'Mu':<10}")
     print("-" * 90)
 
-    for i in range(15):
+    for i in range(2):
 
         sol = solver.run(
             vars_scaled,
@@ -276,3 +277,8 @@ if __name__ == "__main__":
 
     V_ia_converged, V_ia_0_new = propmodel.induced_velocity(params_opt)
     debugPlotting(V_ia_0_new, params_opt)
+
+    #Propeller geometry files
+    upper_points,lower_points = UpperLowerPoints(r"+AirfoilData\ARAD05_half_camber\ARA-D 5% AIRFOIL half camber.dat")
+    PropGeomGenerator(params_opt.c,params_opt.beta,params_opt.r,upper_points,'upper_points')
+    PropGeomGenerator(params_opt.c,params_opt.beta,params_opt.r,lower_points,'lower_points')
