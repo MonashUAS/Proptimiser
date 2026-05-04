@@ -55,10 +55,11 @@ class Inputs(eqx.Module):
     Smoothing_log = False
 
     # Foil interpolation orders
-    P_Cl: int = 1
+    P_Cl: int = 3
     Q_Cl: int = 2
     P_Cd: int = 2
     Q_Cd: int = 2
+    interpolation_update_spacing: int = 2 # The number of top level iterations before the interpolation functions are updated
 
 
 class Params(eqx.Module):

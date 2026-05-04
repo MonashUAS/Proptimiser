@@ -64,7 +64,6 @@ def parametric_coeffs(V_ia, params):
     C_D = jnp.where(stall, C_D_stall, C_D_unstall)
     C_M = jnp.where(stall, C_M_stall, C_M_unstall)
     
-    return C_L, C_D, C_M
     return C_L, C_D, C_M_stall
 
 
@@ -194,6 +193,9 @@ def loadAirfoilData(filename: str,
     mac = np.unique(mac)
     cl  = np.reshape(cl, shape)
     cd  = np.reshape(cd, shape)
+
+    # Convert input to radians
+    alp = jnp.radians(alp)
     
     # Create the cl and cd interpolator arrays
     cl_interpolator = jnp.zeros((nr, Inputs.P_Cl + Inputs.Q_Cl - 1))
