@@ -18,7 +18,7 @@ class Inputs(eqx.Module):
 
     # Thrust constraint
     solvertype: str = "T"
-    thrust: float = 100 # Newtons
+    thrust: float = 50 # Newtons
 
     # Normalisation for Power (update with flat-plate guess)
     power_scale: float = 1000
@@ -29,7 +29,7 @@ class Inputs(eqx.Module):
 
     ## Discretisation settings
     # Radial discretisation
-    n_r: int = 30
+    n_r: int = 25
     # Azimuthal discretisation (for skewed inflow)
     n_psi: int = 36
 
@@ -46,7 +46,7 @@ class Inputs(eqx.Module):
 
     ## Curve smoothing parameters
     # Set the highest power in the numerator and denominator of the chord smoothing function
-    Ord_Denominator_c = 3
+    Ord_Denominator_c = 4
     Ord_Numerator_c = 2
     # Set the highest power in the numerator and denominator of the beta smoothing function
     Ord_Denominator_beta = 2
@@ -60,6 +60,7 @@ class Inputs(eqx.Module):
     P_Cd: int = 2
     Q_Cd: int = 2
     interpolation_update_spacing: int = 2 # The number of top level iterations before the interpolation functions are updated
+    switchingDelay: int = 10
 
 
 class Params(eqx.Module):
@@ -91,7 +92,7 @@ class Params(eqx.Module):
 
     # Physical properties
     rho: float = 1.225      # air density (kgm^{-3})
-    mu: float = 12.13e-6    # kinematic viscosity of air at 20c (N s/m**2)
+    mu: float = 1.7965e-5    # kinematic viscosity of air at 20c (N s/m**2)
     v_sound:float = 343           # speed of sound in air at standard atm (m/s)
     
     # Interpolators

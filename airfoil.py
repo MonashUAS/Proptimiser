@@ -105,14 +105,16 @@ def lookup_coeffs(V_ia, params):
     C_L_unstall = jnp.zeros(jnp.shape(AoA_eff))
     C_D_unstall = jnp.zeros(jnp.shape(AoA_eff))
     
-    for ii in range(len(params.r)):
-        C_L_unstall = C_L_unstall.at[ii, :].set(RationalFunction(phi[ii, :], 
-                                                                 clInterpolator[ii, 0:Inputs.P_Cl], 
-                                                                 clInterpolator[ii, Inputs.P_Cl:(Inputs.P_Cl + Inputs.Q_Cl - 1)]))
-        
-        C_D_unstall = C_D_unstall.at[ii, :].set(RationalFunction(phi[ii, :], 
-                                                                 cdInterpolator[ii, 0:Inputs.P_Cd], 
-                                                                 cdInterpolator[ii, Inputs.P_Cd:(Inputs.P_Cd + Inputs.Q_Cd - 1)]))
+    # Outer if statement is needed for jit compilation
+    if Inputs.coeff_method == 1:
+        for ii in range(len(params.r)):
+            C_L_unstall = C_L_unstall.at[ii, :].set(RationalFunction(phi[ii, :], 
+                                                                    clInterpolator[ii, 0:Inputs.P_Cl], 
+                                                                    clInterpolator[ii, Inputs.P_Cl:(Inputs.P_Cl + Inputs.Q_Cl - 1)]))
+            
+            C_D_unstall = C_D_unstall.at[ii, :].set(RationalFunction(phi[ii, :], 
+                                                                    cdInterpolator[ii, 0:Inputs.P_Cd], 
+                                                                    cdInterpolator[ii, Inputs.P_Cd:(Inputs.P_Cd + Inputs.Q_Cd - 1)]))
     
     # Coefficients in stall region based on flat plate model
     C_N_stall = C_D90 * (jnp.sin(AoA_eff)) / (0.56+0.44*jnp.sin(AoA_eff))       # Normal Force Coefficient

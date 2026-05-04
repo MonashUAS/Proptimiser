@@ -55,7 +55,7 @@ def base_objective(c, beta, params_static, milScale=0.3, thrScale=1.5):
 
 
 #Scaled Aug. lagrangian, returns the actual Lagrangian 
-def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_err, scale_THR_err=1.5, scale_POW_cost=0.0005):
+def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_err, scale_THR_err=15.0, scale_POW_cost=0.0005):
     c_scaled, beta_scaled = opt_vars_scaled
     
     c = c_scaled*c_scale
@@ -66,8 +66,7 @@ def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_
 
     power_cost = power*scale_POW_cost
 
-    return jnp.sqrt(thrust_err**2 + rms_MIL_err**2 + power_cost**2)
-
+    return jnp.sqrt(thrust_err**2 + rms_MIL_err**2 + power_cost**2/thrust_err**2)
 
 
 #Gradient scaling (compute c and beta scales)
@@ -155,13 +154,15 @@ def run_optimization():
 
     # Geometry setup
     psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
-    r, dr = propmodel.radial_stops(0.225, 0.05, Inputs.n_r)
+    r, dr = propmodel.radial_stops(0.225, 0.025, Inputs.n_r)
 
     init_c = jnp.full(Inputs.n_r, 0.020)
     init_beta = jnp.full(Inputs.n_r, jnp.radians(5))
     
     # If using a lookup table for airfoil coefficients precompute interpolators
     if(Inputs.coeff_method):
+        switchflag = True
+
         # Define the input tables
         input_filename = "compiledData-ARAD10.txt"
 
@@ -179,13 +180,15 @@ def run_optimization():
             beta=init_beta[:,None],
             r=r[:, None], dr=dr,
             psi=psi[None, :], dpsi=dpsi,
-            V_x=jnp.array([0]), V_yz=jnp.array([0]),
-            omega=jnp.array([840]), # rad/s
+            V_x=jnp.array([15]), V_yz=jnp.array([0]),
+            omega=jnp.array([8000/60*2*3.14159]), # rad/s
             V_ia_0 = jnp.full((Inputs.n_r,), jnp.array([4.0])),
             cdInterpolator=cd_interpolator,
             clInterpolator=cl_interpolator
         )
     else:
+        switchflag = False
+
         params_static = Params(
             N=2,
             R=jnp.max(r),
@@ -198,6 +201,7 @@ def run_optimization():
             V_ia_0 = jnp.full((Inputs.n_r,), jnp.array([4.0]))
         )
 
+    Inputs.coeff_method = 0
 
     P_c = Inputs.Ord_Numerator_c
     Q_c = Inputs.Ord_Denominator_c
@@ -242,7 +246,6 @@ def run_optimization():
     print("-" * 90)
 
     for i in range(20):
-
         sol = solver.run(
             vars_scaled,
             bounds=bounds,
@@ -275,17 +278,22 @@ def run_optimization():
 
         V_ia_converged, V_ia_0_new = propmodel.induced_velocity(params_warm)
 
-        if not np.mod(i, Inputs.interpolation_update_spacing):
-            # Generate the new reynolds and mach lists
-            V_R, _ = resultantVelocityComponents(V_ia_converged, params_warm)
-            V_R_aved = jnp.mean(V_R, axis=1)
-            Re_list = V_R_aved * c * params_static.rho / params_static.mu * 0
-            Ma_list = V_R_aved / params_static.v_sound
+        if switchflag:
+            if i == Inputs.switchingDelay:
+                Inputs.coeff_method = 1
 
-            # Generate the interpolators
-            cl_interpolator, cd_interpolator = airfoil.loadAirfoilData(input_filename, Re_list, Ma_list, Inputs.n_r)
+        if Inputs.coeff_method == 1:
+            if not np.mod(i - Inputs.switchingDelay, Inputs.interpolation_update_spacing):
+                # Generate the new reynolds and mach lists
+                V_R, _ = resultantVelocityComponents(V_ia_converged, params_warm)
+                V_R_aved = jnp.mean(V_R, axis=1)
+                Re_list = params_static.rho * c * V_R_aved / params_static.mu
+                Ma_list = V_R_aved / params_static.v_sound
 
-            params_static = replace(params_static, clInterpolator=cl_interpolator, cdInterpolator=cd_interpolator)
+                # Generate the interpolators
+                cl_interpolator, cd_interpolator = airfoil.loadAirfoilData(input_filename, Re_list, Ma_list, Inputs.n_r)
+
+                params_static = replace(params_static, clInterpolator=cl_interpolator, cdInterpolator=cd_interpolator)
 
         params_static = replace(params_static, V_ia_0=V_ia_0_new)
 
