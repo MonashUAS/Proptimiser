@@ -29,7 +29,7 @@ class Inputs(eqx.Module):
 
     ## Discretisation settings
     # Radial discretisation
-    n_r: int = 50
+    n_r: int = 30
     # Azimuthal discretisation (for skewed inflow)
     n_psi: int = 36
 
@@ -53,6 +53,12 @@ class Inputs(eqx.Module):
     Ord_Numerator_beta = 1
     # Set whether the smoothing function reports on quality of the smoothing attempt
     Smoothing_log = False
+
+    # Foil interpolation orders
+    P_Cl: int = 1
+    Q_Cl: int = 2
+    P_Cd: int = 2
+    Q_Cd: int = 2
 
 
 class Params(eqx.Module):
@@ -86,7 +92,7 @@ class Params(eqx.Module):
     rho: float = 1.225      # air density (kgm^{-3})
     mu: float = 12.13e-6    # kinematic viscosity of air at 20c (N s/m**2)
     v_sound:float = 343           # speed of sound in air at standard atm (m/s)
-
+    
     # Interpolators
     cdInterpolator: jsp.interpolate.RegularGridInterpolator = None
     clInterpolator: jsp.interpolate.RegularGridInterpolator = None

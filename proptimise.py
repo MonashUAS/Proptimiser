@@ -165,8 +165,12 @@ def run_optimization():
         # Define the input tables
         input_filename = "compiledData-ARAD10.txt"
 
+        # Generate the reynolds and mach lists
+        Re_list = 200000 * jnp.ones(jnp.size(r))
+        Ma_list = 0.15 * jnp.ones(jnp.size(r))
+
         # Generate the interpolators
-        cl_interpolator, cd_interpolator = airfoil.loadAirfoilData(input_filename)
+        cl_interpolator, cd_interpolator = airfoil.loadAirfoilData(input_filename, Re_list, Ma_list, Inputs.n_r)
 
         params_static = Params(
             N=2,
@@ -226,7 +230,7 @@ def run_optimization():
     )
 
     #Solver
-    solver = jaxopt.ScipyBoundedMinimize(fun=objective_fn, method="L-BFGS-B", tol=1e-8, maxiter=1000)
+    solver = jaxopt.ScipyBoundedMinimize(fun=objective_fn, method="L-BFGS-B", tol=1e-6, maxiter=100)
 
     #Augmented Lagrangian params
     lmbda = 0
@@ -237,7 +241,7 @@ def run_optimization():
     print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Lambda':<12} | {'Mu':<10}")
     print("-" * 90)
 
-    for i in range(15):
+    for i in range(200):
 
         sol = solver.run(
             vars_scaled,
@@ -255,7 +259,6 @@ def run_optimization():
         c = vars_scaled[0] * c_scale
         beta = vars_scaled[1] * beta_scale
 
-
         # Use the foil interpolators to generate rational functions for the chord and beta distribution
         # Refer to https://www.itl.nist.gov/div898/handbook/pmd/section8/pmd812b.htm for choosing P and Q
         c_fit_params = RationalFunctionInterp(r, jnp.squeeze(c), P_c, Q_c, verbose=Smoothing_log, extendedChecking=True, method='dogbox')
@@ -271,7 +274,18 @@ def run_optimization():
         params_warm = replace(params_static, c=jnp.squeeze(c), beta=jnp.squeeze(beta))
 
         V_ia_converged, V_ia_0_new = propmodel.induced_velocity(params_warm)
-        params_static = replace(params_static, V_ia_0=V_ia_0_new)
+
+        # Generate the new reynolds and mach lists
+        V_R, _ = resultantVelocityComponents(V_ia_converged, params_warm)
+        V_R_aved = jnp.mean(V_R, axis=1)
+        Re_list = V_R_aved * c * params_static.rho / params_static.mu
+        Ma_list = V_R_aved / params_static.v_sound
+
+        # Generate the interpolators
+        cl_interpolator, cd_interpolator = airfoil.loadAirfoilData(input_filename, Re_list, Ma_list, Inputs.n_r)
+
+        params_static = replace(params_static, V_ia_0=V_ia_0_new, clInterpolator=cl_interpolator, cdInterpolator=cd_interpolator)
+
         power, thrust_err, thrust, rms_MIL_err = base_objective(c, beta, params_static)
 
         print(f"{i:<6} | {float(power):<12.4f} | {float(thrust):<12.4f} | {float(thrust_err):<12.4f} | {rms_MIL_err:<10.1f} | {lmbda:<12.4f} | {mu:<10.1f}")
