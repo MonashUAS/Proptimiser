@@ -32,7 +32,7 @@ def RationalFunctionInterp(x0, y0, P: int, Q: int, verbose:bool = False,
 
     popt, pcov = scp.optimize.curve_fit(RationalWrapper, x0, y0, p0,
                                         check_finite=extendedChecking, method=method, 
-                                        bounds=bounds)
+                                        bounds=bounds,maxfev=10000)
 
     if verbose:
         print("-----> RFI debug <-----")

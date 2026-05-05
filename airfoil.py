@@ -91,7 +91,7 @@ def lookup_coeffs(V_ia, params):
     _, phi = resultantVelocityComponents(V_ia, params) # get only second output
 
     # Angle of attack
-    AoA_eff = geometric_angle - phi - AoA_0
+    AoA_eff = geometric_angle - phi 
 
     # Calculate the normal component of V_yz from the tocal V_yz
     V_yz_perp = V_yz * jnp.sin(psi)
@@ -105,6 +105,20 @@ def lookup_coeffs(V_ia, params):
     C_L_unstall = jnp.zeros(jnp.shape(AoA_eff))
     C_D_unstall = jnp.zeros(jnp.shape(AoA_eff))
     
+
+    #New code, verify first.
+    def station_coeffs(p, cl_coeffs, cd_coeffs):
+        cl = RationalFunction(p, cl_coeffs[0:Inputs.P_Cl], cl_coeffs[Inputs.P_Cl:])
+        cd = RationalFunction(p, cd_coeffs[0:Inputs.P_Cd], cd_coeffs[Inputs.P_Cd:])
+        return cl, cd
+    
+    C_L_unstall, C_D_unstall = jax.vmap(station_coeffs)(
+        AoA_eff, 
+        params.clInterpolator, 
+        params.cdInterpolator
+    )
+
+    '''
     # Outer if statement is needed for jit compilation
     if Inputs.coeff_method == 1:
         for ii in range(len(params.r)):
@@ -116,6 +130,7 @@ def lookup_coeffs(V_ia, params):
                                                                     cdInterpolator[ii, 0:Inputs.P_Cd], 
                                                                     cdInterpolator[ii, Inputs.P_Cd:(Inputs.P_Cd + Inputs.Q_Cd - 1)]))
     
+    '''
     # Coefficients in stall region based on flat plate model
     C_N_stall = C_D90 * (jnp.sin(AoA_eff)) / (0.56+0.44*jnp.sin(AoA_eff))       # Normal Force Coefficient
     C_T_stall = 0.5*C_D0 *jnp.cos(AoA_eff)                                      # Tangential Force Coefficient
@@ -137,10 +152,26 @@ def lookup_coeffs(V_ia, params):
 
 
 def aero_coeffs(V_ia, params):
+    ''' Legacy code 
     # Select Method to Establish Aerodynamic Coefficients
     C_L, C_D, C_M = lax.switch(Inputs.coeff_method,
                     [parametric_coeffs, lookup_coeffs],
                     V_ia, params)
+    
+    '''
+
+    # Computing cl,cd and cm with parametric and lookup methods
+    cl_p, cd_p, cm_p = parametric_coeffs(V_ia, params)
+    cl_l, cd_l, cm_l = lookup_coeffs(V_ia, params)
+    
+    #Varies between 0 and 1 to control blending
+    alpha = params.blend_alpha
+    
+    # Parametric/lookup blending 
+    C_L = (1.0 - alpha) * cl_p + alpha * cl_l
+    C_D = (1.0 - alpha) * cd_p + alpha * cd_l
+    C_M = (1.0 - alpha) * cm_p + alpha * cm_l
+
     return C_L, C_D, C_M
 
 

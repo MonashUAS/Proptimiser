@@ -157,7 +157,8 @@ def run_optimization():
     r, dr = propmodel.radial_stops(0.225, 0.025, Inputs.n_r)
 
     init_c = jnp.full(Inputs.n_r, 0.020)
-    init_beta = jnp.full(Inputs.n_r, jnp.radians(5))
+    # Linearly decreasing profile to start
+    init_beta = jnp.linspace(jnp.radians(15), jnp.radians(5), Inputs.n_r)
     
     # If using a lookup table for airfoil coefficients precompute interpolators
     if(Inputs.coeff_method):
@@ -180,7 +181,7 @@ def run_optimization():
             beta=init_beta[:,None],
             r=r[:, None], dr=dr,
             psi=psi[None, :], dpsi=dpsi,
-            V_x=jnp.array([15]), V_yz=jnp.array([0]),
+            V_x=jnp.array([0]), V_yz=jnp.array([0]),
             omega=jnp.array([8000/60*2*3.14159]), # rad/s
             V_ia_0 = jnp.full((Inputs.n_r,), jnp.array([4.0])),
             cdInterpolator=cd_interpolator,
@@ -242,10 +243,34 @@ def run_optimization():
     eta_tol = 1e-1
 
     #Set arbtitrarily high to initiate solver
-    print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Lambda':<12} | {'Mu':<10}")
+    print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Cost':<12}")
     print("-" * 90)
 
-    for i in range(20):
+    #Initialise the global best cost variable
+    global_best_cost = jnp.inf
+    global_best_c = init_c
+    global_best_beta = init_beta
+    
+    total_iter = Inputs.n_iter_parametric + Inputs.n_iter_blended + Inputs.n_iter_lookup
+
+    for i in range(total_iter):
+
+        if i < Inputs.n_iter_parametric: #Start with parametric method only to initialise
+            alpha = 0 
+        elif i < (Inputs.n_iter_parametric + Inputs.n_iter_blended): # Begin blending (linear ramp)
+            alpha = (i-Inputs.n_iter_parametric)/(Inputs.n_iter_blended) 
+            Inputs.coeff_method = 1
+
+            if i == Inputs.n_iter_parametric:  #initialise with best sol.
+                vars_scaled = (global_best_c/c_scale, global_best_beta/beta_scale)
+        else:   #Pure lookup
+            alpha = 1
+            
+            if i == Inputs.n_iter_parametric + Inputs.n_iter_blended:  #again, initialise with best sol.
+                vars_scaled = (global_best_c/c_scale, global_best_beta/beta_scale)
+
+        params_static = replace(params_static, blend_alpha=alpha)
+
         sol = solver.run(
             vars_scaled,
             bounds=bounds,
@@ -278,12 +303,8 @@ def run_optimization():
 
         V_ia_converged, V_ia_0_new = propmodel.induced_velocity(params_warm)
 
-        if switchflag:
-            if i == Inputs.switchingDelay:
-                Inputs.coeff_method = 1
-
         if Inputs.coeff_method == 1:
-            if not np.mod(i - Inputs.switchingDelay, Inputs.interpolation_update_spacing):
+            if not np.mod(i - Inputs.n_iter_parametric, Inputs.interpolation_update_spacing):
                 # Generate the new reynolds and mach lists
                 V_R, _ = resultantVelocityComponents(V_ia_converged, params_warm)
                 V_R_aved = jnp.mean(V_R, axis=1)
@@ -295,31 +316,47 @@ def run_optimization():
 
                 params_static = replace(params_static, clInterpolator=cl_interpolator, cdInterpolator=cd_interpolator)
 
+
         params_static = replace(params_static, V_ia_0=V_ia_0_new)
 
         power, thrust_err, thrust, rms_MIL_err = base_objective(c, beta, params_static)
 
-        print(f"{i:<6} | {float(power):<12.4f} | {float(thrust):<12.4f} | {float(thrust_err):<12.4f} | {rms_MIL_err:<10.1f} | {lmbda:<12.4f} | {mu:<10.1f}")
+        #The cost as calculated by the solver (sol.state.fun_val) doesnt capture the smoothed geometry. 
+        current_smoothed_cost = objective_fn(
+            (c / c_scale, beta / beta_scale), 
+            params_static, 
+            c_scale, 
+            beta_scale, 
+            scale_MIL_err=0.25, 
+            scale_THR_err=1.5
+        )
+
+        print(f"{i:<6} | {float(power):<12.4f} | {float(thrust):<12.4f} | {float(thrust_err):<12.4f} | {rms_MIL_err:<10.1f} | {current_smoothed_cost:<12.4f}")
 
         vars_scaled = (c/c_scale,beta_smoothed/beta_scale)
 
-        # Convergence
-        if abs(thrust_err) < eta_tol:
+        #Check if current (smoothed) cost is better than global.
+        if current_smoothed_cost <= global_best_cost:
+            global_best_cost = current_smoothed_cost
+            global_best_c = c
+            global_best_beta = beta
+
+        # Convergence, don't want to prematurely return a solution
+        if abs(thrust_err) < eta_tol and alpha == 1:
             print(f"\nConverged at iteration {i} with thrust error {thrust_err:.2e}")
             break
 
         #AL update
 
-        prev_err = abs(thrust_err)
-
         if Inputs.interIterationDebug:
             debugPlotting(V_ia_0_new, params_warm)
         
+    
+
     else:
         print(f"\nWarning: max iterations reached. Final thrust error: {thrust_err:.2e}")
-        
-    return replace(params_static, c=c, beta=beta)
 
+    return replace(params_static, c=global_best_c, beta=global_best_beta)
 
 #Run + plotting
 if __name__ == "__main__":

@@ -62,6 +62,11 @@ class Inputs(eqx.Module):
     interpolation_update_spacing: int = 2 # The number of top level iterations before the interpolation functions are updated
     switchingDelay: int = 10
 
+    # Blended parametric/lookup parameters 
+    n_iter_parametric: int = 3
+    n_iter_blended: int = 4
+    n_iter_lookup: int = 6
+    
 
 class Params(eqx.Module):
     '''
@@ -99,6 +104,8 @@ class Params(eqx.Module):
     cdInterpolator: jsp.interpolate.RegularGridInterpolator = None
     clInterpolator: jsp.interpolate.RegularGridInterpolator = None
 
+    #Blending parameter, ranges between 0->1 (full parametric -> full lookup)
+    blend_alpha: float = 0.0
 
 def blade_design_mask(params: Params):
     """
