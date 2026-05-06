@@ -53,7 +53,7 @@ def base_objective(c, beta, params_static):
 
 
 #Scaled Aug. lagrangian, returns the actual Lagrangian 
-def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_err=0.3, scale_THR_err=15.0, scale_POW_cost=0.05):
+def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_err=0.3, scale_THR_err=15.0, scale_POW_cost=0.01):
     c_scaled, beta_scaled = opt_vars_scaled
     
     c = c_scaled*c_scale
@@ -315,10 +315,13 @@ def run_optimization():
             scale_THR_err=1.5
         )
 
+        # Calculate the thrust efficiency
+        thrust_eff = thrust/9.81*1000/power
+
         print("\n")
-        print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Smoothed cost':<12} | {'Blending Parameter':<10}")
+        print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Smoothed cost':<12} | {'Blending Parameter':<10} | Thrust efficiency (g/W)")
         print("-" * 90)
-        print(f"{i:<6} | {float(power):<12.4f} | {float(thrust):<12.4f} | {float(thrust_err):<12.4f} | {rms_MIL_err:<10.1f} | {current_smoothed_cost:<12.4f} | {params_static.blendingParam:<10.1f}")
+        print(f"{i:<6} | {float(power):<12.4f} | {float(thrust):<12.4f} | {float(thrust_err):<12.4f} | {rms_MIL_err:<10.1f} | {current_smoothed_cost:<13.4f} | {params_static.blendingParam:<18.4f} | {thrust_eff:<20.4f}")
         print("\n")
 
         vars_scaled = (c/c_scale,beta_smoothed/beta_scale)
