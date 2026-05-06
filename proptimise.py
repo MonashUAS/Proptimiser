@@ -19,10 +19,6 @@ jax.config.update("jax_traceback_filtering", "quiet_remove_frames")
 jax.config.update("jax_check_tracer_leaks", "off")
 jax.config.update("jax_disable_jit", False)
 
-#Curvature penalty 
-def curvature_penalty(x):
-    d2 = x[2:] - 2.0 * x[1:-1] + x[:-2]
-    return jnp.mean(d2**2)
 
 def minimumInducedLossCost(V_ia_0):
     """
@@ -37,6 +33,7 @@ def minimumInducedLossCost(V_ia_0):
     rms_err = jnp.sqrt(jnp.sum(squared_err))
 
     return rms_err
+
 
 #Returns the power, thrust error and smoothness penalty
 def base_objective(c, beta, params_static):
@@ -55,7 +52,7 @@ def base_objective(c, beta, params_static):
 
 
 #Scaled Aug. lagrangian, returns the actual Lagrangian 
-def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_err=0.3, scale_THR_err=15.0, scale_POW_cost=0.0005):
+def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_err=0.3, scale_THR_err=15.0, scale_POW_cost=0.05):
     c_scaled, beta_scaled = opt_vars_scaled
     
     c = c_scaled*c_scale
@@ -66,12 +63,13 @@ def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_
 
     rms_MIL_err = rms_MIL_err * scale_MIL_err
     thrust_err = thrust_err * scale_THR_err
-    power_cost = power*scale_POW_cost
+    power_cost = power * scale_POW_cost
 
     return jnp.sqrt(thrust_err**2 + rms_MIL_err**2 + power_cost**2)
 
 
 #Gradient scaling (compute c and beta scales)
+# TODO: FInish implementation of this function or deprecate it
 def compute_gradient_scales(init_c, init_beta, params_static):
     c_scale    = 500
     beta_scale = 1
@@ -156,9 +154,9 @@ def run_optimization():
 
     # Geometry setup
     psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
-    r, dr = propmodel.radial_stops(0.225, 0.05, Inputs.n_r)
+    r, dr = propmodel.radial_stops(Inputs.tip_diameter/2, Inputs.hub_diameter/2, Inputs.n_r)
 
-    init_c = jnp.full(Inputs.n_r, 0.020)
+    init_c = jnp.linspace(0.030, 0.015, Inputs.n_r)
     # Linearly decreasing profile to start
     init_beta = jnp.linspace(jnp.radians(15), jnp.radians(5), Inputs.n_r)
     
@@ -213,22 +211,17 @@ def run_optimization():
     #Bounds (chord + beta pairs) (scaled)
     bounds = (
         (
-            jnp.full_like(params_static.c, 0.005/c_scale),
-            jnp.full_like(params_static.beta, jnp.radians(0) / beta_scale),
+            jnp.full_like(params_static.c, Inputs.min_chord/c_scale),
+            jnp.full_like(params_static.beta, jnp.radians(Inputs.min_twist) / beta_scale),
         ),
         (
-            jnp.full_like(params_static.c, 0.05/c_scale),
-            jnp.full_like(params_static.beta, jnp.radians(45) / beta_scale),
+            jnp.full_like(params_static.c, Inputs.max_chord/c_scale),
+            jnp.full_like(params_static.beta, jnp.radians(Inputs.max_twist) / beta_scale),
         )
     )
 
     #Solver
-    solver = jaxopt.ScipyBoundedMinimize(fun=objective_fn, method="L-BFGS-B", tol=1e-4, maxiter=1000)
-
-    #Augmented Lagrangian params
-    lmbda = 0
-    mu = 1
-    eta_tol = 1e-2
+    solver = jaxopt.ScipyBoundedMinimize(fun=objective_fn, method="L-BFGS-B", tol=Inputs.opt_tol, maxiter=Inputs.opt_max_iter)
 
     #Initialise the global best cost variable
     global_best_cost = jnp.inf
@@ -289,7 +282,7 @@ def run_optimization():
 
         # Generate the interpolators
         for rr in range(Inputs.n_r):
-            if (jnp.abs((Re_list_new[rr]-Re_list[rr])/Re_list[rr])>0.1) or (jnp.abs((Ma_list_new[rr]-Ma_list[rr])/Ma_list[rr])>0.1):
+            if (jnp.abs((Re_list_new[rr]-Re_list[rr])/Re_list[rr])>0.1) or (jnp.abs(Ma_list_new[rr]-Ma_list[rr])>0.05):
                 print("Regenerating interpolator at radial position " + str(rr+1) + " of " + str(Inputs.n_r))
 
                 Re_list = Re_list.at[rr].set(Re_list_new[rr])
@@ -336,7 +329,7 @@ def run_optimization():
             global_best_beta = beta
 
         # Convergence, don't want to prematurely return a solution
-        if abs(thrust_err) < eta_tol and params_static.blendingParam == 1:
+        if abs(thrust_err) < Inputs.eta_tol and params_static.blendingParam == 1:
             print(f"\nConverged at iteration {i} with thrust error {thrust_err:.2e}")
             break
 
@@ -345,8 +338,6 @@ def run_optimization():
         if Inputs.interIterationDebug:
             debugPlotting(V_ia_0_new, params_warm)
         
-    
-
     else:
         print(f"\nWarning: max iterations reached. Final thrust error: {thrust_err:.2e}")
 

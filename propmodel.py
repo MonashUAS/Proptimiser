@@ -315,7 +315,7 @@ def induced_velocity(params):
         print("Residual min/max:", res_check.min(), res_check.max())
 
     # Newton Solver for Induced Velocity
-    solver = jaxopt.Broyden(fun=thrust_residual, maxiter=100, tol=Inputs.newton_eps, max_stepsize=0.5, implicit_diff=True)
+    solver = jaxopt.Broyden(fun=thrust_residual, maxiter=Inputs.newton_max_iter, tol=Inputs.newton_eps, max_stepsize=0.5, implicit_diff=True)
     # Input initial guess for induced velocity and solve. (Induced velocity is parametrised per radial stop)
     (V_ia_0, info) = solver.run(params.V_ia_0, params)
 

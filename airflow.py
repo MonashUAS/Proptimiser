@@ -129,11 +129,17 @@ def prandtl_tip_loss(V_ia, params):
     Notation adapted from that source, with variables reallocated for consistency with literature
     '''
 
-    eps = 1e-2
+    # Get the propeller geometric properties
     B = params.N
-    R = params.R
     r = params.r
+    R = params.R
+    
+    # Set an offset value for ensuring no divide by zeros
+    eps = 1e-2
+    
+    # Get the local induced angle at each radial and azimuthal position
     phi = jnp.abs(resultantVelocityComponents(V_ia, params)[1]) # get only second output
+
 
     f_tip = B/2 * (R - r) / (r * jnp.sin(phi))
     
@@ -155,10 +161,15 @@ def prandtl_root_loss(V_ia, params):
     Notation adapted from that source, with variables reallocated for consistency with literature
     '''
 
-    eps = 1e-2
+    # Get the propeller geometric properties
     B = params.N
-    R_hub = 0.05
     r = params.r
+    R_hub = r[0]
+
+    # Set an offset value for ensuring no divide by zeros
+    eps = 1e-2
+
+    # Get the local induced angle at each radial and azimuthal position
     phi = jnp.abs(resultantVelocityComponents(V_ia, params)[1]) # get only second output
 
     f_root = B/2 * (r - R_hub) / (r * jnp.sin(phi))

@@ -7,63 +7,74 @@ import jax.scipy as jsp
 class Inputs(eqx.Module):
     # Optimisation / design settings which remain constant during execution
 
-    # Outer-loop optimisation (Optax / similar)
-    opt_max_iter: int = 100
-    opt_tol: float = 1e-3
+    # ----- Geometric parameters -----
+    hub_diameter: float = 0.050 # DIAMETER in meters
+    tip_diameter: float = 0.450 # DIAMETER in meters
 
-    # Newton solver settings
-    newton_max_iter: int = 1000
-    newton_eps: float = 1e-3
-    newton_damping: float = 0.1
+    # max and min chords in meters
+    max_chord: float = 0.050
+    min_chord: float = 0.005
+    
+    # max and min twists in degrees
+    max_twist: float = 45
+    min_twist: float = -15
 
-    # Thrust constraint
-    solvertype: str = "T"
+    # ----- Solution parameters -----
+    solvertype: str = "T" # Thrust constraint (T) or torque constraint (Q)
     thrust: float = 100 # Newtons
 
-    # Normalisation for Power (update with flat-plate guess)
-    power_scale: float = 1000
 
-    # Smoothness Constraints
-    lambda_beta_smooth: float = 1e-1*power_scale
-    lambda_chord_smooth: float = 1e-1*power_scale
+    # ----- Optimiser parameters -----
+    # Newton solver settings
+    opt_max_iter: int = 1000
+    opt_tol: float = 1e-2
+    newton_max_iter: int = 100
+    newton_eps: float = 1e-3
 
-    ## Discretisation settings
+    #Augmented Lagrangian params
+    eta_tol = 1e-2
+
+
+    # ----- Discretisation parameters -----
     # Radial discretisation
     n_r: int = 20
     # Azimuthal discretisation (for skewed inflow)
     n_psi: int = 36
 
-    # Diagnostics / debugging
-    verbose: bool = False
-    record_convergence_history: bool = False
-    interIterationDebug: bool = False
 
-    # Model Selection
-    inflow_model: int = 0 # 0 = basic, 1 = Pitt & Peters, 2 = DTU
-    coeff_method: int = 2 # 0 = parametric, 1 = lookup table, 2 = blending mode
+    # ----- Airflow model selections -----
+    inflow_model: int = 1 # 0 = basic, 1 = Pitt & Peters, 2 = DTU
     tip_loss_model: int = 1 # 0 = none, 1 = Prandtl
     root_loss_model: int = 1 # 0 = none, 1 = Prandtl
 
-    ## Curve smoothing parameters
+
+    # ----- Chord and twist smoothing parameters -----
     # Set the highest power in the numerator and denominator of the chord smoothing function
     Ord_Denominator_c = 4
     Ord_Numerator_c = 2
+
     # Set the highest power in the numerator and denominator of the beta smoothing function
     Ord_Denominator_beta = 2
     Ord_Numerator_beta = 1
-    # Set whether the smoothing function reports on quality of the smoothing attempt
-    Smoothing_log = False
 
-    # Foil interpolation orders
-    P_Cl: int = 3
-    Q_Cl: int = 2
-    P_Cd: int = 2
-    Q_Cd: int = 2
+
+    # ----- Lookup method parameters -----
+    P_Cl: int = 3 # Cl numerator order
+    Q_Cl: int = 2 # Cd denominator order
+    P_Cd: int = 2 # Cl numerator order
+    Q_Cd: int = 2 # Cd denominator order
     
     # Lookup blending steps
     Iterations_initialising: int = 2
     Iterations_blending: int = 13
     Iterations_solving: int = 10
+    
+
+    # ----- Siagnostic and debugging flags -----
+    verbose: bool = False
+    record_convergence_history: bool = False
+    interIterationDebug: bool = False
+    Smoothing_log = False # Set whether the smoothing function reports on quality of the smoothing attempt
 
     
 
@@ -106,6 +117,8 @@ class Params(eqx.Module):
 
     #Blending parameter, ranges between 0->1 (full parametric -> full lookup)
     blend_alpha: float = 0.0
+
+
 
 def blade_design_mask(params: Params):
     """

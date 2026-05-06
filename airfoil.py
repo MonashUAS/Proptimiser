@@ -69,24 +69,14 @@ def parametric_coeffs(V_ia, params):
 
 def lookup_coeffs(V_ia, params):
     '''
-    Placeholder for future lookup table implementation, 
-    use parametric for now to allow compile
+    lookup table implementation
     '''
     # Unpack params
     V_x, omega, r, V_yz, psi = params.V_x, params.omega, params.r, params.V_yz, params.psi
-    
-    # Constants:
-    C_D90 = 1.98    # Drag coefficient at 90 degrees angle of attack (flat plate)
-    C_D0 = 0.0175    # Zero lift drag coefficient (ARA-D 10)
-    AoA_0 = jnp.radians(-5) # zero lift angle of attack
 
     # load relevant data from inputs
     geometric_angle = params.beta[:, None]
-
-    # load interpolators
-    clInterpolator = params.clInterpolator
-    cdInterpolator = params.cdInterpolator
-
+    
     # calculate aerodynamic incidence
     _, phi = resultantVelocityComponents(V_ia, params) # get only second output
 
@@ -105,7 +95,6 @@ def lookup_coeffs(V_ia, params):
     C_L_unstall = jnp.zeros(jnp.shape(AoA_eff))
     C_D_unstall = jnp.zeros(jnp.shape(AoA_eff))
     
-
     #New code, verify first.
     def station_coeffs(p, cl_coeffs, cd_coeffs):
         cl = RationalFunction(p, cl_coeffs[0:Inputs.P_Cl], cl_coeffs[Inputs.P_Cl:])
@@ -118,23 +107,8 @@ def lookup_coeffs(V_ia, params):
         params.cdInterpolator
     )
 
-    '''
-    for ii in range(len(params.r)):
-        C_L_unstall = C_L_unstall.at[ii, :].set(RationalFunction(AoA_eff[ii, :], 
-                                                                clInterpolator[ii, 0:Inputs.P_Cl], 
-                                                                clInterpolator[ii, Inputs.P_Cl:(Inputs.P_Cl + Inputs.Q_Cl - 1)]))
-        
-        C_D_unstall = C_D_unstall.at[ii, :].set(RationalFunction(AoA_eff[ii, :], 
-                                                                cdInterpolator[ii, 0:Inputs.P_Cd], 
-                                                                cdInterpolator[ii, Inputs.P_Cd:(Inputs.P_Cd + Inputs.Q_Cd - 1)]))
-    
-    '''
     # Coefficients in stall region based on flat plate model
-    C_N_stall = C_D90 * (jnp.sin(AoA_eff - AoA_0)) / (0.56+0.44*jnp.sin(AoA_eff - AoA_0))       # Normal Force Coefficient
-    C_T_stall = 0.5*C_D0 *jnp.cos(AoA_eff - AoA_0)                                      # Tangential Force Coefficient
-    C_L_stall = C_N_stall*jnp.cos(AoA_eff - AoA_0)-C_T_stall*jnp.sin(AoA_eff - AoA_0)           # Lift Coefficient
-    C_D_stall = C_N_stall*jnp.sin(AoA_eff - AoA_0)+C_T_stall*jnp.cos(AoA_eff - AoA_0)           # Drag Coefficient
-    C_M_stall = -C_N_stall*(0.25-0.175*(1-2*AoA_eff/jnp.pi))                   # Moment Coefficient
+    C_L_stall, C_D_stall, C_M = parametric_coeffs(V_ia, params)
 
     # Set piecewise function between 20 and 160 degrees
     stall_low  = jnp.abs(AoA_eff) >= jnp.radians(20)
@@ -144,18 +118,11 @@ def lookup_coeffs(V_ia, params):
     # Piecewise coefficients (stall for 20°–160°)
     C_L = jnp.where(stall, C_L_stall, C_L_unstall)
     C_D = jnp.where(stall, C_D_stall, C_D_unstall)
-    C_M = C_M_stall
     
     return C_L, C_D, C_M
 
+
 def aero_coeffs(V_ia, params):
-    ''' Legacy code 
-    # Select Method to Establish Aerodynamic Coefficients
-    C_L, C_D, C_M = lax.switch(Inputs.coeff_method,
-                    [parametric_coeffs, lookup_coeffs, blended_lookups],
-                    V_ia, params)
-    
-    '''
 
     # Computing cl,cd and cm with parametric and lookup methods
     cl_p, cd_p, cm_p = parametric_coeffs(V_ia, params)
