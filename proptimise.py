@@ -24,7 +24,7 @@ def curvature_penalty(x):
     d2 = x[2:] - 2.0 * x[1:-1] + x[:-2]
     return jnp.mean(d2**2)
 
-def minimumInducedLossCost(V_ia_0, scale=1):
+def minimumInducedLossCost(V_ia_0):
     """
     Returns the cost function of minimum induced loss, that is the RMS of the 
     variation of the induced velocity at the center of the propeller by each annulus
@@ -36,10 +36,10 @@ def minimumInducedLossCost(V_ia_0, scale=1):
 
     rms_err = jnp.sqrt(jnp.sum(squared_err))
 
-    return rms_err*scale
+    return rms_err
 
 #Returns the power, thrust error and smoothness penalty
-def base_objective(c, beta, params_static, milScale=0.3, thrScale=1.5):
+def base_objective(c, beta, params_static):
 
     params = replace(params_static, c=c, beta=beta)
     V_ia, V_ia_0   = propmodel.induced_velocity(params)
@@ -49,24 +49,26 @@ def base_objective(c, beta, params_static, milScale=0.3, thrScale=1.5):
 
     thrust_err = thrust - Inputs.thrust
 
-    rms_MIL_err = minimumInducedLossCost(V_ia_0, scale=milScale)
+    rms_MIL_err = minimumInducedLossCost(V_ia_0)
 
-    return power, thrust_err*thrScale, thrust, rms_MIL_err
+    return power, thrust_err, thrust, rms_MIL_err
 
 
 #Scaled Aug. lagrangian, returns the actual Lagrangian 
-def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_err, scale_THR_err=15.0, scale_POW_cost=0.0005):
+def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_err=0.3, scale_THR_err=15.0, scale_POW_cost=0.0005):
     c_scaled, beta_scaled = opt_vars_scaled
     
     c = c_scaled*c_scale
     beta = beta_scaled*beta_scale
 
-    power, thrust_err, _, rms_MIL_err = base_objective(c, beta, params_static, scale_MIL_err, scale_THR_err)
+    power, thrust_err, _, rms_MIL_err = base_objective(c, beta, params_static)
     #print(power)
 
+    rms_MIL_err = rms_MIL_err * scale_MIL_err
+    thrust_err = thrust_err * scale_THR_err
     power_cost = power*scale_POW_cost
 
-    return jnp.sqrt(thrust_err**2 + rms_MIL_err**2 + power_cost**2/thrust_err**2)
+    return jnp.sqrt(thrust_err**2 + rms_MIL_err**2 + power_cost**2)
 
 
 #Gradient scaling (compute c and beta scales)
@@ -154,55 +156,41 @@ def run_optimization():
 
     # Geometry setup
     psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
-    r, dr = propmodel.radial_stops(0.225, 0.025, Inputs.n_r)
+    r, dr = propmodel.radial_stops(0.225, 0.05, Inputs.n_r)
 
     init_c = jnp.full(Inputs.n_r, 0.020)
     # Linearly decreasing profile to start
     init_beta = jnp.linspace(jnp.radians(15), jnp.radians(5), Inputs.n_r)
     
-    # If using a lookup table for airfoil coefficients precompute interpolators
-    if(Inputs.coeff_method):
-        switchflag = True
+    print("--> Initialising")
 
-        # Define the input tables
-        input_filename = "compiledData-ARAD10.txt"
+    # Define the input tables
+    input_filename = "compiledData-ARAD10.txt"
 
-        # Generate the reynolds and mach lists
-        Re_list = 150000 * jnp.ones(jnp.size(r))
-        Ma_list = 0.15 * jnp.ones(jnp.size(r))
+    # Generate the reynolds and mach lists
+    Re_list = 150000 * jnp.ones(jnp.size(r))
+    Ma_list = 0.15 * jnp.ones(jnp.size(r))
+    Re_list_new = 150000 * jnp.ones(jnp.size(r))
+    Ma_list_new = 0.15 * jnp.ones(jnp.size(r))
 
-        # Generate the interpolators
-        cl_interpolator, cd_interpolator = airfoil.loadAirfoilData(input_filename, Re_list, Ma_list, Inputs.n_r)
+    # Generate the interpolators
+    cl_interpolator, cd_interpolator = airfoil.loadAirfoilData(input_filename, Re_list, Ma_list, Inputs.n_r)
 
-        params_static = Params(
-            N=2,
-            R=jnp.max(r),
-            c=init_c[:, None],
-            beta=init_beta[:,None],
-            r=r[:, None], dr=dr,
-            psi=psi[None, :], dpsi=dpsi,
-            V_x=jnp.array([0]), V_yz=jnp.array([0]),
-            omega=jnp.array([8000/60*2*3.14159]), # rad/s
-            V_ia_0 = jnp.full((Inputs.n_r,), jnp.array([4.0])),
-            cdInterpolator=cd_interpolator,
-            clInterpolator=cl_interpolator
-        )
-    else:
-        switchflag = False
+    params_static = Params(
+        N=2,
+        R=jnp.max(r),
+        c=init_c[:, None],
+        beta=init_beta[:,None],
+        r=r[:, None], dr=dr,
+        psi=psi[None, :], dpsi=dpsi,
+        V_x=jnp.array([0]), V_yz=jnp.array([0]),
+        omega=jnp.array([8000/60*2*3.14159]), # rad/s
+        V_ia_0 = jnp.full((Inputs.n_r,), jnp.array([4.0])),
+        cdInterpolator=cd_interpolator,
+        clInterpolator=cl_interpolator
+    )
 
-        params_static = Params(
-            N=2,
-            R=jnp.max(r),
-            c=init_c[:, None],
-            beta=init_beta[:,None],
-            r=r[:, None], dr=dr,
-            psi=psi[None, :], dpsi=dpsi,
-            V_x=jnp.array([0]), V_yz=jnp.array([0]),
-            omega=jnp.array([840]), # rad/s
-            V_ia_0 = jnp.full((Inputs.n_r,), jnp.array([4.0]))
-        )
-
-    Inputs.coeff_method = 0
+    print("--> Initialisation complete!")
 
     P_c = Inputs.Ord_Numerator_c
     Q_c = Inputs.Ord_Denominator_c
@@ -240,11 +228,7 @@ def run_optimization():
     #Augmented Lagrangian params
     lmbda = 0
     mu = 1
-    eta_tol = 1e-1
-
-    #Set arbtitrarily high to initiate solver
-    print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Cost':<12}")
-    print("-" * 90)
+    eta_tol = 1e-2
 
     #Initialise the global best cost variable
     global_best_cost = jnp.inf
@@ -255,21 +239,7 @@ def run_optimization():
 
     for i in range(total_iter):
 
-        if i < Inputs.n_iter_parametric: #Start with parametric method only to initialise
-            alpha = 0 
-        elif i < (Inputs.n_iter_parametric + Inputs.n_iter_blended): # Begin blending (linear ramp)
-            alpha = (i-Inputs.n_iter_parametric)/(Inputs.n_iter_blended) 
-            Inputs.coeff_method = 1
-
-            if i == Inputs.n_iter_parametric:  #initialise with best sol.
-                vars_scaled = (global_best_c/c_scale, global_best_beta/beta_scale)
-        else:   #Pure lookup
-            alpha = 1
-            
-            if i == Inputs.n_iter_parametric + Inputs.n_iter_blended:  #again, initialise with best sol.
-                vars_scaled = (global_best_c/c_scale, global_best_beta/beta_scale)
-
-        params_static = replace(params_static, blend_alpha=alpha)
+        print("--> Running solver")
 
         sol = solver.run(
             vars_scaled,
@@ -280,7 +250,9 @@ def run_optimization():
             scale_MIL_err=0.25,
             scale_THR_err=1.5
         )
-
+        
+        print("--> Solver complete!")
+        
         vars_scaled = sol.params
 
         #Unscale C and beta
@@ -303,18 +275,36 @@ def run_optimization():
 
         V_ia_converged, V_ia_0_new = propmodel.induced_velocity(params_warm)
 
-        if Inputs.coeff_method == 1:
-            if not np.mod(i - Inputs.n_iter_parametric, Inputs.interpolation_update_spacing):
-                # Generate the new reynolds and mach lists
-                V_R, _ = resultantVelocityComponents(V_ia_converged, params_warm)
-                V_R_aved = jnp.mean(V_R, axis=1)
-                Re_list = params_static.rho * c * V_R_aved / params_static.mu
-                Ma_list = V_R_aved / params_static.v_sound
 
-                # Generate the interpolators
-                cl_interpolator, cd_interpolator = airfoil.loadAirfoilData(input_filename, Re_list, Ma_list, Inputs.n_r)
+        print("--> Regenerating interpolators")
 
-                params_static = replace(params_static, clInterpolator=cl_interpolator, cdInterpolator=cd_interpolator)
+        # Generate the new reynolds and mach lists
+        V_R, _ = resultantVelocityComponents(V_ia_converged, params_warm)
+        V_R_aved = jnp.mean(V_R, axis=1)
+        Re_list_new = params_static.rho * c * V_R_aved / params_static.mu
+        Ma_list_new = V_R_aved / params_static.v_sound
+
+        if (i >= Inputs.switchingDelay) and (i <= Inputs.switchingDelay + Inputs.switchingTime):
+            params_static = replace(params_static, blendingParam = (i - Inputs.switchingDelay)/Inputs.switchingTime)
+
+        # Generate the interpolators
+        for rr in range(Inputs.n_r):
+            if (jnp.abs((Re_list_new[rr]-Re_list[rr])/Re_list[rr])>0.1) or (jnp.abs((Ma_list_new[rr]-Ma_list[rr])/Ma_list[rr])>0.1):
+                print("Regenerating interpolator at radial position " + str(rr) + " of " + str(Inputs.n_r))
+
+                Re_list = Re_list.at[rr].set(Re_list_new[rr])
+                Ma_list = Ma_list.at[rr].set(Ma_list_new[rr])
+
+                # check if the mach or reynolds has changed more than 10%
+                cl_params, cd_params = airfoil.loadAirfoilDataSingle(input_filename, Re_list[rr], Ma_list[rr])
+                
+                # store the data in the interpolator arrays
+                cl_interpolator = cl_interpolator.at[rr].set(cl_params)
+                cd_interpolator = cd_interpolator.at[rr].set(cd_params)
+
+        params_static = replace(params_static, clInterpolator=cl_interpolator, cdInterpolator=cd_interpolator)
+
+        print("--> Interpolators complete!")
 
 
         params_static = replace(params_static, V_ia_0=V_ia_0_new)
@@ -331,7 +321,9 @@ def run_optimization():
             scale_THR_err=1.5
         )
 
-        print(f"{i:<6} | {float(power):<12.4f} | {float(thrust):<12.4f} | {float(thrust_err):<12.4f} | {rms_MIL_err:<10.1f} | {current_smoothed_cost:<12.4f}")
+        print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Lambda':<12} | {'Blending Parameter':<10}")
+        print("-" * 90)
+        print(f"{i:<6} | {float(power):<12.4f} | {float(thrust):<12.4f} | {float(thrust_err):<12.4f} | {rms_MIL_err:<10.1f} | {current_smoothed_cost:<12.4f} | {params_static.blendingParam:<10.1f}")
 
         vars_scaled = (c/c_scale,beta_smoothed/beta_scale)
 
@@ -342,7 +334,7 @@ def run_optimization():
             global_best_beta = beta
 
         # Convergence, don't want to prematurely return a solution
-        if abs(thrust_err) < eta_tol and alpha == 1:
+        if abs(thrust_err) < eta_tol and params_static.blendingParam == 1:
             print(f"\nConverged at iteration {i} with thrust error {thrust_err:.2e}")
             break
 

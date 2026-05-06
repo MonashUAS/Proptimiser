@@ -18,7 +18,7 @@ class Inputs(eqx.Module):
 
     # Thrust constraint
     solvertype: str = "T"
-    thrust: float = 50 # Newtons
+    thrust: float = 100 # Newtons
 
     # Normalisation for Power (update with flat-plate guess)
     power_scale: float = 1000
@@ -29,9 +29,9 @@ class Inputs(eqx.Module):
 
     ## Discretisation settings
     # Radial discretisation
-    n_r: int = 25
+    n_r: int = 20
     # Azimuthal discretisation (for skewed inflow)
-    n_psi: int = 36
+    n_psi: int = 18
 
     # Diagnostics / debugging
     verbose: bool = False
@@ -40,7 +40,7 @@ class Inputs(eqx.Module):
 
     # Model Selection
     inflow_model: int = 0 # 0 = basic, 1 = Pitt & Peters, 2 = DTU
-    coeff_method: int = 1 # 0 = parametric, 1 = lookup table
+    coeff_method: int = 2 # 0 = parametric, 1 = lookup table, 2 = blending mode
     tip_loss_model: int = 1 # 0 = none, 1 = Prandtl
     root_loss_model: int = 1 # 0 = none, 1 = Prandtl
 
@@ -59,13 +59,8 @@ class Inputs(eqx.Module):
     Q_Cl: int = 2
     P_Cd: int = 2
     Q_Cd: int = 2
-    interpolation_update_spacing: int = 2 # The number of top level iterations before the interpolation functions are updated
-    switchingDelay: int = 10
-
-    # Blended parametric/lookup parameters 
-    n_iter_parametric: int = 3
-    n_iter_blended: int = 4
-    n_iter_lookup: int = 6
+    switchingDelay: int = 2
+    switchingTime: int = 13
     
 
 class Params(eqx.Module):
@@ -103,6 +98,7 @@ class Params(eqx.Module):
     # Interpolators
     cdInterpolator: jsp.interpolate.RegularGridInterpolator = None
     clInterpolator: jsp.interpolate.RegularGridInterpolator = None
+    blendingParam: float = 0
 
     #Blending parameter, ranges between 0->1 (full parametric -> full lookup)
     blend_alpha: float = 0.0

@@ -91,7 +91,7 @@ def lookup_coeffs(V_ia, params):
     _, phi = resultantVelocityComponents(V_ia, params) # get only second output
 
     # Angle of attack
-    AoA_eff = geometric_angle - phi 
+    AoA_eff = geometric_angle - phi
 
     # Calculate the normal component of V_yz from the tocal V_yz
     V_yz_perp = V_yz * jnp.sin(psi)
@@ -119,23 +119,21 @@ def lookup_coeffs(V_ia, params):
     )
 
     '''
-    # Outer if statement is needed for jit compilation
-    if Inputs.coeff_method == 1:
-        for ii in range(len(params.r)):
-            C_L_unstall = C_L_unstall.at[ii, :].set(RationalFunction(phi[ii, :], 
-                                                                    clInterpolator[ii, 0:Inputs.P_Cl], 
-                                                                    clInterpolator[ii, Inputs.P_Cl:(Inputs.P_Cl + Inputs.Q_Cl - 1)]))
-            
-            C_D_unstall = C_D_unstall.at[ii, :].set(RationalFunction(phi[ii, :], 
-                                                                    cdInterpolator[ii, 0:Inputs.P_Cd], 
-                                                                    cdInterpolator[ii, Inputs.P_Cd:(Inputs.P_Cd + Inputs.Q_Cd - 1)]))
+    for ii in range(len(params.r)):
+        C_L_unstall = C_L_unstall.at[ii, :].set(RationalFunction(AoA_eff[ii, :], 
+                                                                clInterpolator[ii, 0:Inputs.P_Cl], 
+                                                                clInterpolator[ii, Inputs.P_Cl:(Inputs.P_Cl + Inputs.Q_Cl - 1)]))
+        
+        C_D_unstall = C_D_unstall.at[ii, :].set(RationalFunction(AoA_eff[ii, :], 
+                                                                cdInterpolator[ii, 0:Inputs.P_Cd], 
+                                                                cdInterpolator[ii, Inputs.P_Cd:(Inputs.P_Cd + Inputs.Q_Cd - 1)]))
     
     '''
     # Coefficients in stall region based on flat plate model
-    C_N_stall = C_D90 * (jnp.sin(AoA_eff)) / (0.56+0.44*jnp.sin(AoA_eff))       # Normal Force Coefficient
-    C_T_stall = 0.5*C_D0 *jnp.cos(AoA_eff)                                      # Tangential Force Coefficient
-    C_L_stall = C_N_stall*jnp.cos(AoA_eff)-C_T_stall*jnp.sin(AoA_eff)           # Lift Coefficient
-    C_D_stall = C_N_stall*jnp.sin(AoA_eff)+C_T_stall*jnp.cos(AoA_eff)           # Drag Coefficient
+    C_N_stall = C_D90 * (jnp.sin(AoA_eff - AoA_0)) / (0.56+0.44*jnp.sin(AoA_eff - AoA_0))       # Normal Force Coefficient
+    C_T_stall = 0.5*C_D0 *jnp.cos(AoA_eff - AoA_0)                                      # Tangential Force Coefficient
+    C_L_stall = C_N_stall*jnp.cos(AoA_eff - AoA_0)-C_T_stall*jnp.sin(AoA_eff - AoA_0)           # Lift Coefficient
+    C_D_stall = C_N_stall*jnp.sin(AoA_eff - AoA_0)+C_T_stall*jnp.cos(AoA_eff - AoA_0)           # Drag Coefficient
     C_M_stall = -C_N_stall*(0.25-0.175*(1-2*AoA_eff/jnp.pi))                   # Moment Coefficient
 
     # Set piecewise function between 20 and 160 degrees
@@ -150,12 +148,11 @@ def lookup_coeffs(V_ia, params):
     
     return C_L, C_D, C_M
 
-
 def aero_coeffs(V_ia, params):
     ''' Legacy code 
     # Select Method to Establish Aerodynamic Coefficients
     C_L, C_D, C_M = lax.switch(Inputs.coeff_method,
-                    [parametric_coeffs, lookup_coeffs],
+                    [parametric_coeffs, lookup_coeffs, blended_lookups],
                     V_ia, params)
     
     '''
@@ -165,7 +162,7 @@ def aero_coeffs(V_ia, params):
     cl_l, cd_l, cm_l = lookup_coeffs(V_ia, params)
     
     #Varies between 0 and 1 to control blending
-    alpha = params.blend_alpha
+    alpha = params.blendingParam
     
     # Parametric/lookup blending 
     C_L = (1.0 - alpha) * cl_p + alpha * cl_l
@@ -177,7 +174,7 @@ def aero_coeffs(V_ia, params):
 
 def loadAirfoilData(filename: str, 
                     Re_list: jnp.ndarray, Ma_list: jnp.ndarray, nr: int,
-                    shape: jnp.ndarray = jnp.array([81, 14, 6]), numInterpPoints: int = 50,
+                    shape: jnp.ndarray = jnp.array([81, 14, 6]),
                     method:str='linear') -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Inputs:
@@ -186,7 +183,57 @@ def loadAirfoilData(filename: str,
      -> Ma_list:            A list corresponding to the local mach number at each radial position of the propeller
      -> nr:                 The number of radial stations in the propeller
      -> shape:              The shape of each data "block" in the input file. The input file is expected to be made up of one of these blocks for each of alpha, reynolds number, mach number, CL and CD and to be in that order
-     -> numInterpPoints:    The number of interpolation points to generate from the input file prior to applying the rational function fitting
+     -> method:             The method for performing the initial interpolation, prior to applying the rational function interpolation. Used to interpolate within the alphaInterpRange 
+    
+    Hidden Inputs: (Accessible through init.py):     
+     -> CL_P:               Order of numerator polynomial in CL rational function
+     -> CL_Q:               Order of denominator polynomial in CL rational function
+     -> CD_P:               Order of numerator polynomial in CD rational function
+     -> CD_Q:               Order of denominator polynomial in CD rational function
+
+    Outputs:
+     -> cl_interpolators:   an array of size [nr, (p + q)] with each radially spaced element consisting of [CL_P, p0, p1, ..., pn, q1, q2, ..., qn]
+     -> cd_interpolators:   an array of size [nr, (p + q)] with each radially spaced element consisting of [CD_P, p0, p1, ..., pn, q1, q2, ..., qn]
+    
+    >>FUNCTION DESCRIPTION<<
+    ...
+    ... Description to go here
+    ...
+    >>FUNCTION DESCRIPTION<<
+    """
+    # Create the cl and cd interpolator arrays
+    cl_interpolator = jnp.zeros((nr, Inputs.P_Cl + Inputs.Q_Cl - 1))
+    cd_interpolator = jnp.zeros((nr, Inputs.P_Cd + Inputs.Q_Cd - 1))
+    
+    # Iterate through the radial stations
+    for r in range(nr):
+        
+        print("Initialising radial position " + str(r) + " of " + str(nr))
+
+        # use single point lookup (less efficient but done for code maintenance)
+        cl_params, cd_params = loadAirfoilDataSingle(filename, Re_list[r], Ma_list[r], shape, method)
+
+        # store the data in the interpolator arrays
+        cl_interpolator = cl_interpolator.at[r].set(cl_params)
+        cd_interpolator = cd_interpolator.at[r].set(cd_params)
+
+        print("Radial position " + str(r) + " of " + str(nr) + " initialised")
+    
+    # Return the interpolator arrays
+    return cl_interpolator, cd_interpolator
+
+
+def loadAirfoilDataSingle(filename: str, 
+                          Re_list: jnp.ndarray, Ma_list: jnp.ndarray,
+                          shape: jnp.ndarray = jnp.array([81, 14, 6]),
+                          method:str='linear') -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Inputs:
+     -> filename:           string containing the relative path to the file containing the airfoil data
+     -> Re_list:            A list corresponding to the local reynolds number at each radial position of the propeller
+     -> Ma_list:            A list corresponding to the local mach number at each radial position of the propeller
+     -> nr:                 The number of radial stations in the propeller
+     -> shape:              The shape of each data "block" in the input file. The input file is expected to be made up of one of these blocks for each of alpha, reynolds number, mach number, CL and CD and to be in that order
      -> method:             The method for performing the initial interpolation, prior to applying the rational function interpolation. Used to interpolate within the alphaInterpRange 
     
     Hidden Inputs: (Accessible through init.py):     
@@ -230,33 +277,23 @@ def loadAirfoilData(filename: str,
     # Convert input to radians
     alp = jnp.radians(alp)
     
-    # Create the cl and cd interpolator arrays
-    cl_interpolator = jnp.zeros((nr, Inputs.P_Cl + Inputs.Q_Cl - 1))
-    cd_interpolator = jnp.zeros((nr, Inputs.P_Cd + Inputs.Q_Cd - 1))
-    
     # Generate a 3D scipy style interpolator object which can be called like a function to interpolate input points
     cli_temp = jsp.interpolate.RegularGridInterpolator((alp, rey, mac), cl, method=method)
     cdi_temp = jsp.interpolate.RegularGridInterpolator((alp, rey, mac), cd, method=method)
 
-    # Iterate through the radial stations
-    for r in range(nr):
-        # Use the temporary 3d interpolator objects to generate 1D arrays for CL and CD
-        Cl_temp = cli_temp((alp, Re_list[r], Ma_list[r]))
-        Cd_temp = cdi_temp((alp, Re_list[r], Ma_list[r]))
+    # Use the temporary 3d interpolator objects to generate 1D arrays for CL and CD
+    Cl_temp = cli_temp((alp, Re_list, Ma_list))
+    Cd_temp = cdi_temp((alp, Re_list, Ma_list))
 
-        Cl_temp = jnp.where(jnp.isfinite(Cl_temp), Cl_temp, 0.01*jnp.sign(alp))
-        Cd_temp = jnp.where(jnp.isfinite(Cd_temp), Cd_temp, 0.5)
+    Cl_temp = jnp.where(jnp.isfinite(Cl_temp), Cl_temp, 0.01*jnp.sign(alp))
+    Cd_temp = jnp.where(jnp.isfinite(Cd_temp), Cd_temp, 0.5)
 
-        # Perform rational fitting on the temporary cl and cd arrays
-        cl_params = RationalFunctionInterp(alp, Cl_temp, Inputs.P_Cl, Inputs.Q_Cl, verbose=False, extendedChecking=True)
-        cd_params = RationalFunctionInterp(alp, Cd_temp, Inputs.P_Cd, Inputs.Q_Cd, verbose=False, extendedChecking=True)
-
-        # store the data in the interpolator arrays
-        cl_interpolator = cl_interpolator.at[r].set(cl_params)
-        cd_interpolator = cd_interpolator.at[r].set(cd_params)
+    # Perform rational fitting on the temporary cl and cd arrays
+    cl_params = RationalFunctionInterp(alp, Cl_temp, Inputs.P_Cl, Inputs.Q_Cl, verbose=False, extendedChecking=True)
+    cd_params = RationalFunctionInterp(alp, Cd_temp, Inputs.P_Cd, Inputs.Q_Cd, verbose=False, extendedChecking=True)
     
     # Return the interpolator arrays
-    return cl_interpolator, cd_interpolator
+    return cl_params, cd_params
 
 
 if __name__ == "__main__":
@@ -282,5 +319,3 @@ if __name__ == "__main__":
         omega=jnp.array([2*jnp.pi*8000/60]),
         V_ia_0=jnp.full_like(r[:, None], 14)
     )
-
-    #parametric_coeffs(jnp.full_like(r[:, None], 0), params_static, True)
