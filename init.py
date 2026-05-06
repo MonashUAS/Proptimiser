@@ -29,7 +29,7 @@ class Inputs(eqx.Module):
 
     ## Discretisation settings
     # Radial discretisation
-    n_r: int = 5
+    n_r: int = 20
     # Azimuthal discretisation (for skewed inflow)
     n_psi: int = 36
 

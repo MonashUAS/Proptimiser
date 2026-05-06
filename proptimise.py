@@ -162,7 +162,7 @@ def run_optimization():
     # Linearly decreasing profile to start
     init_beta = jnp.linspace(jnp.radians(15), jnp.radians(5), Inputs.n_r)
     
-    print("--> Initialising")
+    print("\n--> Initialising")
 
     # Define the input tables
     input_filename = "compiledData-ARAD10.txt"
@@ -190,7 +190,7 @@ def run_optimization():
         clInterpolator=cl_interpolator
     )
 
-    print("--> Initialisation complete!")
+    print("\t--> Initialisation complete!")
 
     P_c = Inputs.Ord_Numerator_c
     Q_c = Inputs.Ord_Denominator_c
@@ -239,7 +239,7 @@ def run_optimization():
 
     for i in range(total_iter):
 
-        print("--> Running solver")
+        print("\n--> Running solver")
 
         sol = solver.run(
             vars_scaled,
@@ -251,7 +251,7 @@ def run_optimization():
             scale_THR_err=1.5
         )
         
-        print("--> Solver complete!")
+        print("\t--> Solver complete!")
         
         vars_scaled = sol.params
 
@@ -276,7 +276,7 @@ def run_optimization():
         V_ia_converged, V_ia_0_new = propmodel.induced_velocity(params_warm)
 
 
-        print("--> Regenerating interpolators")
+        print("\n--> Regenerating interpolators")
 
         # Generate the new reynolds and mach lists
         V_R, _ = resultantVelocityComponents(V_ia_converged, params_warm)
@@ -304,7 +304,7 @@ def run_optimization():
 
         params_static = replace(params_static, clInterpolator=cl_interpolator, cdInterpolator=cd_interpolator)
 
-        print("--> Interpolators complete!")
+        print("\t--> Interpolators complete!")
 
 
         params_static = replace(params_static, V_ia_0=V_ia_0_new)
@@ -321,9 +321,11 @@ def run_optimization():
             scale_THR_err=1.5
         )
 
-        print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Lambda':<12} | {'Blending Parameter':<10}")
+        print("\n")
+        print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Smoothed cost':<12} | {'Blending Parameter':<10}")
         print("-" * 90)
         print(f"{i:<6} | {float(power):<12.4f} | {float(thrust):<12.4f} | {float(thrust_err):<12.4f} | {rms_MIL_err:<10.1f} | {current_smoothed_cost:<12.4f} | {params_static.blendingParam:<10.1f}")
+        print("\n")
 
         vars_scaled = (c/c_scale,beta_smoothed/beta_scale)
 

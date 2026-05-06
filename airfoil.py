@@ -217,7 +217,7 @@ def loadAirfoilData(filename: str,
         cl_interpolator = cl_interpolator.at[r].set(cl_params)
         cd_interpolator = cd_interpolator.at[r].set(cd_params)
 
-        print("Radial position " + str(r+1) + " of " + str(nr) + " initialised")
+        print("\tRadial position " + str(r+1) + " of " + str(nr) + " initialised")
     
     # Return the interpolator arrays
     return cl_interpolator, cd_interpolator
