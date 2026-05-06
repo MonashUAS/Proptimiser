@@ -235,7 +235,7 @@ def run_optimization():
     global_best_c = init_c
     global_best_beta = init_beta
     
-    total_iter = Inputs.n_iter_parametric + Inputs.n_iter_blended + Inputs.n_iter_lookup
+    total_iter = Inputs.Iterations_initialising + Inputs.Iterations_blending + Inputs.Iterations_solving
 
     for i in range(total_iter):
 
@@ -284,13 +284,13 @@ def run_optimization():
         Re_list_new = params_static.rho * c * V_R_aved / params_static.mu
         Ma_list_new = V_R_aved / params_static.v_sound
 
-        if (i >= Inputs.switchingDelay) and (i <= Inputs.switchingDelay + Inputs.switchingTime):
-            params_static = replace(params_static, blendingParam = (i - Inputs.switchingDelay)/Inputs.switchingTime)
+        if (i >= Inputs.Iterations_initialising) and (i <= Inputs.Iterations_initialising + Inputs.Iterations_blending):
+            params_static = replace(params_static, blendingParam = (i - Inputs.Iterations_initialising)/Inputs.Iterations_blending)
 
         # Generate the interpolators
         for rr in range(Inputs.n_r):
             if (jnp.abs((Re_list_new[rr]-Re_list[rr])/Re_list[rr])>0.1) or (jnp.abs((Ma_list_new[rr]-Ma_list[rr])/Ma_list[rr])>0.1):
-                print("Regenerating interpolator at radial position " + str(rr) + " of " + str(Inputs.n_r))
+                print("Regenerating interpolator at radial position " + str(rr+1) + " of " + str(Inputs.n_r))
 
                 Re_list = Re_list.at[rr].set(Re_list_new[rr])
                 Ma_list = Ma_list.at[rr].set(Ma_list_new[rr])

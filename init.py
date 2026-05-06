@@ -29,9 +29,9 @@ class Inputs(eqx.Module):
 
     ## Discretisation settings
     # Radial discretisation
-    n_r: int = 20
+    n_r: int = 5
     # Azimuthal discretisation (for skewed inflow)
-    n_psi: int = 18
+    n_psi: int = 36
 
     # Diagnostics / debugging
     verbose: bool = False
@@ -59,8 +59,12 @@ class Inputs(eqx.Module):
     Q_Cl: int = 2
     P_Cd: int = 2
     Q_Cd: int = 2
-    switchingDelay: int = 2
-    switchingTime: int = 13
+    
+    # Lookup blending steps
+    Iterations_initialising: int = 2
+    Iterations_blending: int = 13
+    Iterations_solving: int = 10
+
     
 
 class Params(eqx.Module):
