@@ -1,4 +1,5 @@
 import jax.numpy as jnp
+import jax.scipy as jscp
 import matplotlib.pyplot as plt
 import scipy as scp
 import numpy as np
@@ -31,7 +32,7 @@ def RationalFunctionInterp(x0, y0, P: int, Q: int, verbose:bool = False,
 
     popt, pcov = scp.optimize.curve_fit(RationalWrapper, x0, y0, p0,
                                         check_finite=extendedChecking, method=method, 
-                                        bounds=bounds)
+                                        bounds=bounds,maxfev=10000)
 
     if verbose:
         print("-----> RFI debug <-----")
@@ -50,6 +51,7 @@ def RationalFunctionInterp(x0, y0, P: int, Q: int, verbose:bool = False,
     """
     return popt
 
+
 def RationalFunction(x, p, q):
     """
     The general rational function description.
@@ -61,7 +63,7 @@ def RationalFunction(x, p, q):
     zeroth order denominator coefficient must comes last.
     """
 
-    func_eval = np.polyval(p, x) / np.polyval(q + [1.0], x)
+    func_eval = jnp.polyval(jnp.asarray(p), jnp.asarray(x)) / jnp.polyval(jnp.append(jnp.asarray(q), jnp.array([1.0])), jnp.asarray(x))
     
     return func_eval
 

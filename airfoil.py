@@ -2,9 +2,13 @@
 import jax
 from jax import numpy as jnp
 from jax import lax
+import jax.scipy as jsp
 import matplotlib.pyplot as plt
 from init import Inputs,Params
 from airflow import resultantVelocityComponents
+import numpy as np
+import scipy as scipy
+from Foil_Interpolators import RationalFunctionInterp, RationalFunction
 
 ## ---Parametric Coefficients---
 # (good for approximate analysis, use LUT for more accuracy)
@@ -25,7 +29,7 @@ def parametric_coeffs(V_ia, params):
     C_La = 5.7     # Lift curve slope per rad (ARAD10)
     C_D90 = 1.98    # Drag coefficient at 90 degrees angle of attack (flat plate)
     C_D0 = 0.0175    # Zero lift drag coefficient (ARA-D 10)
-    AoA_0 = jnp.radians(10) # zero lift angle of attack
+    AoA_0 = jnp.radians(-10) # zero lift angle of attack
 
     # load relevant data from inputs
     geometric_angle = params.beta[:, None]
@@ -34,11 +38,7 @@ def parametric_coeffs(V_ia, params):
     _, phi = resultantVelocityComponents(V_ia, params) # get only second output
 
     # Angle of attack
-    AoA_eff = geometric_angle - phi + AoA_0
-
-    # Do some conditioning of the effective AoA
-    #AoA_eff = jnp.where(AoA_eff==jnp.pi/2, AoA_eff+jnp.radians(0.05), AoA_eff)
-    #AoA_eff = jnp.where(AoA_eff==jnp.pi, AoA_eff-jnp.radians(0.05), AoA_eff)
+    AoA_eff = geometric_angle - phi - AoA_0
 
     # Coefficients in non-stall region
     C_L_unstall = C_La * AoA_eff                                                            # Lift Coefficient in linear region
@@ -64,26 +64,201 @@ def parametric_coeffs(V_ia, params):
     C_D = jnp.where(stall, C_D_stall, C_D_unstall)
     C_M = jnp.where(stall, C_M_stall, C_M_unstall)
     
-    return C_L, C_D, C_M
+    return C_L, C_D, C_M_stall
 
 
 def lookup_coeffs(V_ia, params):
     '''
-    Placeholder for future lookup table implementation, 
-    use parametric for now to allow compile
+    lookup table implementation
     '''
-    #raise(NotImplementedError("FUnction 'lookup_coeffs' in airfoil.py is not implemented yet"))
-    # Look up/estimate CL/CD from CFD data tables
+    # Unpack params
+    V_x, omega, r, V_yz, psi = params.V_x, params.omega, params.r, params.V_yz, params.psi
 
-    # Input parameters of alpha, Re, Ma, airfoil type. Return airfoil with suitable coefficients that minimise chord.
-    return parametric_coeffs(V_ia, params)
+    # load relevant data from inputs
+    geometric_angle = params.beta[:, None]
+    
+    # calculate aerodynamic incidence
+    _, phi = resultantVelocityComponents(V_ia, params) # get only second output
+
+    # Angle of attack
+    AoA_eff = geometric_angle - phi
+
+    # Calculate the normal component of V_yz from the tocal V_yz
+    V_yz_perp = V_yz * jnp.sin(psi)
+
+    # Calculate V_R from the magnitude of the vector sum of the individual components
+    V_axial_net = V_x + V_ia
+    V_norml_net = omega*r + V_yz_perp
+    V_R = jnp.sqrt(jnp.square(V_axial_net) + jnp.square(V_norml_net))
+
+    # Coefficients in non-stall region
+    C_L_unstall = jnp.zeros(jnp.shape(AoA_eff))
+    C_D_unstall = jnp.zeros(jnp.shape(AoA_eff))
+    
+    #New code, verify first.
+    def station_coeffs(p, cl_coeffs, cd_coeffs):
+        cl = RationalFunction(p, cl_coeffs[0:Inputs.P_Cl], cl_coeffs[Inputs.P_Cl:])
+        cd = RationalFunction(p, cd_coeffs[0:Inputs.P_Cd], cd_coeffs[Inputs.P_Cd:])
+        return cl, cd
+    
+    C_L_unstall, C_D_unstall = jax.vmap(station_coeffs)(
+        AoA_eff, 
+        params.clInterpolator, 
+        params.cdInterpolator
+    )
+
+    # Coefficients in stall region based on flat plate model
+    C_L_stall, C_D_stall, C_M = parametric_coeffs(V_ia, params)
+
+    # Set piecewise function between 20 and 160 degrees
+    stall_low  = jnp.abs(AoA_eff) >= jnp.radians(20)
+    stall_high = jnp.abs(AoA_eff) >  jnp.radians(160) # Don't model high stall angle, inverse flow is complex
+    stall      = stall_low & ~stall_high   # 20°–160°
+    
+    # Piecewise coefficients (stall for 20°–160°)
+    C_L = jnp.where(stall, C_L_stall, C_L_unstall)
+    C_D = jnp.where(stall, C_D_stall, C_D_unstall)
+    
+    return C_L, C_D, C_M
+
 
 def aero_coeffs(V_ia, params):
-    # Select Method to Establish Aerodynamic Coefficients
-    C_L, C_D, C_M = lax.switch(Inputs.coeff_method,
-                    [parametric_coeffs, lookup_coeffs],
-                    V_ia, params)
+
+    # Computing cl,cd and cm with parametric and lookup methods
+    cl_p, cd_p, cm_p = parametric_coeffs(V_ia, params)
+    cl_l, cd_l, cm_l = lookup_coeffs(V_ia, params)
+    
+    #Varies between 0 and 1 to control blending
+    alpha = params.blendingParam
+    
+    # Parametric/lookup blending 
+    C_L = (1.0 - alpha) * cl_p + alpha * cl_l
+    C_D = (1.0 - alpha) * cd_p + alpha * cd_l
+    C_M = (1.0 - alpha) * cm_p + alpha * cm_l
+
     return C_L, C_D, C_M
+
+
+def loadAirfoilData(filename: str, 
+                    Re_list: jnp.ndarray, Ma_list: jnp.ndarray, nr: int,
+                    shape: jnp.ndarray = jnp.array([81, 14, 6]),
+                    method:str='linear') -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Inputs:
+     -> filename:           string containing the relative path to the file containing the airfoil data
+     -> Re_list:            A list corresponding to the local reynolds number at each radial position of the propeller
+     -> Ma_list:            A list corresponding to the local mach number at each radial position of the propeller
+     -> nr:                 The number of radial stations in the propeller
+     -> shape:              The shape of each data "block" in the input file. The input file is expected to be made up of one of these blocks for each of alpha, reynolds number, mach number, CL and CD and to be in that order
+     -> method:             The method for performing the initial interpolation, prior to applying the rational function interpolation. Used to interpolate within the alphaInterpRange 
+    
+    Hidden Inputs: (Accessible through init.py):     
+     -> CL_P:               Order of numerator polynomial in CL rational function
+     -> CL_Q:               Order of denominator polynomial in CL rational function
+     -> CD_P:               Order of numerator polynomial in CD rational function
+     -> CD_Q:               Order of denominator polynomial in CD rational function
+
+    Outputs:
+     -> cl_interpolators:   an array of size [nr, (p + q)] with each radially spaced element consisting of [CL_P, p0, p1, ..., pn, q1, q2, ..., qn]
+     -> cd_interpolators:   an array of size [nr, (p + q)] with each radially spaced element consisting of [CD_P, p0, p1, ..., pn, q1, q2, ..., qn]
+    
+    >>FUNCTION DESCRIPTION<<
+    ...
+    ... Description to go here
+    ...
+    >>FUNCTION DESCRIPTION<<
+    """
+    # Create the cl and cd interpolator arrays
+    cl_interpolator = jnp.zeros((nr, Inputs.P_Cl + Inputs.Q_Cl - 1))
+    cd_interpolator = jnp.zeros((nr, Inputs.P_Cd + Inputs.Q_Cd - 1))
+
+    # Iterate through the radial stations
+    for r in range(nr):
+        
+        print("Initialising radial position " + str(r+1) + " of " + str(nr))
+
+        # use single point lookup (less efficient but done for code maintenance)
+        cl_params, cd_params = loadAirfoilDataSingle(filename, Re_list[r], Ma_list[r], shape, method)
+
+        # store the data in the interpolator arrays
+        cl_interpolator = cl_interpolator.at[r].set(cl_params)
+        cd_interpolator = cd_interpolator.at[r].set(cd_params)
+    
+    # Return the interpolator arrays
+    return cl_interpolator, cd_interpolator
+
+
+def loadAirfoilDataSingle(filename: str, 
+                          Re_list: jnp.ndarray, Ma_list: jnp.ndarray,
+                          shape: jnp.ndarray = jnp.array([81, 14, 6]),
+                          method:str='linear') -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Inputs:
+     -> filename:           string containing the relative path to the file containing the airfoil data
+     -> Re_list:            A list corresponding to the local reynolds number at each radial position of the propeller
+     -> Ma_list:            A list corresponding to the local mach number at each radial position of the propeller
+     -> nr:                 The number of radial stations in the propeller
+     -> shape:              The shape of each data "block" in the input file. The input file is expected to be made up of one of these blocks for each of alpha, reynolds number, mach number, CL and CD and to be in that order
+     -> method:             The method for performing the initial interpolation, prior to applying the rational function interpolation. Used to interpolate within the alphaInterpRange 
+    
+    Hidden Inputs: (Accessible through init.py):     
+     -> CL_P:               Order of numerator polynomial in CL rational function
+     -> CL_Q:               Order of denominator polynomial in CL rational function
+     -> CD_P:               Order of numerator polynomial in CD rational function
+     -> CD_Q:               Order of denominator polynomial in CD rational function
+
+    Outputs:
+     -> cl_interpolators:   an array of size [nr, (p + q)] with each radially spaced element consisting of [CL_P, p0, p1, ..., pn, q1, q2, ..., qn]
+     -> cd_interpolators:   an array of size [nr, (p + q)] with each radially spaced element consisting of [CD_P, p0, p1, ..., pn, q1, q2, ..., qn]
+    
+    >>FUNCTION DESCRIPTION<<
+    ...
+    ... Description to go here
+    ...
+    >>FUNCTION DESCRIPTION<<
+    """
+
+    # Load the data from file
+    array = np.loadtxt(filename, dtype='float', delimiter=',')
+
+    # Establish the block size
+    numbloks = 5    
+    blocksize = int(np.shape(array)[0]/numbloks)
+
+    # Load the blocks of data from the input file
+    alp = array[0           :   blocksize,      :]
+    rey = array[blocksize   :   blocksize*2,    :]
+    mac = array[blocksize*2 :   blocksize*3,    :]
+    cl  = array[blocksize*3 :   blocksize*4,    :]
+    cd  = array[blocksize*4 :   blocksize*5,    :]
+
+    # Reshape the blocks of data from 2D to 3D, breaking up only the last two dims:
+    alp = np.unique(alp)
+    rey = np.unique(rey)
+    mac = np.unique(mac)
+    cl  = np.reshape(cl, shape)
+    cd  = np.reshape(cd, shape)
+
+    # Convert input to radians
+    alp = jnp.radians(alp)
+    
+    # Generate a 3D scipy style interpolator object which can be called like a function to interpolate input points
+    cli_temp = jsp.interpolate.RegularGridInterpolator((alp, rey, mac), cl, method=method)
+    cdi_temp = jsp.interpolate.RegularGridInterpolator((alp, rey, mac), cd, method=method)
+
+    # Use the temporary 3d interpolator objects to generate 1D arrays for CL and CD
+    Cl_temp = cli_temp((alp, Re_list, Ma_list))
+    Cd_temp = cdi_temp((alp, Re_list, Ma_list))
+
+    Cl_temp = jnp.where(jnp.isfinite(Cl_temp), Cl_temp, 0.01*jnp.sign(alp))
+    Cd_temp = jnp.where(jnp.isfinite(Cd_temp), Cd_temp, 0.5)
+
+    # Perform rational fitting on the temporary cl and cd arrays
+    cl_params = RationalFunctionInterp(alp, Cl_temp, Inputs.P_Cl, Inputs.Q_Cl, verbose=False, extendedChecking=True)
+    cd_params = RationalFunctionInterp(alp, Cd_temp, Inputs.P_Cd, Inputs.Q_Cd, verbose=False, extendedChecking=True)
+    
+    # Return the interpolator arrays
+    return cl_params, cd_params
 
 
 if __name__ == "__main__":
@@ -109,5 +284,3 @@ if __name__ == "__main__":
         omega=jnp.array([2*jnp.pi*8000/60]),
         V_ia_0=jnp.full_like(r[:, None], 14)
     )
-
-    parametric_coeffs(jnp.full_like(r[:, None], 0), params_static, True)

@@ -6,7 +6,7 @@ import pandas as pd
 
 def params_to_le_te(r, beta, chord):
     # Calculate Chord Offset
-    chord_offset = 0.2 * np.max(chord)
+    chord_offset = 0.3 * np.max(chord)
 
     # 1. Calculate the components
     x = r.ravel()
