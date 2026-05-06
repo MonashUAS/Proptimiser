@@ -204,7 +204,7 @@ def loadAirfoilData(filename: str,
     # Create the cl and cd interpolator arrays
     cl_interpolator = jnp.zeros((nr, Inputs.P_Cl + Inputs.Q_Cl - 1))
     cd_interpolator = jnp.zeros((nr, Inputs.P_Cd + Inputs.Q_Cd - 1))
-    
+
     # Iterate through the radial stations
     for r in range(nr):
         
@@ -217,7 +217,7 @@ def loadAirfoilData(filename: str,
         cl_interpolator = cl_interpolator.at[r].set(cl_params)
         cd_interpolator = cd_interpolator.at[r].set(cd_params)
 
-        print("Radial position " + str(r) + " of " + str(nr) + " initialised")
+        print("Radial position " + str(r+1) + " of " + str(nr) + " initialised")
     
     # Return the interpolator arrays
     return cl_interpolator, cd_interpolator
