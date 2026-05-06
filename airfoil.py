@@ -208,7 +208,7 @@ def loadAirfoilData(filename: str,
     # Iterate through the radial stations
     for r in range(nr):
         
-        print("Initialising radial position " + str(r) + " of " + str(nr))
+        print("Initialising radial position " + str(r+1) + " of " + str(nr))
 
         # use single point lookup (less efficient but done for code maintenance)
         cl_params, cd_params = loadAirfoilDataSingle(filename, Re_list[r], Ma_list[r], shape, method)
@@ -216,8 +216,6 @@ def loadAirfoilData(filename: str,
         # store the data in the interpolator arrays
         cl_interpolator = cl_interpolator.at[r].set(cl_params)
         cd_interpolator = cd_interpolator.at[r].set(cd_params)
-
-        print("\tRadial position " + str(r+1) + " of " + str(nr) + " initialised")
     
     # Return the interpolator arrays
     return cl_interpolator, cd_interpolator
