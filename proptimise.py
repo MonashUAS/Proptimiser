@@ -44,7 +44,7 @@ def base_objective(c, beta, params_static):
     power  = jnp.squeeze(propmodel.mechanicalPower(V_ia, params))
     thrust = jnp.squeeze(propmodel.thrust(V_ia, params))
 
-    thrust_err = thrust - params.thrust_target
+    thrust_err = thrust - params. thrust_target
 
     rms_MIL_err = minimumInducedLossCost(V_ia_0)
 
@@ -65,7 +65,7 @@ def objective_fn(opt_vars_scaled,
                  scale_cruise_power=0.05,
                  scale_max_thrust=2.5,
                  scale_hover_power=0.05,
-                 scale_cruise_thrust = 15.0
+                 scale_cruise_thrust = 25.0
                  ):
     # Variable scaling to increase stability of optimiser
     c_scaled, beta_scaled = opt_vars_scaled
@@ -192,14 +192,15 @@ def run_optimization():
     # Generate the interpolators
     cl_interpolator, cd_interpolator = airfoil.loadAirfoilData(input_filename, Re_list, Ma_list, Inputs.n_r)
 
-    params_static = Params(  # hover — nothing else changes
+    # Treat as hover condition
+    params_static = Params(  
     N=2,
     R=jnp.max(r),
     c=init_c[:, None],
     beta=init_beta[:,None],
     r=r[:, None], dr=dr,
     psi=psi[None, :], dpsi=dpsi,
-    V_x=jnp.array([0.0]),                          # hover: no forward speed
+    V_x=jnp.array([0.0]),                          
     V_yz=jnp.array([0]),
     omega=jnp.array([Inputs.omega_hover*2*jnp.pi/60]),
     V_ia_0=jnp.full((Inputs.n_r,), jnp.array([4.0])),
@@ -208,6 +209,7 @@ def run_optimization():
     thrust_target=Inputs.thrust_hover,
     )   
 
+    # Set up cruise and max_thrust
     params_cruise = replace(params_static, V_x=jnp.array([Inputs.V_cruise]),omega=jnp.array([Inputs.omega_cruise*2*jnp.pi/60]),thrust_target=Inputs.thrust_cruise)
     params_max_thrust = replace(params_static, omega=jnp.array([Inputs.omega_max*2*jnp.pi/60]), thrust_target=Inputs.thrust_max)
     
@@ -285,17 +287,20 @@ def run_optimization():
         beta_smoothed = RationalFunction(r, list(beta_fit_params[0:P_beta]), list(beta_fit_params[P_beta:len(beta_fit_params)]))
 
         c = c_smoothed
-        
         beta = beta_smoothed
 
-        params_warm = replace(params_static, c=jnp.squeeze(c), beta=jnp.squeeze(beta))
-        V_ia_converged, V_ia_0_new = propmodel.induced_velocity(params_warm)
+        params_warm_hover = replace(params_static, c=jnp.squeeze(c), beta=jnp.squeeze(beta))
+        params_warm_cruise = replace(params_cruise, c=jnp.squeeze(c), beta=jnp.squeeze(beta))
+        params_warm_max = replace(params_max_thrust, c=jnp.squeeze(c), beta=jnp.squeeze(beta))
 
+        V_ia_hover, V_ia_0_hover = propmodel.induced_velocity(params_warm_hover)
+        _, V_ia_0_cruise = propmodel.induced_velocity(params_warm_cruise)
+        _, V_ia_0_max = propmodel.induced_velocity(params_warm_max)
 
         print("\n--> Regenerating interpolators")
 
-        # Generate the new reynolds and mach lists
-        V_R, _ = resultantVelocityComponents(V_ia_converged, params_warm)
+        # Generate the new reynolds and mach lists (these should probably be re-calculated for cruise and max conditions but don't want to nuke the time required)
+        V_R, _ = resultantVelocityComponents(V_ia_hover, params_warm_hover)
         V_R_aved = jnp.mean(V_R, axis=1)
         Re_list_new = params_static.rho * c * V_R_aved / params_static.mu
         Ma_list_new = V_R_aved / params_static.v_sound
@@ -325,16 +330,20 @@ def run_optimization():
         params_cruise = replace(params_cruise,
                                 c=jnp.squeeze(c), 
                                 beta=jnp.squeeze(beta),
+                                blendingParam=params_static.blendingParam,
+                                V_ia_0=V_ia_0_cruise,
                                 clInterpolator=cl_interpolator,
                                 cdInterpolator=cd_interpolator)
                                 
         params_max_thrust = replace(params_max_thrust, 
                                     c=jnp.squeeze(c), 
                                     beta=jnp.squeeze(beta),
+                                    blendingParam=params_static.blendingParam,
+                                    V_ia_0=V_ia_0_max,
                                     clInterpolator=cl_interpolator,
                                     cdInterpolator=cd_interpolator)
 
-        params_static = replace(params_static, V_ia_0=V_ia_0_new)
+        params_static = replace(params_static, V_ia_0=V_ia_0_hover)
         
         #power, thrust_err, thrust, rms_MIL_err = base_objective(c, beta, params_static)
 
@@ -354,7 +363,6 @@ def run_optimization():
             scale_THR_err=1.5
         )
         print("\n")
-        #print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Smoothed cost':<12} | {'Blending Parameter':<10}")
         print(f"{'Iter':<6} | {'Power (Hover)':<12} | {'Power (Cruise)':<12} |{'Hvr Thr':<10} {'Hvr Err':<10} | {'Crs Thr':<10} {'Crs Err':<10} | {'Max Thr':<10} {'Max Err':<10}| {'Cost':<12}")
         print("-" * 90)
         #print(f"{i:<6} | {float(power):<12.4f} | {float(thrust):<12.4f} | {float(thrust_err):<12.4f} | {rms_MIL_err:<10.1f} | {rms_MIL_err:<12.4f} | {params_static.blendingParam:<10.1f}")
@@ -388,17 +396,12 @@ def run_optimization():
             break
 
         if Inputs.interIterationDebug:
-            debugPlotting(V_ia_0_new, params_warm)
+            debugPlotting(V_ia_0_new, params_warm_hover)
         
     else:
         print(f"\nWarning: max iterations reached. Using solution from iteration {i}")
         print(f"\nBest solution at iteration {global_best_iter}: Power (cruise): {global_power_cruise:.2e}\nPower (hover) {global_power_hover:.2e}\nThrust error (cruise): {global_thrust_err_cruise:.2e}\nThrust error (hover): {global_thrust_err_hover:.2e}")
         
-
-    pd.DataFrame({'r': jnp.squeeze(params_static.r)}).to_csv('r.csv', index=False,header=False)
-    pd.DataFrame({'chord': jnp.squeeze(global_best_c)}).to_csv('chord.csv', index=False,header=False)
-    pd.DataFrame({'beta_rad': jnp.squeeze(global_best_beta), 'beta_deg': jnp.degrees(jnp.squeeze(global_best_beta))}).to_csv('beta.csv', index=False,header=False)
-
     return replace(params_static, c=global_best_c, beta=global_best_beta)
 
 #Run + plotting
