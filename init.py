@@ -12,16 +12,24 @@ class Inputs(eqx.Module):
     tip_diameter: float = 0.450 # DIAMETER in meters
 
     # max and min chords in meters
-    max_chord: float = 0.050
+    max_chord: float = 0.075
     min_chord: float = 0.005
     
     # max and min twists in degrees
     max_twist: float = 45
     min_twist: float = -15
 
+    # Hover and cruise motor speed (RPM)
+    omega_hover: float = 6000
+    omega_cruise: float = 7000
+    omega_max: float = 9000
     # ----- Solution parameters -----
     solvertype: str = "T" # Thrust constraint (T) or torque constraint (Q)
-    thrust: float = 100 # Newtons
+    thrust_hover: float = 32 # Newtons, maximum thrust target omega_max
+    thrust_cruise: float = 30 # Newtons, cruise thrust target at omega_hover
+
+    thrust_max: float = thrust_hover * 2 #Newtons, T/W of 2.
+    V_cruise = 15 #ms^-1
 
 
     # ----- Optimiser parameters -----
@@ -104,6 +112,8 @@ class Params(eqx.Module):
     #V_R: jnp.ndarray        # Net resultant velocity magnitude (ms^-1) at each radial and azimuthal station
 
     V_ia_0: float     # initial guess/storage for V_ia_0 (ms^{-1})
+
+    thrust_target: float 
 
     # Physical properties
     rho: float = 1.225      # air density (kgm^{-3})
