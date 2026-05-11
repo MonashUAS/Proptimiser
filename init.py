@@ -20,15 +20,14 @@ class Inputs(eqx.Module):
     min_twist: float = -15
 
     # Hover and cruise motor speed (RPM)
-    omega_hover: float = 6000
-    omega_cruise: float = 7000
-    omega_max: float = 9000
+    omega_hover: float = 4320
+    omega_cruise: float = 1.2*4320
+    omega_max: float = 8640
     # ----- Solution parameters -----
     solvertype: str = "T" # Thrust constraint (T) or torque constraint (Q)
     thrust_hover: float = 32 # Newtons, maximum thrust target omega_max
-    thrust_cruise: float = 30 # Newtons, cruise thrust target at omega_hover
-
-    thrust_max: float = thrust_hover * 2 #Newtons, T/W of 2.
+    thrust_cruise: float = 1.1*32 # Newtons, cruise thrust target at omega_hover
+    thrust_max: float = thrust_hover * 3.5 #Newtons, T/W of 3.5.
     V_cruise = 15 #ms^-1
 
 
@@ -45,7 +44,7 @@ class Inputs(eqx.Module):
 
     # ----- Discretisation parameters -----
     # Radial discretisation
-    n_r: int = 20
+    n_r: int = 28
     # Azimuthal discretisation (for skewed inflow)
     n_psi: int = 36
 

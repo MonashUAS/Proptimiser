@@ -67,6 +67,7 @@ def objective_fn(opt_vars_scaled,
                  scale_hover_power=0.05,
                  scale_cruise_thrust = 25.0
                  ):
+    
     # Variable scaling to increase stability of optimiser
     c_scaled, beta_scaled = opt_vars_scaled
     c = c_scaled*c_scale
@@ -81,7 +82,7 @@ def objective_fn(opt_vars_scaled,
     hover_cost  = (thrust_err_hover * scale_hover_thrust)**2 + (power_hover * scale_hover_power)**2 
     cruise_cost  = (thrust_err_cruise * scale_cruise_thrust)**2 + (scale_cruise_power * power_cruise)**2 
     max_thrust_cost = jnp.where(thrust_err_max_thrust >= 0, 0.0, (thrust_err_max_thrust * scale_max_thrust)**2)
-    MIL_cost = ((rms_MIL_hover + rms_MIL_cruise + rms_MIL_max) * scale_MIL_err) ** 2
+    MIL_cost = ((rms_MIL_hover + rms_MIL_cruise) * scale_MIL_err) ** 2
 
     return jnp.sqrt(hover_cost + cruise_cost + max_thrust_cost + MIL_cost)
 
@@ -184,13 +185,20 @@ def run_optimization():
     input_filename = "compiledData-ARAD10.txt"
 
     # Generate the reynolds and mach lists
-    Re_list = 150000 * jnp.ones(jnp.size(r))
-    Ma_list = 0.15 * jnp.ones(jnp.size(r))
-    Re_list_new = 150000 * jnp.ones(jnp.size(r))
-    Ma_list_new = 0.15 * jnp.ones(jnp.size(r))
+    #Re_list = 150000 * jnp.ones(jnp.size(r))
+    #Ma_list = 0.15 * jnp.ones(jnp.size(r))
+    #Re_list_new = 150000 * jnp.ones(jnp.size(r))
+    #Ma_list_new = 0.15 * jnp.ones(jnp.size(r))
+
+    Re_list_hover  = Re_list_cruise  = Re_list_max  = 150000 * jnp.ones(jnp.size(r))
+    Ma_list_hover  = Ma_list_cruise  = Ma_list_max  = 0.15   * jnp.ones(jnp.size(r))
 
     # Generate the interpolators
-    cl_interpolator, cd_interpolator = airfoil.loadAirfoilData(input_filename, Re_list, Ma_list, Inputs.n_r)
+    #cl_interpolator, cd_interpolator = airfoil.loadAirfoilData(input_filename, Re_list, Ma_list, Inputs.n_r)
+
+    cl_interp_hover, cd_interp_hover   = airfoil.loadAirfoilData(input_filename, Re_list_hover,  Ma_list_hover,  Inputs.n_r)
+    cl_interp_cruise, cd_interp_cruise = airfoil.loadAirfoilData(input_filename, Re_list_cruise, Ma_list_cruise, Inputs.n_r)
+    cl_interp_max, cd_interp_max       = airfoil.loadAirfoilData(input_filename, Re_list_max,    Ma_list_max,    Inputs.n_r)
 
     # Treat as hover condition
     params_static = Params(  
@@ -204,8 +212,8 @@ def run_optimization():
     V_yz=jnp.array([0]),
     omega=jnp.array([Inputs.omega_hover*2*jnp.pi/60]),
     V_ia_0=jnp.full((Inputs.n_r,), jnp.array([4.0])),
-    cdInterpolator=cd_interpolator,
-    clInterpolator=cl_interpolator,
+    cdInterpolator=cd_interp_hover,
+    clInterpolator=cl_interp_hover,
     thrust_target=Inputs.thrust_hover,
     )   
 
@@ -294,59 +302,70 @@ def run_optimization():
         params_warm_max = replace(params_max_thrust, c=jnp.squeeze(c), beta=jnp.squeeze(beta))
 
         V_ia_hover, V_ia_0_hover = propmodel.induced_velocity(params_warm_hover)
-        _, V_ia_0_cruise = propmodel.induced_velocity(params_warm_cruise)
-        _, V_ia_0_max = propmodel.induced_velocity(params_warm_max)
+        V_ia_cruise, V_ia_0_cruise = propmodel.induced_velocity(params_warm_cruise)
+        V_ia_max, V_ia_0_max = propmodel.induced_velocity(params_warm_max)
+
+        ## New stuff
+        #Generate resultant velocity components for each of the conditions
+        V_R_hover,  _ = resultantVelocityComponents(V_ia_hover, params_warm_hover)
+        V_R_cruise, _ = resultantVelocityComponents(V_ia_cruise, params_warm_cruise)
+        V_R_max,    _ = resultantVelocityComponents(V_ia_max, params_warm_max)
+
+        #New Re and Mach lists
+        Re_list_new_hover  = params_static.rho * c * jnp.mean(V_R_hover,  axis=1) / params_static.mu
+        Re_list_new_cruise = params_static.rho * c * jnp.mean(V_R_cruise, axis=1) / params_static.mu
+        Re_list_new_max    = params_static.rho * c * jnp.mean(V_R_max,    axis=1) / params_static.mu
+
+        Ma_list_new_hover  = jnp.mean(V_R_hover,  axis=1) / params_static.v_sound
+        Ma_list_new_cruise = jnp.mean(V_R_cruise, axis=1) / params_static.v_sound
+        Ma_list_new_max    = jnp.mean(V_R_max,    axis=1) / params_static.v_sound
 
         print("\n--> Regenerating interpolators")
 
-        # Generate the new reynolds and mach lists (these should probably be re-calculated for cruise and max conditions but don't want to nuke the time required)
-        V_R, _ = resultantVelocityComponents(V_ia_hover, params_warm_hover)
-        V_R_aved = jnp.mean(V_R, axis=1)
-        Re_list_new = params_static.rho * c * V_R_aved / params_static.mu
-        Ma_list_new = V_R_aved / params_static.v_sound
+        interp_conditions = [
+        ("Hover",      Re_list_new_hover,  Ma_list_new_hover,  Re_list_hover,  Ma_list_hover,  cl_interp_hover,  cd_interp_hover),
+        ("Cruise",     Re_list_new_cruise, Ma_list_new_cruise, Re_list_cruise, Ma_list_cruise, cl_interp_cruise, cd_interp_cruise),
+        ("Max Thrust", Re_list_new_max,    Ma_list_new_max,    Re_list_max,    Ma_list_max,    cl_interp_max,    cd_interp_max),
+    ]
 
-        if (i >= Inputs.Iterations_initialising) and (i <= Inputs.Iterations_initialising + Inputs.Iterations_blending):
-            params_static = replace(params_static, blendingParam = (i - Inputs.Iterations_initialising)/Inputs.Iterations_blending)
+        updated = {}
+        for name, Re_new, Ma_new, Re_curr, Ma_curr, cl_interp, cd_interp in interp_conditions:
+            for rr in range(Inputs.n_r):
+                if (jnp.abs((Re_new[rr]-Re_curr[rr])/Re_curr[rr]) > 0.1) or (jnp.abs(Ma_new[rr]-Ma_curr[rr]) > 0.05):
+                    print(f"  [{name}] Regenerating interpolator at radial position {rr+1} of {Inputs.n_r}")
+                    Re_curr = Re_curr.at[rr].set(Re_new[rr])
+                    Ma_curr = Ma_curr.at[rr].set(Ma_new[rr])
+                    cl_params, cd_params = airfoil.loadAirfoilDataSingle(input_filename, Re_curr[rr], Ma_curr[rr])
+                    cl_interp = cl_interp.at[rr].set(cl_params)
+                    cd_interp = cd_interp.at[rr].set(cd_params)
+            updated[name] = (Re_curr, Ma_curr, cl_interp, cd_interp)
 
-        # Generate the interpolators
-        for rr in range(Inputs.n_r):
-            if (jnp.abs((Re_list_new[rr]-Re_list[rr])/Re_list[rr])>0.1) or (jnp.abs(Ma_list_new[rr]-Ma_list[rr])>0.05):
-                print("Regenerating interpolator at radial position " + str(rr+1) + " of " + str(Inputs.n_r))
-
-                Re_list = Re_list.at[rr].set(Re_list_new[rr])
-                Ma_list = Ma_list.at[rr].set(Ma_list_new[rr])
-
-                # check if the mach or reynolds has changed more than 10%
-                cl_params, cd_params = airfoil.loadAirfoilDataSingle(input_filename, Re_list[rr], Ma_list[rr])
-                
-                # store the data in the interpolator arrays
-                cl_interpolator = cl_interpolator.at[rr].set(cl_params)
-                cd_interpolator = cd_interpolator.at[rr].set(cd_params)
-
-        params_static = replace(params_static, clInterpolator=cl_interpolator, cdInterpolator=cd_interpolator)
+        Re_list_hover,  Ma_list_hover,  cl_interp_hover,  cd_interp_hover  = updated["Hover"]
+        Re_list_cruise, Ma_list_cruise, cl_interp_cruise, cd_interp_cruise = updated["Cruise"]
+        Re_list_max,    Ma_list_max,    cl_interp_max,    cd_interp_max    = updated["Max Thrust"]
 
         print("\t--> Interpolators complete!")
+
+        params_static = replace(params_static, clInterpolator=cl_interp_hover, cdInterpolator=cd_interp_hover)
 
         params_cruise = replace(params_cruise,
                                 c=jnp.squeeze(c), 
                                 beta=jnp.squeeze(beta),
                                 blendingParam=params_static.blendingParam,
                                 V_ia_0=V_ia_0_cruise,
-                                clInterpolator=cl_interpolator,
-                                cdInterpolator=cd_interpolator)
+                                clInterpolator=cl_interp_cruise,
+                                cdInterpolator=cd_interp_cruise)
                                 
         params_max_thrust = replace(params_max_thrust, 
                                     c=jnp.squeeze(c), 
                                     beta=jnp.squeeze(beta),
                                     blendingParam=params_static.blendingParam,
                                     V_ia_0=V_ia_0_max,
-                                    clInterpolator=cl_interpolator,
-                                    cdInterpolator=cd_interpolator)
+                                    clInterpolator=cl_interp_max,
+                                    cdInterpolator=cd_interp_max)
 
         params_static = replace(params_static, V_ia_0=V_ia_0_hover)
         
-        #power, thrust_err, thrust, rms_MIL_err = base_objective(c, beta, params_static)
-
         power_hover, thrust_err_hover, thrust_hover, rms_MIL_err = base_objective(c, beta, params_static)
         power_cruise, thrust_err_cruise, thrust_cruise, _ = base_objective(c, beta, params_cruise)
         _, thrust_err_max, thrust_max, _       = base_objective(c, beta, params_max_thrust)
@@ -363,11 +382,11 @@ def run_optimization():
             scale_THR_err=1.5
         )
         print("\n")
-        print(f"{'Iter':<6} | {'Power (Hover)':<12} | {'Power (Cruise)':<12} |{'Hvr Thr':<10} {'Hvr Err':<10} | {'Crs Thr':<10} {'Crs Err':<10} | {'Max Thr':<10} {'Max Err':<10}| {'Cost':<12}")
-        print("-" * 90)
-        #print(f"{i:<6} | {float(power):<12.4f} | {float(thrust):<12.4f} | {float(thrust_err):<12.4f} | {rms_MIL_err:<10.1f} | {rms_MIL_err:<12.4f} | {params_static.blendingParam:<10.1f}")
-        print(f"{i:<6} | {float(power_hover):<12.4f} | {float(power_cruise):<12.4f} | {float(thrust_hover):<10.4f} {float(thrust_err_hover):<+10.4f} | {float(thrust_cruise):<10.4f} {float(thrust_err_cruise):<+10.4f} | {float(thrust_max):<10.4f} {float(thrust_err_max):<+10.4f}| {float(sol.state.fun_val):<12.6f}")
-        
+    
+        print(f"{'Iter':<6} | {'Power (Hover)':<13} | {'Power (Cruise)':<13} | {'Hvr Thr':<10} {'Hvr Err':<11} | {'Crs Thr':<10} {'Crs Err':<11} | {'Max Thr':<10} {'Max Err':<11} | {'Cost':<12}")
+        print("-" * 110)
+        print(f"{i:<6} | {float(power_hover):<13.4f} | {float(power_cruise):<13.4f} | {float(thrust_hover):<10.4f} {float(thrust_err_hover):<+11.4f} | {float(thrust_cruise):<10.4f} {float(thrust_err_cruise):<+11.4f} | {float(thrust_max):<10.4f} {float(thrust_err_max):<+11.4f} | {float(sol.state.fun_val):<12.6f}")
+
         print("\n")
 
         vars_scaled = (c/c_scale,beta_smoothed/beta_scale)
