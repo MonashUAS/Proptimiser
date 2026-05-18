@@ -9,13 +9,13 @@ class Inputs(eqx.Module):
 
     # Hover condition 
     thrust_hover   = 21 # N
-    omega_hover    = 4300/60*2*jnp.pi  # rad/s
+    #omega_hover    = 4300/60*2*jnp.pi  # rad/s
     V_x_hover      = 0.0 # m/s
     V_yz_hover     = 0.0 # m/s 
 
     # Cruise condition
     thrust_cruise  = 23.5 # N 
-    omega_cruise   = 5000/60*2*jnp.pi
+    #omega_cruise   = 5000/60*2*jnp.pi
     V_x_cruise     = 10.0 # m/s
     V_yz_cruise    = 0.0 # m/s
 
@@ -83,7 +83,7 @@ class Inputs(eqx.Module):
     # Lookup blending steps
     Iterations_initialising: int = 2
     Iterations_blending: int = 6
-    Iterations_solving: int = 6
+    Iterations_solving: int = 12
     
 
     # ----- Siagnostic and debugging flags -----
@@ -158,7 +158,7 @@ def blade_design_mask(params: Params):
         # Inflow / rotor state
         V_x=False,
         V_yz=False,
-        omega=False,
+        omega=True,
         V_ia_0=False,
 
         # Physical properties
