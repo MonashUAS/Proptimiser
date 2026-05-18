@@ -396,7 +396,7 @@ def power(V_ia, params):
 def mechanicalPower(V_ia, params):
     '''
     Calculates and returns the shaft power (W) applied to the propeller 
-    '''    
+    '''
 
     # Unpack Params
     omega = params.omega
@@ -410,26 +410,20 @@ def mechanicalPower(V_ia, params):
 
     return jnp.squeeze(P)
 
-
-
-def actuator_disk_power(V_ia, power):
+def actuator_disk_power(T, params):
     '''
     Calculate Ideal Actuator Disk Power for same thrust
-
-    UNFINISHED CODE
-
-    TODO Implement actuator thrust
-    TODO FInish this code
+    Provides theoretical local minimum power using actuator disc model
+    T is from momentum theory, 
     '''
+    rho = params.rho
+    R   = params.R
+    V_x = params.V_x # freestream velocity
 
-    raise(NotImplementedError("This function is yet to be implemented"))
-
-    T = actuator_thrust(V_ia,params)
-    V_x = params.V_x
-
-    V_ind_mean = jnp.mean(V_ia)
-
-    return P_actuator
+    A = jnp.pi*R**2 # disc area
+    v_induced = jnp.sqrt(T/(2*rho*A) + V_x**2/4) - V_x/2  #  induced velocity through actuator disc
+    P_act = T*(V_x+v_induced) # Ideal actuator disk power
+    return jnp.squeeze(P_act)
 
 def single(R, c, beta, N, plot=False):
         '''

@@ -40,8 +40,8 @@ class Inputs(eqx.Module):
     ## Solver Model Selection
 
     # Aerodynamic Models Selection
-    inflow_model: int = 1 # 0 = basic, 1 = Pitt & Peters, 2 = DTU
-    coeff_method: int = 1 # 0 = parametric, 1 = lookup table
+    inflow_model: int = 1 # 0 = basic, 1 = Pitt & Peters, 2 = DTU (WIP)
+    coeff_method: int = 2 # 0 = parametric, 1 = alpha/reynolds, 2 = alpha/mach/reynolds
     tip_loss_model: int = 1 # 0 = none, 1 = Prandtl
     root_loss_model: int = 1 # 0 = none, 1 = Prandtl
 
@@ -143,7 +143,7 @@ if __name__ == "__main__":
     from datetime import datetime
     # Internal Imports
     import propmodel
-    import optimiser
+    import proptimiser
     import results
     import geometry
     from airfoil import load_airfoil_data
@@ -192,28 +192,64 @@ if __name__ == "__main__":
     print(f"Initialised Airfoil Fit with airfoil {params_init.airfoil}")
 
     # Run Optimiser
-    params_opt = optimiser.run_optimization(params_init)
+    params_opt = proptimiser.run_optimization(params_init)
 
     # Plot Info
     results.propinfoplot(params_opt)
+
+    # check interpolated plot
+    import numpy as np
+    import matplotlib.pyplot as plt
+    # Fit high order polynomial to data, then establish leading and trailing edge using fit.
+    polyorder = 5
+    c_coeffs = np.polyfit(params_opt.r, params_opt.c, polyorder)
+    c_p = np.poly1d(c_coeffs)
+    c_poly = c_p(r)
+
+    beta_coeffs = np.polyfit(params_opt.r, params_opt.beta, polyorder)
+    beta_p = np.poly1d(beta_coeffs)
+    beta_poly = beta_p(r)
+
+    # Let the plotting begin
+    fig = plt.figure(figsize=(14, 10))
+
+    # Optimum Chord & Twist Distribution (Combined)
+    # Chord Distribution
+    ax1 = fig.add_subplot(1, 2, 1)
+    line1 = ax1.plot(r, c_poly, "o-", markersize=4, color="tab:blue", label=r"Chord ($c$)")
+    ax1.set_title(r"\textbf{Optimum Chord \& Twist Distribution}")
+    ax1.set_ylabel(r"Chord (mm)", color="tab:blue")
+    ax1.set_xlabel(r"Radius ($r$) [mm]")
+    ax1.set_xlim(left=0)
+    ax1.tick_params(axis='y', labelcolor="tab:blue")
+    ax1.grid(True, linestyle='--', alpha=0.6)
+
+    # Beta Distribution
+    ax2 = fig.add_subplot(1, 2, 2)
+    line2 = ax2.plot(r, beta_poly, 'o-', color="tab:red", markersize=4, label=r"Twist ($\beta$)")
+    ax2.set_xlim(left=0)
+    ax2.set_ylabel(r"Twist ($^\circ$)", color="tab:red")
+    ax2.tick_params(axis='y', labelcolor="tab:red")
+    plt.show()
 
     # Save Results/Export Geometry if Required
     user_input = input('Save Propeller? (y/n): ')
     timestamp = datetime.now().strftime("%Y%m%d-%H%M")
     if user_input.lower() == 'y':
-        paramsfile = "prop_params"+timestamp
-        inputsfile = "prop_inputs"+timestamp
-        print('Solving Propeller Inputs/Parameters to {paramsfile} and {inputsfile}')
+        paramsfile = "prop_params_" + timestamp
+        inputsfile = "prop_inputs_" + timestamp
+        print(f'Saving Propeller Inputs/Parameters to {paramsfile} and {inputsfile}')
 
-        Params.save_state(paramsfile)
-        Inputs.save_state(inputsfile)
+        # Use the instantiated object references (params_opt and an Inputs instance)
+        params_opt.save_state(paramsfile)
+        Inputs().save_state(inputsfile)
     
     user_input = input('Export Propeller Geometry to .pts files? (y/n): ')
 
     if user_input.lower() == 'y':
-        exportname = "prop_pts"
+        exportname = f"prop_pts_{timestamp}"
         foilpoints = geometry.upperlowerairfoil(params_opt.airfoil)
         geometry.ptsfilegenerator(params_opt.r, params_opt.c, params_opt.beta, foilpoints, exportname)
-        print('Solving Propeller Inputs/Parameters to {paramsfile} and {inputsfile}')
+        print(f'Saving Propeller Geometry to {exportname}.pts')
 
     print('Proptimisation Complete')

@@ -2,21 +2,25 @@
 
 import numpy as np
 from datetime import datetime
+import scipy.optimize as opt
 
-def params_to_le_te(r, beta, c):
-    # Calculate Chord Offset
-    chord_offset = 0.3 * np.max(c)
-
-    # Calculate the components
+def params_to_le_te(r, c, beta):
+    """
+    Calculates 3D coordinates for LE and TE lines.
+    Aligns the 1/4 chord line precisely along the radial X-axis (pitch axis).
+    """
     x = r.ravel()
+    c = c.ravel()
+    beta = beta.ravel()
     
-    y_le = ((chord_offset + c) * np.sin(beta)).ravel()
-    z_le = ((chord_offset + c) * np.cos(beta)).ravel()
+    # LE is at -25% chord from the pitch axis; TE is at +75% chord from the pitch axis
+    y_le = -0.25 * c * np.sin(beta)
+    z_le = -0.25 * c * np.cos(beta)
     
-    y_te = ((-chord_offset + c) * np.sin(beta)).ravel()
-    z_te = ((-chord_offset + c) * np.cos(beta)).ravel()
+    y_te = 0.75 * c * np.sin(beta)
+    z_te = 0.75 * c * np.cos(beta)
 
-    # Stack them into (N, 3) arrays
+    # Stack into clean (N, 3) positional arrays
     le_points = np.column_stack([x, y_le, z_le])
     te_points = np.column_stack([x, y_te, z_te])
 
@@ -26,34 +30,50 @@ def upperlowerairfoil(airfoil):
     '''
     Takes airfoil geometry .dat file (contained in airfoils) and returns arrays of the upper 
     and lower points.
-
-    Importantly, the code assumes that the first row is information like 'ARA-D 10% AIRFOIL half camber'. If this
-    line is not present, the skiprows flag will need to be modified.
     '''
-
-    arifoil_path = "airfoils/"+airfoil
-    # Load data using numpy, skipping the header row
-    foil_data = np.loadtxt(airfoil, skiprows=1)
+    airfoil_path = "airfoils/"+airfoil+"/"+airfoil+".dat"
+    # Load data using numpy, skipping the header rows
+    foil_data = np.loadtxt(airfoil_path, skiprows=1)
     
-    # Filter rows based on the y-coordinate (column index 1)
-    upper_points = foil_data[foil_data[:, 1] >= 0]
-    lower_points = foil_data[foil_data[:, 1] <= 0]
+    # Find index where x-coordinates drop back to 0.0 
+    # (indicating the transition from upper surface TE to lower surface LE)
+    split_idx = np.where(np.diff(foil_data[:, 0]) < 0)[0]
+    
+    if len(split_idx) > 0:
+        split_point = split_idx[0] + 1
+        upper_points = foil_data[:split_point]
+        lower_points = foil_data[split_point:]
+    else:
+        # Fallback to value-filtering only if index split fails
+        upper_points = foil_data[foil_data[:, 1] >= 0]
+        lower_points = foil_data[foil_data[:, 1] <= 0]
 
     return upper_points, lower_points
 
-from datetime import datetime
-import numpy as np
 
-def ptsfilegenerator(r, c, beta, foilpoints, exportname):
+def ptsfilegenerator(r, c, beta, foilpoints, exportname, polyorder=6):
     '''
     Creates geometry files which defines the propellers shape
     '''
     # Unpack the tuple of upper and lower points
     upper_points, lower_points = foilpoints
-    foil_data = np.vstack([upper_points, lower_points])
+    
+    # Reverse upper points (Trailing Edge -> Leading Edge) before stacking 
+    # with lower points (Leading Edge -> Trailing Edge) for a continuous perimeter loop
+    foil_data = np.vstack([upper_points[::-1], lower_points])
+    if polyorder>0:
+        # Fit high order polynomial to data, then establish leading and trailing edge using fit.
+        c_coeffs = np.polyfit(r, c, polyorder)
+        c_p = np.poly1d(c_coeffs)
+        c_poly = c_p(r)
 
-    # Convert parameters to xyz coordinates
-    le_points, te_points = params_to_le_te(r,c,beta)
+        beta_coeffs = np.polyfit(r, beta, polyorder)
+        beta_p = np.poly1d(beta_coeffs)
+        beta_poly = beta_p(r)
+
+        le_points, te_points = params_to_le_te(r, c_poly, beta_poly)
+    else:
+        le_points, te_points = params_to_le_te(r, c, beta)
 
     # Extract x and y coordinates from the unpacked NumPy arrays (Column 0 and 1)
     foil_x = foil_data[:, 0]
@@ -66,13 +86,127 @@ def ptsfilegenerator(r, c, beta, foilpoints, exportname):
         np.zeros(m)
     ])
 
-    # Convert from m to mm for LE and TE points, and transpose arrays
-    propgeom_LE_coords      = le_points.T      * 1000
-    propgeom_TE_coords      = te_points.T      * 1000
+    # Convert from m to mm for LE and TE points
+    propgeom_LE_coords      = le_points * 1000
+    propgeom_TE_coords      = te_points * 1000
     propgeom_airfoil_coords = propgeom_airfoil_coords.T
-
 
     # Write files with the timestamp appended
     np.savetxt(f"{exportname}_LE.pts",  propgeom_LE_coords,      delimiter=" ", fmt="%.7f")
     np.savetxt(f"{exportname}_TE.pts",  propgeom_TE_coords,      delimiter=" ", fmt="%.7f")
     np.savetxt(f"{exportname}_airfoil.pts",   propgeom_airfoil_coords, delimiter=" ", fmt="%.7f")
+
+def build_propeller_mesh(geompoints, foilpoints, num_blades=2):
+    """
+    Lofts a 3D propeller blade by interpolating between the Leading Edge (LE) 
+    and Trailing Edge (TE) lines, scaling the thickness profile dynamically.
+    """
+    import pyvista as pv
+    # Unpack clean tuple signatures
+    le_points, te_points = geompoints
+    upper_points, lower_points = foilpoints
+    
+    # Create continuous loop coordinates around the profile perimeter
+    foil_data = np.vstack([upper_points[::-1], lower_points])
+    foil_x = foil_data[:, 0]  # Normalized chord station [0 to 1]
+    foil_y = foil_data[:, 1]  # Normalized thickness station
+    
+    # Calculate the raw structural chord vectors and absolute lengths
+    chord_vectors = te_points - le_points  # Shape: (n_r, 3)
+    chords = np.linalg.norm(chord_vectors, axis=1, keepdims=True)  # Shape: (n_r, 1)
+    
+    # Derive the local thickness orientation vector
+    # By taking the cross product of the span axis (X) and chord direction, 
+    # we dynamically capture the true normal vector for thickness
+    u_span = np.array([1.0, 0.0, 0.0])
+    u_chord = chord_vectors / chords
+    u_thick = np.cross(u_span, u_chord)  # Shape: (n_r, 3)
+    
+    # Transform arrays to (n_r, 1, 3) to broadcast against the profile points (1, n_foil, 1)
+    LE = le_points[:, None, :]
+    CHORD_VEC = chord_vectors[:, None, :]
+    UTHICK = u_thick[:, None, :]
+    CHORDS = chords[:, None, :]
+    
+    FX = foil_x[None, :, None]
+    FY = foil_y[None, :, None]
+    
+    # Position = Start at LE + move down the chord line + project out normal thickness
+    mesh_points = LE + (FX * CHORD_VEC) + (FY * CHORDS * UTHICK)
+    
+    # Extract structural coordinate grids for PyVista
+    X_3d = mesh_points[:, :, 0]
+    Y_3d = mesh_points[:, :, 1]
+    Z_3d = mesh_points[:, :, 2]
+    
+    base_blade = pv.StructuredGrid(X_3d, Y_3d, Z_3d)
+    
+    # Duplicate and rotate across the assembly hub
+    meshes = [base_blade]
+    for i in range(1, int(num_blades)):
+        angle = i * (360.0 / num_blades)
+        rotated_blade = base_blade.copy()
+        rotated_blade.rotate_z(angle, inplace=True)
+        meshes.append(rotated_blade)
+        
+    return pv.MultiBlock(meshes).combine()
+
+if __name__ == "__main__":
+    '''
+    Create and Plot Demo Flatblade Propeller Blade Geometry
+    '''
+    import matplotlib.pyplot as plt
+    import propmodel
+    from init import Inputs, Params
+    import pyvista as pv
+    
+    # Generate Flat Blade Parameters
+    c_val = 0.1
+    beta_val = np.radians(15)
+
+    # Populate radial/azimuthal stops and initial guess
+    psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
+    r, dr = propmodel.radial_stops(0.25, 0.05, Inputs.n_r)
+    V_ia_0 = np.full_like(r, np.array([10.0]))
+
+    c = np.full((Inputs.n_r,), c_val)
+    beta = np.full((Inputs.n_r,), beta_val)
+
+    airfoil = "ARAD10"
+
+    upper_points, lower_points = upperlowerairfoil(airfoil)
+
+    # FIX: Reverse upper points (using [[::-1]) so coordinates sequence seamlessly 
+    # around the perimeter: Trailing Edge -> Leading Edge -> Trailing Edge
+    foil_data = np.vstack([upper_points[::-1], lower_points])
+
+    # FIX: Corrected argument order (r, beta, c) to match function definition
+    le_points, te_points = params_to_le_te(r, beta, c)
+
+    # Extract x and y coordinates
+    foil_x = foil_data[:, 0]
+    foil_y = foil_data[:, 1]
+
+    # Plot Airfoil
+    plt.figure(figsize=(8, 4))
+    plt.plot(foil_x, foil_y, 'b-', label=f"{airfoil} Profile")
+    plt.grid(True)
+    plt.axis("equal")
+    plt.xlabel("Chord Station (x/c)")
+    plt.ylabel("Thickness Station (y/c)")
+    plt.title(f"Airfoil Geometry Loop Check: {airfoil}")
+    plt.legend()
+    plt.show()
+
+    ## 3D Render of Propeller
+    geompoints = (le_points, te_points)
+    foilpoints = (upper_points, lower_points)
+
+    prop_mesh = build_propeller_mesh(geompoints, foilpoints, num_blades=2)
+
+    # Fire up the local PyVista testing window
+    plotter = pv.Plotter()
+    plotter.set_background("#1e1e2f") #dark mode for vibes
+    plotter.add_mesh(prop_mesh, color="silver", show_edges=True, edge_color="#444444", smooth_shading=True)
+    plotter.add_axes()
+    plotter.show()

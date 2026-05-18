@@ -1,16 +1,12 @@
 ## Results and Data Visualisation Functions
 
-
 # External Imports
 import numpy as np
 import matplotlib.pyplot as plt
 
-
 # Internal Imports
 import propmodel
 import init
-
-
 def propinfoplot(params, show=True):
     '''
     Plot Propeller Solve Info, Including Geometry, Solver Info,
