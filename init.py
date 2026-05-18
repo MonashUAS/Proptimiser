@@ -5,32 +5,41 @@ import jax.scipy as jsp
 
 # Freeze configuration parameters at runtime
 class Inputs(eqx.Module):
-    # Optimisation / design settings which remain constant during execution
+    # Optimisation / desig  n settings which remain constant during execution
 
+    # Hover condition 
+    thrust_hover   = 21 # N
+    omega_hover    = 4300/60*2*jnp.pi  # rad/s
+    V_x_hover      = 0.0 # m/s
+    V_yz_hover     = 0.0 # m/s 
+
+    # Cruise condition
+    thrust_cruise  = 23.5 # N 
+    omega_cruise   = 5000/60*2*jnp.pi
+    V_x_cruise     = 10.0 # m/s
+    V_yz_cruise    = 0.0 # m/s
+
+    # Multi-objective weighting, balance between achieving hover/cruise optimality 
+    w_hover  = 0.3
+    w_cruise = 0.7
+    
     # ----- Geometric parameters -----
     hub_diameter: float = 0.050 # DIAMETER in meters
-    tip_diameter: float = 0.450 # DIAMETER in meters
+    tip_diameter: float = 0.50 # DIAMETER in meters
 
     # max and min chords in meters
-    max_chord: float = 0.075
+    max_chord: float = 0.050
     min_chord: float = 0.005
     
     # max and min twists in degrees
     max_twist: float = 45
     min_twist: float = -15
 
-    # Hover and cruise motor speed (RPM)
-    omega_hover: float = 4320
-    omega_cruise: float = 1.2*4320
-    omega_max: float = 8640
     # ----- Solution parameters -----
     solvertype: str = "T" # Thrust constraint (T) or torque constraint (Q)
-    thrust_hover: float = 32 # Newtons, maximum thrust target omega_max
-    thrust_cruise: float = 1.1*32 # Newtons, cruise thrust target at omega_hover
-    thrust_max: float = thrust_hover * 3.5 #Newtons, T/W of 3.5.
-    V_cruise = 15 #ms^-1
+    #Thrust targets defined above, under each condition. 
 
-
+    
     # ----- Optimiser parameters -----
     # Newton solver settings
     opt_max_iter: int = 1000
@@ -44,7 +53,7 @@ class Inputs(eqx.Module):
 
     # ----- Discretisation parameters -----
     # Radial discretisation
-    n_r: int = 28
+    n_r: int = 15
     # Azimuthal discretisation (for skewed inflow)
     n_psi: int = 36
 
@@ -57,8 +66,8 @@ class Inputs(eqx.Module):
 
     # ----- Chord and twist smoothing parameters -----
     # Set the highest power in the numerator and denominator of the chord smoothing function
-    Ord_Denominator_c = 4
-    Ord_Numerator_c = 2
+    Ord_Denominator_c = 2
+    Ord_Numerator_c = 4
 
     # Set the highest power in the numerator and denominator of the beta smoothing function
     Ord_Denominator_beta = 2
@@ -73,8 +82,8 @@ class Inputs(eqx.Module):
     
     # Lookup blending steps
     Iterations_initialising: int = 2
-    Iterations_blending: int = 13
-    Iterations_solving: int = 10
+    Iterations_blending: int = 6
+    Iterations_solving: int = 6
     
 
     # ----- Siagnostic and debugging flags -----
@@ -111,8 +120,6 @@ class Params(eqx.Module):
     #V_R: jnp.ndarray        # Net resultant velocity magnitude (ms^-1) at each radial and azimuthal station
 
     V_ia_0: float     # initial guess/storage for V_ia_0 (ms^{-1})
-
-    thrust_target: float 
 
     # Physical properties
     rho: float = 1.225      # air density (kgm^{-3})
