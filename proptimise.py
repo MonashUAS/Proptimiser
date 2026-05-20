@@ -8,6 +8,7 @@ from init import Params, Inputs
 import propmodel
 import airfoil
 import pandas as pd
+from jax import numpy as jnp
 
 from Foil_Interpolators import RationalFunctionInterp, RationalFunction
 from airflow import resultantVelocityComponents, tip_root_loss_factors
@@ -79,36 +80,38 @@ def motorPower(torque: float, speed: float, I_0: float = 0.7, R_m: float = 0.120
 
 
 #Scaled Aug. lagrangian, returns the actual Lagrangian 
-def objective_fn(
-    opt_vars_scaled,
-    params_hover, params_cruise,
-    c_scale, beta_scale, omega_scale,
-    scale_MIL_err=0.3,
-    scale_THR_err=15.0,
-    scale_POW_cost=0.065,
-    w_hover=0.5,
-    w_cruise=0.5,
-):
-    c_scaled, beta_scaled, omegas_scaled = opt_vars_scaled
+def objective_fn(opt_vars_scaled,
+                params_hover, params_cruise,
+                c_scale, beta_scale,
+                omegas,
+                scale_MIL_err=0.3,
+                scale_THR_err=15.0,
+                scale_POW_cost=0.065,
+                w_hover=0.5,
+                w_cruise=0.5
+                ):
+
+    c_scaled, beta_scaled = opt_vars_scaled
     c = c_scaled * c_scale
     beta = beta_scaled * beta_scale
-    omegas = omegas_scaled * omega_scale
 
+    #print("Hover case")
     #Calculate the cost for both hover and cruise conditions. 
     # Hover cost
-    _, pow_h, thr_err_h, _, mil_h, _ = base_objective_single(
-        c, beta, omegas[0], params_hover, Inputs.thrust_hover
-    )
+    #omega_hover = determine_speed(opt_vars_scaled, params_hover, c_scale, beta_scale, Inputs.thrust_hover)
+    omega_hover = determine_speed(opt_vars_scaled, params_hover, c_scale, beta_scale, Inputs.thrust_hover, omegas[0])
+    _, pow_h, thr_err_h, _, mil_h, _ = base_objective_single(c, beta, omega_hover, params_hover, Inputs.thrust_hover)
+
+    #print("Cruise case")
+    # Cruise cost
+    #omega_cruise = determine_speed(opt_vars_scaled, params_cruise, c_scale, beta_scale, Inputs.thrust_cruise)
+    omega_cruise = determine_speed(opt_vars_scaled, params_hover, c_scale, beta_scale, Inputs.thrust_hover, omegas[1])
+    _, pow_c, thr_err_c, _, mil_c, _ = base_objective_single(c, beta, omega_cruise, params_cruise, Inputs.thrust_cruise)
 
     cost_h = jnp.sqrt(
         (thr_err_h*scale_THR_err) ** 2
         + (mil_h*scale_MIL_err) ** 2
         + (pow_h*scale_POW_cost) ** 2
-    )
-
-    # Cruise cost
-    _, pow_c, thr_err_c, _, mil_c, _ = base_objective_single(
-        c, beta, omegas[1], params_cruise, Inputs.thrust_cruise
     )
 
     cost_c = jnp.sqrt(
@@ -117,8 +120,62 @@ def objective_fn(
         + (pow_c*scale_POW_cost) ** 2
     )
 
+    net_cost = w_hover * cost_h + w_cruise * cost_c
+
     # Weighted combination of cruise/hover
-    return w_hover * cost_h + w_cruise * cost_c
+    return net_cost
+
+
+#Scaled Aug. lagrangian, returns the actual Lagrangian 
+def determine_speed(opt_vars_scaled,
+                    params,
+                    c_scale, beta_scale,
+                    thrust_target,
+                    omega_guess):
+
+    c_scaled, beta_scaled = opt_vars_scaled
+    c = c_scaled * c_scale
+    beta = beta_scaled * beta_scale
+
+    def wrapped_base_objective_function(x):
+        """
+            A wrapper necessary for RPM optimisation, shuffles inputs for base objective function
+        """
+        _, _, thr_err, _, _, _ = base_objective_single(c, beta, x, params, thrust_target)
+
+        return thr_err
+
+    # Newton Solver for Induced Velocity
+    omega = homeRolledRootSolver(wrapped_base_objective_function, lower=omega_guess*0.8, upper=omega_guess*1.2, iters=8)
+
+    # Weighted combination of cruise/hover
+    return omega
+
+
+def homeRolledRootSolver(fun, lower, upper, iters=20):
+        """
+        Home rolled implementation of fixed iteration number bisection method, janky way to implement nested loops without jax crashing out
+        """
+
+        w = 0.33 # Weighting parameter for finding the new A and B, between 0 and 1 inclusive
+
+        A = lower # lower bound
+        B = upper # Upper bound
+        C = (A + B)/2
+        
+        for iteration in range(iters):
+            # Get the residual at A
+            r_A =  fun(A)
+
+            # Get the residual at B
+            r_B = fun(B)
+
+            C = A - r_A*(B - A)/(r_B - r_A)
+
+            A = (A*(1-w) + C*(1+w))/2
+            B = (B*(1-w) + C*(1+w))/2
+
+        return C
 
 
 #Gradient scaling (compute c and beta scales)
@@ -269,6 +326,8 @@ def run_optimization():
     beta = init_beta
     #omegas is unchanged
 
+    vars_scaled = (c / c_scale, beta / beta_scale)
+
     solver = jaxopt.ScipyBoundedMinimize(
         fun=objective_fn, method="L-BFGS-B",
         tol=Inputs.opt_tol, maxiter=Inputs.opt_max_iter
@@ -277,7 +336,6 @@ def run_optimization():
     global_best_cost = jnp.inf
     global_best_c = c
     global_best_beta = beta
-    global_best_omegas = omegas
 
     total_iter = (
         Inputs.Iterations_initialising
@@ -288,19 +346,15 @@ def run_optimization():
     for i in range(total_iter):
         print(f"\n--> Running solver (iter {i})")
 
-        vars_scaled = (c / c_scale, beta / beta_scale, omegas / omega_scale)
-
         # Re-establish bounds
         bounds = (
             (
                 jnp.full_like(params_hover.c, Inputs.min_chord / c_scale),
-                jnp.full_like(params_hover.beta, jnp.radians(Inputs.min_twist) / beta_scale),
-                0.8*omegas / omega_scale # allow RPM to change by up to 20% in each iteration
+                jnp.full_like(params_hover.beta, jnp.radians(Inputs.min_twist) / beta_scale)
             ),
             (
                 jnp.full_like(params_hover.c, Inputs.max_chord / c_scale),
-                jnp.full_like(params_hover.beta, jnp.radians(Inputs.max_twist) / beta_scale),
-                1.2*omegas / omega_scale # allow RPM to change by up to 20% in each iteration
+                jnp.full_like(params_hover.beta, jnp.radians(Inputs.max_twist) / beta_scale)
             ),
         )
 
@@ -310,8 +364,8 @@ def run_optimization():
             params_hover=params_hover,
             params_cruise=params_cruise,
             c_scale=c_scale,
+            omegas=omegas,
             beta_scale=beta_scale,
-            omega_scale=omega_scale,
             scale_MIL_err=0.25,
             scale_THR_err=4.5,
             w_hover=Inputs.w_hover,
@@ -321,7 +375,6 @@ def run_optimization():
         vars_scaled = sol.params
         c      = vars_scaled[0] * c_scale
         beta   = vars_scaled[1] * beta_scale
-        omegas = vars_scaled[2] * omega_scale
 
         # Smooth geometry 
         c_fit    = RationalFunctionInterp(r, jnp.squeeze(c),    P_c,    Q_c,    method='trf')
@@ -329,6 +382,13 @@ def run_optimization():
 
         c    = RationalFunction(r, list(c_fit[0:P_c]),       list(c_fit[P_c:]))
         beta = RationalFunction(r, list(beta_fit[0:P_beta]), list(beta_fit[P_beta:]))
+
+        vars_scaled = (c / c_scale, beta / beta_scale)
+
+        # calculate the final RPMs:
+        print("--> Recalculating rotational speeds")
+        omegas = omegas.at[0].set(determine_speed(vars_scaled, params_hover, c_scale, beta_scale, Inputs.thrust_hover, omegas[0]))
+        omegas = omegas.at[1].set(determine_speed(vars_scaled, params_cruise, c_scale, beta_scale, Inputs.thrust_cruise, omegas[1]))
 
         for label, params_static, Re_list, Ma_list, omega in [("hover",  params_hover,  Re_hover,  Ma_hover, omegas[0]),
                                                               ("cruise", params_cruise, Re_cruise, Ma_cruise, omegas[1]),]:
@@ -392,9 +452,10 @@ def run_optimization():
 
         # Calculate cost to be displayed, ensure scale factors are actually what's being used (consolidate in future!)
         current_cost = objective_fn(
-            (c / c_scale, beta / beta_scale, omegas / omega_scale),
+            (c / c_scale, beta / beta_scale),
             params_hover, params_cruise,
-            c_scale, beta_scale,omega_scale,
+            c_scale, beta_scale, 
+            omegas,
             scale_MIL_err=0.25, scale_THR_err=1.5,
             w_hover=Inputs.w_hover, w_cruise=Inputs.w_cruise,
         )

@@ -9,13 +9,11 @@ class Inputs(eqx.Module):
 
     # Hover condition 
     thrust_hover   = 21 # N
-    #omega_hover    = 4300/60*2*jnp.pi  # rad/s
     V_x_hover      = 0.0 # m/s
     V_yz_hover     = 0.0 # m/s 
 
     # Cruise condition
     thrust_cruise  = 23.5 # N 
-    #omega_cruise   = 5000/60*2*jnp.pi
     V_x_cruise     = 10.0 # m/s
     V_yz_cruise    = 0.0 # m/s
 
@@ -43,8 +41,8 @@ class Inputs(eqx.Module):
     # ----- Optimiser parameters -----
     # Newton solver settings
     opt_max_iter: int = 1000
-    opt_tol: float = 1e-2
-    newton_max_iter: int = 100
+    opt_tol: float = 1e-3
+    newton_max_iter: int = 200
     newton_eps: float = 1e-3
 
     #Augmented Lagrangian params
@@ -53,7 +51,7 @@ class Inputs(eqx.Module):
 
     # ----- Discretisation parameters -----
     # Radial discretisation
-    n_r: int = 15
+    n_r: int = 8
     # Azimuthal discretisation (for skewed inflow)
     n_psi: int = 36
 
@@ -66,12 +64,12 @@ class Inputs(eqx.Module):
 
     # ----- Chord and twist smoothing parameters -----
     # Set the highest power in the numerator and denominator of the chord smoothing function
-    Ord_Denominator_c = 2
     Ord_Numerator_c = 4
-
+    Ord_Denominator_c = 2
+    
     # Set the highest power in the numerator and denominator of the beta smoothing function
+    Ord_Numerator_beta = 2
     Ord_Denominator_beta = 2
-    Ord_Numerator_beta = 1
 
 
     # ----- Lookup method parameters -----
@@ -83,7 +81,7 @@ class Inputs(eqx.Module):
     # Lookup blending steps
     Iterations_initialising: int = 2
     Iterations_blending: int = 6
-    Iterations_solving: int = 12
+    Iterations_solving: int = 17
     
 
     # ----- Siagnostic and debugging flags -----
@@ -133,35 +131,4 @@ class Params(eqx.Module):
 
     #Blending parameter, ranges between 0->1 (full parametric -> full lookup)
     blend_alpha: float = 0.0
-
-
-
-def blade_design_mask(params: Params):
-    """
-    Mask specifying which Params fields are optimized.
-    True  -> optimized
-    False -> frozen
-    """
-    return Params(
-        # Domain of integration
-        r=False,
-        dr=False,
-        psi=False,
-        dpsi=False,
-
-        # Geometry & discretization (DESIGN VARIABLES)
-        N=False,
-        R=False,
-        c=True,
-        beta=True,
-
-        # Inflow / rotor state
-        V_x=False,
-        V_yz=False,
-        omega=True,
-        V_ia_0=False,
-
-        # Physical properties
-        rho=False
-    )
 
