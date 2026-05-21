@@ -18,30 +18,51 @@ class Inputs(eqx.Module):
     opt_solver: str = "L-BFGS-B" # Toggle Optimisation Loop (type of optimisation algorithm.)
     opt_max_iter: int = 100 
     opt_tol: float = 1e-2   # Optimiser Stability Criteria
+    opt_weights: int = 2    # Number of Weights for the Cost Function
 
-    # Newton solver settings (Broyden for Newton-Like Induced Velocity Solving)
-    newton_max_iter: int = 200
-    newton_eps: float = 1e-2
-    newton_damping: float = 0.1
+    # Induced Velocity Settings
+    V_ia_0_max_iter: int = 100
+    V_ia_0_eps: float = 5e-2
 
-    # Thrust Target Constraint
+    # Omega Solver Settings
+    omega_max_iter: int = 20
+    omega_eps: float = 0.5
+
+    # Solver Type (Thrust Constraint)
     solvertype: str = "T"
-    thrust: float = 50 # Newtons
 
     ## Discretisation settings
     # Radial discretisation
-    n_r: int = 50
+    n_r: int = 25
     # Azimuthal discretisation (for skewed inflow)
-    n_psi: int = 36
+    n_psi: int = 12
 
-    # Diagnostics / debugging
+    # diagnostics/debugging
     verbose: bool = False
 
-    ## Solver Model Selection
+    ## Input Parameters
+    # Geometry Setup (universal across propeller)
+    R_tip = 0.25
+    R_hub = 0.025
+
+    ## --- FLIGHT CONDITIONS (Batched as Arrays) ---
+    # Index 0: Hover | Index 1: Forward Flight
+    thrust_target = jnp.array([22.0, 30.0])
+    
+    V_x = jnp.array([0.0, 0.0])
+    V_yz = jnp.array([10.0, 0.0])
+    omega= jnp.array([640.0, 640.0])
+    
+    objective_weight = jnp.array([0.7, 0.3])
+
+    # Motor Information
+    I_0: float = 0.7           # Zero Load Current (amps)
+    R_m: float = 0.120         # Coil Resistance   (ohms)
+    k_V: float = 150            # Motor kV          (RPM/Volt)
 
     # Aerodynamic Models Selection
     inflow_model: int = 1 # 0 = basic, 1 = Pitt & Peters, 2 = DTU (WIP)
-    coeff_method: int = 2 # 0 = parametric, 1 = alpha/reynolds, 2 = alpha/mach/reynolds
+    coeff_method: int = 0 # 0 = parametric, 1 = alpha/reynolds, 2 = alpha/mach/reynolds
     tip_loss_model: int = 1 # 0 = none, 1 = Prandtl
     root_loss_model: int = 1 # 0 = none, 1 = Prandtl
 
@@ -93,6 +114,15 @@ class Params(eqx.Module):
     V_yz: jnp.ndarray       # In plane inflow velocity (ms^{-1})
     omega: jnp.ndarray      # rotational speed (rad/s)
 
+    # Cost Weights
+    objective_thrust: jnp.ndarray
+    objective_MIL:  jnp.ndarray     
+    objective_power: jnp.ndarray    # Use MIL instead of power consumption
+    objective_weight: jnp.ndarray 
+
+    # Target objective
+    thrust_target: jnp.ndarray
+
     V_ia_0: jnp.ndarray     # initial guess/storage for V_ia_0 (ms^{-1})
 
     # Solver Logging Info
@@ -107,11 +137,6 @@ class Params(eqx.Module):
     rho: float = 1.225          # air density (kgm^{-3})
     mu: float = 1.798e-5        # air viscosity (kgm^-1s^-1)
 
-    # Optimiser Weights (look into modifying these as ADAM parameters)
-    objective_thrust: float = 1 # set to one for now
-    objective_MIL:  float = 1   # 
-    objective_power: float = 0  # Use MIL instead of power consumption
-
     def save_state(self, filename: str = "params_state.eqx"):
         """Saves the array parameters to an Equinox file."""
         # ensure extension is used
@@ -124,7 +149,8 @@ class Params(eqx.Module):
 
     def load_state(self, filename: str = "propellers/params_state.eqx"):
         """
-        Loads saved binary array weights back into a Params class instance.
+        Loads saved binary array weights back into a Params class instance.n
+
         Acts on 'self' as the structural skeleton and returns a populated copy.
         """
         if not filename.endswith(".eqx"):
@@ -138,7 +164,7 @@ if __name__ == "__main__":
     '''
     Complete a Propeller Optimisation Run from the Terminal.
 
-    Modify Values in 
+    Modify Values in Init()
     '''
     from datetime import datetime
     # Internal Imports
@@ -149,13 +175,6 @@ if __name__ == "__main__":
     from airfoil import load_airfoil_data
 
     ## SOLVER SPECS
-    R = 0.25
-    R_hub = 0.025
-
-    V_x = 2
-    V_yz = 0.5
-
-    omega = 640
     airfoil = "arad10"
 
     c_scale = 0.1                   # Max chord (m)
@@ -163,7 +182,7 @@ if __name__ == "__main__":
 
     # Initial Geometry setup
     psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
-    r, dr = propmodel.radial_stops(R, R_hub, Inputs.n_r)
+    r, dr = propmodel.radial_stops(Inputs.R_tip, Inputs.R_hub, Inputs.n_r)
 
     init_c = jnp.full((Inputs.n_r,), c_scale/10)
     init_beta = jnp.full((Inputs.n_r,), beta_scale/10)
@@ -180,19 +199,30 @@ if __name__ == "__main__":
         beta=init_beta,
         r=r, dr=dr,    
         psi=psi, dpsi=dpsi, 
-        V_x=jnp.array([V_x]), V_yz=jnp.array([V_yz]),
-        omega=jnp.array([omega]), 
-        V_ia_0 = jnp.full((Inputs.n_r,), jnp.array([4.0])),
+        V_x=jnp.array([Inputs.V_x]), V_yz=jnp.array([Inputs.V_yz]),
+        omega=jnp.array([Inputs.omega]), 
+        V_ia_0=jnp.full((len(Inputs.thrust_target), Inputs.n_r), 4.0), # Induced Velocity Field for Each Thrust Conditon
         c_scale = c_scale,
         beta_scale = beta_scale,
         error_log = jnp.array([1.0]),
-        time_log = jnp.array([0])
+        time_log = jnp.array([0]),
+
+        # Cost Weights
+        objective_thrust=jnp.array([1.0]),
+        objective_MIL=jnp.array([0.3]),
+        objective_power=jnp.array([0.005]),
+        objective_weight=Inputs.objective_weight,
+        thrust_target=Inputs.thrust_target,
+        
     )
 
     print(f"Initialised Airfoil Fit with airfoil {params_init.airfoil}")
 
     # Run Optimiser
     params_opt = proptimiser.run_optimization(params_init)
+
+    # Take first flight condition for plotting
+    params_opt_hover = jax.tree_map(lambda x: x[0], params_opt)
 
     # Plot Info
     results.propinfoplot(params_opt)

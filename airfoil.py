@@ -128,11 +128,11 @@ def jax_idw_3d_grid(scattered_points, scattered_values, grid_X, grid_Y, power=2.
     return interp_flat.reshape(scattered_values.shape[0], grid_X.shape[0], grid_X.shape[1])
 
 def load_airfoil_data(airfoilname):
-    if Inputs.coeff_method==1:
+    if Inputs.coeff_method<3:
         '''
         Fit 2D Alpha/Reynolds Interpolator
         '''
-        files = glob.glob(f"airfoils/xf-{airfoilname}-il-*.csv")
+        files = glob.glob(f"airfoils/ARAD10/xfoil/xf-{airfoilname}-il-*.csv")
         if not files:
             raise FileNotFoundError(f"No CSVs for {airfoilname}")
 

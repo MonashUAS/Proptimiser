@@ -13,17 +13,14 @@ import jaxopt
 import matplotlib.pyplot as plt
 import scipy.optimize as scipyopt
 from dataclasses import replace
+from jax import lax
+import equinox as eqx
 
 # Internal Imports
 from init import Params, Inputs
 from airfoil import load_airfoil_data
 import propmodel
 from results import propinfoplot
-
-# Curvature Penalty (depreciated)
-def curvature_penalty(x):
-    d2 = x[2:] - 2.0 * x[1:-1] + x[:-2]
-    return jnp.mean(d2**2)
 
 def minimumInducedLossCost(V_ia_0, scale=1):
     """
@@ -39,6 +36,30 @@ def minimumInducedLossCost(V_ia_0, scale=1):
 
     return rms_err*scale
 
+def motorPower(torque: float, omega: float, I_0: float = 0.7, R_m: float = 0.120, k_V: float = 150):
+    """
+    Calcualtes Power Consumption required of the motor to drive the propeller
+
+    Inputs:
+        torque: torque of the motor (Nm)
+        omega: rotational rate of the motor (rad/s)
+        I_0: zero load current (A)
+        R_m: Coil resistance (ohms)
+        K_v: motor speed constant (RPM/volt)
+    """
+    P_out = torque*omega
+
+    K_t = 60 / (2*jnp.pi*k_V) # Calculate the torque constant (Nm/A)
+
+    I = torque / K_t # calculate the current consumed by the motor
+
+    V = omega*60/(2*jnp.pi) / k_V
+
+    P_in = P_out + R_m * (I+I_0)**2 + V*I_0
+
+    return P_in
+
+@jax.jit
 def objectives(params):
     '''
     Return the Base Objective Values of the Solver given an input of parameters
@@ -46,43 +67,114 @@ def objectives(params):
     '''
     # replace params object (works in function)
     V_ia, V_ia_0   = propmodel.induced_velocity(params)             # Solve induced velocity field for current guess
+    thrust = jnp.squeeze(propmodel.thrust(V_ia, params))            # return the total thrust the propeller produce
+    torque = jnp.squeeze(propmodel.torque(V_ia, params))            # return total torque propeller produces
+    rms_MIL_err = minimumInducedLossCost(V_ia_0)                    # minimum induced loss condition root mean square error
     
-    power  = jnp.squeeze(propmodel.mechanicalPower(V_ia, params))   # return the total power produced by the propeller
-    thrust = jnp.squeeze(propmodel.thrust(V_ia, params))            # return the total thrust the propeller produces
-
-    thrust_err = (thrust - Inputs.thrust)           # thrust serror for this iteration
-
-    rms_MIL_err = minimumInducedLossCost(V_ia_0)    # minimum induced loss 
+    # calculate the motor power
+    motor_power = motorPower(torque, params.omega, I_0 = Inputs.I_0, R_m = Inputs.R_m, k_V = Inputs.k_V)
 
     # Return V_ia_0 so we can catch it!
-    return power, thrust_err, thrust, rms_MIL_err, V_ia_0 
+    return motor_power, thrust, rms_MIL_err, V_ia_0 
+
+def omega_thrust_residual(omega_guess, params):
+    '''
+    Calculate thrust residual for Given Parameters and a guess of omega
+
+    Returns:
+        thrust_residual: current thrust residual for given parameters and rotational speed
+    '''
+    params = eqx.tree_at(lambda p: p.omega, params, omega_guess)
+    V_ia, _ = propmodel.induced_velocity(params)
+    thrust = propmodel.thrust(V_ia, params)
+
+    return thrust-params.thrust_target
+
+@jax.custom_vjp
+def solve_omega(params):
+    '''
+    Root find the rotational velocity that matches the thrust residual exactly for ONE condition
+    '''
+    # We turn OFF implicit_diff in jaxopt here because we are manually defining the 1D gradient below!
+    solver = jaxopt.Broyden(fun=omega_thrust_residual, maxiter=Inputs.omega_max_iter, tol=Inputs.omega_eps, implicit_diff=False)
+    
+    (omega, info) = solver.run(params.omega, params)
+    return omega
+
+# Define the Custom Vector Jacobian Product to Prevent NotImplementedErrors
+def solve_omega_fwd(params):
+    # Forward pass: Return the primal omega, and save (omega, params) for the backward pass
+    omega = solve_omega(params)
+    return omega, (omega, params)
+
+def solve_omega_bwd(res, g):
+    # Backward pass: Calculate exact 1D implicit differentiation
+    omega, params = res
+    
+    # Derivative of residual w.r.t omega (a simple scalar)
+    dR_domega = jax.grad(omega_thrust_residual, argnums=0)(omega, params)
+    
+    # Prevent division by zero if gradient goes flat
+    dR_domega = jnp.where(jnp.abs(dR_domega) < 1e-10, 1e-10, dR_domega)
+    
+    # Scale the incoming outer gradient (g) by the implicit function theorem
+    scalar_factor = -g / dR_domega
+    
+    # Pull the scaled gradient back through the parameters structure
+    _, vjp_params = jax.vjp(lambda p: omega_thrust_residual(omega, p), params)
+    grad_params = vjp_params(scalar_factor)[0]
+    
+    return (grad_params,)
+
+# Bind the custom forward and backward passes to the solver
+solve_omega.defvjp(solve_omega_fwd, solve_omega_bwd)
+
+def cost_fn(params):
+    ''' 
+    Computes cost and returns updated V_ia_0 for exactly ONE condition 
+    '''
+    motor_power, thrust, rms_MIL_err, V_ia_0 = objectives(params)
+    
+    # Calculate base cost using this condition's specific targets
+    cost = (
+        params.objective_thrust * (thrust - params.thrust_target)**2 + 
+        params.objective_MIL * rms_MIL_err**2 + 
+        params.objective_power * motor_power**2
+    )
+    
+    # Scale by the relative importance weight of this flight condition
+    weighted_cost = cost * params.objective_weight
+    return weighted_cost, V_ia_0
+
 
 @jax.jit
-def objectives_fn(opt_vars_scaled, state_params): 
+def objectives_fn(opt_vars_scaled, params_list): 
     '''
-    Objectives Function for the total weight of the objective
-    add together all target values with toggles dependent on
-    input solver settings.
-    ''' 
-    # TODO Change below logic so the "optimisation filter"
-    # decides which variables are to be optimised.
-
-    # Scale Variables
+    Vectorized objective function mapping over an ensemble of single-condition Params
+    '''
+    # Unpack and Scale Optimisation Variables
     c_scaled, beta_scaled = opt_vars_scaled
-    c = c_scaled*state_params.c_scale
-    beta = beta_scaled*state_params.beta_scale
+    c = params_list.c_scale[:, None] * c_scaled[None, :]
+    beta = params_list.beta_scale[:, None] * beta_scaled[None, :]
 
-    # Update params with new geometry
-    state_params = replace(state_params, c=c, beta=beta)
+    # Update parameters list with new geometry
+    params_list = eqx.tree_at(lambda p: (p.c, p.beta), params_list, (c, beta))
 
-    # return the objective function dependent on objective states
-    power, thrust_err, thrust, rms_MIL_err, V_ia_0 = objectives(state_params)
+    # vmap omega solving over parameters list
+    solve_omega_vmap = jax.vmap(solve_omega, in_axes=0)
+    omega = solve_omega_vmap(params_list)
 
+    # Update parameters list with new rotational speeds
+    params_list = eqx.tree_at(lambda p: p.omega, params_list, omega)
 
-    cost = state_params.objective_thrust*thrust_err**2 + state_params.objective_MIL*rms_MIL_err**2 + state_params.objective_power*power**2
+    # vmap cost function over parameters list
+    cost_fn_vmap = jax.vmap(cost_fn, in_axes=0)
+    costs, V_ia_0 = cost_fn_vmap(params_list)
 
-    # Return (cost, aux_data)
-    return cost, V_ia_0
+    aux = (V_ia_0, omega)
+    
+    # Sum up total scalar cost across conditions, pass the array of updated V_ia_0 states as aux data
+    return jnp.sum(costs), aux
 
 def compute_gradient_scales(init_c, init_beta, params_static):
     '''
@@ -96,37 +188,45 @@ def compute_gradient_scales(init_c, init_beta, params_static):
 
     return c_scale, beta_scale
 
-def run_optimization(params_init):
+def run_optimization(params_base):
     '''
     The Meat and Bones of the Optimisation Algorithm.
     Iterate until solution is stable or criteria are met.
     '''
     # Debug Print to check initial thrust residual
     if Inputs.verbose:
-        res_check = propmodel.thrust_residual(params_init.V_ia_0, params_init)
+        res_check = propmodel.thrust_residual(params_base.V_ia_0, params_base)
         jax.debug.print("Initial Residuals Check: {dT_res}", dT_res=res_check)
 
-    # Scale initial variables
     vars_scaled = (
-        params_init.c/params_init.c_scale,
-        params_init.beta/params_init.beta_scale
+        params_base.c / params_base.c_scale,
+        params_base.beta / params_base.beta_scale
     )
 
-    # Scaled Bounds (chord + beta pairs)
     bounds = (
-        (   jnp.full_like(params_init.c, 1e-4),
-            jnp.full_like(params_init.beta, 0),    # optimal angle may be negative
+        (jnp.full_like(params_base.c, 1e-4), jnp.full_like(params_base.beta, 0)),
+        (jnp.full_like(params_base.c, 1), jnp.full_like(params_base.beta, 1))
+    )
+
+    conditions_list = [
+        replace(
+            params_base,
+            V_x=Inputs.V_x[0], V_yz=Inputs.V_yz[0], omega=Inputs.omega[0],
+            thrust_target=Inputs.thrust_target[0], objective_weight=Inputs.objective_weight[0],
+            objective_thrust=1.0, objective_MIL=1.0, objective_power=0.0,
+            V_ia_0=jnp.full((Inputs.n_r,), 4.0)
         ),
-        (   jnp.full_like(params_init.c, 1),
-            jnp.full_like(params_init.beta, 1),
-        ))
-
-    # Solver title/header
-    print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} |{'State Error':<6} | {'Iter Time (s)'}")
-    print("-" * 95)
-
-    # Start up the parameters
-    params = params_init
+        replace(
+            params_base,
+            V_x=Inputs.V_x[1], V_yz=Inputs.V_yz[1], omega=Inputs.omega[1],
+            thrust_target=Inputs.thrust_target[1], objective_weight=Inputs.objective_weight[1],
+            objective_thrust=1.0, objective_MIL=1.0, objective_power=0.0,
+            V_ia_0=jnp.full((Inputs.n_r,), 4.0)
+        )
+    ]
+    
+    # Convert list into a stacked PyTree object that JAX natively unrolls via vmap
+    params_struct = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *conditions_list)
 
     # Start the clock
     start_time = time.time()
@@ -142,70 +242,81 @@ def run_optimization(params_init):
     if Inputs.opt_solver == "L-BFGS-B":
         solver = jaxopt.LBFGSB(
             fun=objectives_fn, 
-            has_aux=True,      # allows us to parse V_ia_0
+            has_aux=True,
             implicit_diff=True, 
             jit=True
         )
-        # Bundle parameters into solver state
-        state = solver.init_state(
-            init_params=vars_scaled, # solver state has to be defined
-            bounds=bounds, 
-            state_params=params_init
-        )
+        
+        state = solver.init_state(init_params=vars_scaled, bounds=bounds, params_list=params_struct)
         for i in range(Inputs.opt_max_iter): 
+            vars_scaled, state = solver.update(vars_scaled, 
+                                               state=state, 
+                                               bounds=bounds, 
+                                               params_list=params_struct)
+            # state.aux captures the updated tracking profiles (shape: [2, n_r])
+            # We assign them directly back to keep Newton warm-starts efficient
 
-            vars_scaled, state = solver.update(
-                vars_scaled,
-                state=state,
-                bounds=bounds,
-                state_params=params
-            )
-            
             # Scale Variables
-            c_scaled, beta_scaled = vars_scaled
-            c = c_scaled*params.c_scale
-            beta = beta_scaled*params.beta_scale
+            c_scaled, beta_scaled = vars_scaled    
+            c = params_struct.c_scale[:, None] * c_scaled[None, :]
+            beta = params_struct.beta_scale[:, None] * beta_scaled[None, :]
+            # Extract the updated V_ia_0 from state.aux and update params_struct
+            V_ia_0, omega = state.aux
 
-            # Extract the updated V_ia_0 from state.aux and update params_static
-            params = replace(params, V_ia_0=state.aux, c=c, beta=beta)
+            params_struct = eqx.tree_at(lambda p: (p.c, p.beta, p.omega, p.V_ia_0), params_struct, (c, beta, omega, V_ia_0))
 
-            if state.error < Inputs.opt_tol: 
-                # stop condition first
-                power, thrust_err, thrust, rms_MIL_err, _ = objectives(params)
-                print(f"{i:<6} | {float(power):<12.4f} | {float(thrust):<12.4f} | {float(thrust_err):<12.4f} | {rms_MIL_err:<10.4f} | {state.error:10.4f} | {time.time()-iter_time:3.1f}")
-                print(f"Stopping: Gradient stationarity reached at step {i}")
-                break
-            
-            if (time.time()-print_time > 5) | (i%5==0):
-                # Print Solver State Every Increment or Five seconds, whichever comes first
-                power, thrust_err, thrust, rms_MIL_err, _ = objectives(params)
-                print(f"{i:<6} | {float(power):<12.4f} | {float(thrust):<12.4f} | {float(thrust_err):<12.4f} | {rms_MIL_err:<10.4f} | {state.error:10.4f} | {time.time()-iter_time:3.1f}")
-                #if Inputs.verbose==True:
-                # res_check = propmodel.thrust_residual(state.aux, params_static)
-                # jax.debug.print("Residuals Check: {dT_res}", dT_res=res_check)
+            # Check if we should print this iteration
+            is_terminal = state.error < Inputs.opt_tol
+            is_checkpoint = (time.time() - print_time > 5) or (i % 5 == 0)
+
+            if is_terminal or is_checkpoint:
+                # Vector-map our single-condition objectives function across axis 0
+                vmapped_objectives = jax.vmap(objectives, in_axes=0)
+                powers, thrusts, rms_MIL_errs, _ = vmapped_objectives(params_struct)
+                
+                # Loop through and print metrics for each flight condition individually
+                num_conditions = len(powers)
+                for cond_idx in range(num_conditions):
+                    pwr = float(powers[cond_idx])
+                    thr = float(thrusts[cond_idx])
+                    t_target = float(params_struct.thrust_target[cond_idx])
+                    mil = float(rms_MIL_errs[cond_idx])
+                    
+                    # Tie the global optimization error and iteration timing to the first condition row
+                    err_str = f"{state.error:11.4e}" if cond_idx == 0 else ""
+                    time_str = f"{time.time() - iter_time:3.1f}" if cond_idx == 0 else ""
+                    iter_str = f"{i:<5}\n" if cond_idx == 0 else ""
+
+                    print(f"{iter_str} | C{cond_idx:<3} | {pwr:<12.4f} | {thr:<12.4f} | {thr - t_target:<12.4f} | {mil:<10.4f} | {err_str:<12.2f} | {time_str}s")
+                
                 print_time = time.time()
+                
+                if is_terminal: 
+                    print(f"\nStopping: Gradient stationarity reached at step {i}")
+                    break
 
             # Update Error Log, Iter Time
             error_log = jnp.append(error_log, state.error)
-            time_log = jnp.append(time_log, time.time()-iter_time)
+            time_log = jnp.append(time_log, time.time() - iter_time)
             iter_time = time.time()
 
-    elif Inputs.opt_solver == "scipy": # Not currently implemented
-            solver = scipyopt.minimise(
-            fun=objectives_fn, 
-            has_aux=True,      # allows us to parse V_ia_0
-            implicit_diff=True, 
-            jit=True
-        )
-
     else:
-        print(f"\nWarning: max iterations reached. Final thrust error: {thrust_err:.2e}")
+        # Final terminal backup evaluation if max iterations is hit
+        vmapped_objectives = jax.vmap(objectives, in_axes=0)
+        _, thrusts, _, _ = vmapped_objectives(params_struct)
+        for cond_idx in range(len(thrusts)):
+            err = float(thrusts[cond_idx] - params_struct.thrust_target[cond_idx])
+            print(f"Warning: max iterations reached. Final thrust error [Cond {cond_idx}]: {err:.2e}")
     
     # Clock Time of solve
-    solve_time = time.time()-start_time
-    print(f"\nTotal Solve Time: {solve_time}")
+    solve_time = time.time() - start_time
+    print(f"\nTotal Solve Time: {solve_time:.2f} seconds")
 
-    return replace(params, c=vars_scaled[0]*params.c_scale, beta=vars_scaled[1]*params.beta_scale, error_log=error_log, time_log=time_log)
+    # Extract 1D base slice representations of the final geometry arrays to return back to base instance
+    final_c = params_struct.c[0]
+    final_beta = params_struct.beta[0]
+
+    return replace(params_base, c=final_c, beta=final_beta, error_log=error_log, time_log=time_log)
 
 if __name__ == "__main__":
     # Enable LaTeX formatting for pretty titles

@@ -3,14 +3,11 @@
 # External Libraries
 import jax
 import jax.numpy as jnp
-from jax import jit, vmap, grad, lax
 
-import optax
 import jaxopt
 
 import numpy as np
 import matplotlib.pyplot as plt
-from dataclasses import replace
 
 # Internal Libraries
 from init import Inputs, Params
@@ -290,8 +287,7 @@ def thrust_residual(V_ia_0_guess, params):
 
     return dT_residual
 
-
-### Outputs
+@jax.jit
 def induced_velocity(params):
     '''
     Calculates the axial induced velocity (neglects the radial and tangential induced velocity) for
@@ -315,11 +311,10 @@ def induced_velocity(params):
         print("Residual Shape", jnp.shape(res_check))
         print("Residual min/max:", res_check.min(), res_check.max())
 
-    # Newton Solver for Induced Velocity
-    solver = jaxopt.Broyden(fun=thrust_residual, maxiter=Inputs.newton_max_iter, tol=Inputs.newton_eps, implicit_diff=True)
+    # Newton-Like Solver for Induced Velocity
+    solver = jaxopt.Broyden(fun=thrust_residual, maxiter=Inputs.V_ia_0_max_iter, tol=Inputs.V_ia_0_eps, implicit_diff=True, implicit_diff_solve=jaxopt.linear_solve.solve_gmres)
     # Input initial guess for induced velocity and solve. (Induced velocity is parametrised per radial stop)
     (V_ia_0, info) = solver.run(params.V_ia_0, params)
-
 
     # # Debug Check Final Residuals
     if Inputs.verbose:

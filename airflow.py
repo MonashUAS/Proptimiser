@@ -1,4 +1,3 @@
-from dataclasses import replace
 import jax.numpy as jnp
 from init import Inputs
 from jax import lax
@@ -153,7 +152,6 @@ def prandtl_root_loss(V_ia, params):
 
     Notation adapted from that source, with variables reallocated for consistency with literature
     '''
-
     eps = 1e-6
     B = params.N
     r = params.r
