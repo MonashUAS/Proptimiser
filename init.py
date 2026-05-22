@@ -26,7 +26,7 @@ class Inputs(eqx.Module):
 
     # Omega Solver Settings
     omega_max_iter: int = 20
-    omega_eps: float = 0.5
+    omega_eps: float = 1e-2
 
     # Solver Type (Thrust Constraint)
     solvertype: str = "T"
@@ -224,44 +224,6 @@ if __name__ == "__main__":
     # Take first flight condition for plotting
     params_opt_hover = jax.tree_map(lambda x: x[0], params_opt)
 
-    # Plot Info
-    results.propinfoplot(params_opt)
-
-    # check interpolated plot
-    import numpy as np
-    import matplotlib.pyplot as plt
-    # Fit high order polynomial to data, then establish leading and trailing edge using fit.
-    polyorder = 5
-    c_coeffs = np.polyfit(params_opt.r, params_opt.c, polyorder)
-    c_p = np.poly1d(c_coeffs)
-    c_poly = c_p(r)
-
-    beta_coeffs = np.polyfit(params_opt.r, params_opt.beta, polyorder)
-    beta_p = np.poly1d(beta_coeffs)
-    beta_poly = beta_p(r)
-
-    # Let the plotting begin
-    fig = plt.figure(figsize=(14, 10))
-
-    # Optimum Chord & Twist Distribution (Combined)
-    # Chord Distribution
-    ax1 = fig.add_subplot(1, 2, 1)
-    line1 = ax1.plot(r, c_poly, "o-", markersize=4, color="tab:blue", label=r"Chord ($c$)")
-    ax1.set_title(r"\textbf{Optimum Chord \& Twist Distribution}")
-    ax1.set_ylabel(r"Chord (mm)", color="tab:blue")
-    ax1.set_xlabel(r"Radius ($r$) [mm]")
-    ax1.set_xlim(left=0)
-    ax1.tick_params(axis='y', labelcolor="tab:blue")
-    ax1.grid(True, linestyle='--', alpha=0.6)
-
-    # Beta Distribution
-    ax2 = fig.add_subplot(1, 2, 2)
-    line2 = ax2.plot(r, beta_poly, 'o-', color="tab:red", markersize=4, label=r"Twist ($\beta$)")
-    ax2.set_xlim(left=0)
-    ax2.set_ylabel(r"Twist ($^\circ$)", color="tab:red")
-    ax2.tick_params(axis='y', labelcolor="tab:red")
-    plt.show()
-
     # Save Results/Export Geometry if Required
     user_input = input('Save Propeller? (y/n): ')
     timestamp = datetime.now().strftime("%Y%m%d-%H%M")
@@ -271,15 +233,68 @@ if __name__ == "__main__":
         print(f'Saving Propeller Inputs/Parameters to {paramsfile} and {inputsfile}')
 
         # Use the instantiated object references (params_opt and an Inputs instance)
-        params_opt.save_state(paramsfile)
+        params_opt_hover.save_state(paramsfile)
         Inputs().save_state(inputsfile)
     
     user_input = input('Export Propeller Geometry to .pts files? (y/n): ')
 
     if user_input.lower() == 'y':
         exportname = f"prop_pts_{timestamp}"
-        foilpoints = geometry.upperlowerairfoil(params_opt.airfoil)
-        geometry.ptsfilegenerator(params_opt.r, params_opt.c, params_opt.beta, foilpoints, exportname)
+        foilpoints = geometry.upperlowerairfoil(params_opt_hover.airfoil)
+        geometry.ptsfilegenerator(params_opt_hover.r, params_opt_hover.c, params_opt_hover.beta, foilpoints, exportname)
         print(f'Saving Propeller Geometry to {exportname}.pts')
 
     print('Proptimisation Complete')
+
+    # Plot Info
+    results.propinfoplot(params_opt_hover)
+
+    # check interpolated plot
+    import numpy as np
+    from scipy import UnivariateSpline
+    import matplotlib.pyplot as plt
+
+    # Extract the optimized arrays and convert back to standard NumPy for use in scipy
+    r_opt = np.array(params_opt_hover.r)
+    c_opt = np.array(params_opt_hover.c)
+    beta_opt = np.array(params_opt_hover.beta)
+
+    # Fit the Smoothing Splines
+    # k=3 sets it as a cubic spline
+    # 's' is the smoothing factor. 
+    # -> s=0 forces it through every point. 
+    # -> Increase 's' gradually until the kinks disappear but the global shape remains.
+    c_spline = UnivariateSpline(r_opt, c_opt, k=3, s=1e-5)
+    beta_spline = UnivariateSpline(r_opt, beta_opt, k=3, s=1e-3)
+
+    # Increase Point Density for CAD export
+    r_splinefit = np.linspace(r_opt.min(), r_opt.max(), 100)
+    c_splinefit = c_spline(r_splinefit)
+    beta_splinefit = beta_spline(r_splinefit)
+
+    # Evaluate how much the spline altered the original data
+    c_max_deviation = np.max(np.abs(c_spline(r_opt) - c_opt))
+    print(f"Max chord smoothing deviation: {c_max_deviation:.4f} m")
+    polyorder = 5
+
+    # Let the plotting begin
+    fig = plt.figure(figsize=(14, 10))
+
+    # Optimum Chord & Twist Distribution (Combined)
+    # Chord Distribution
+    ax1 = fig.add_subplot(1, 2, 1)
+    line1 = ax1.plot(r, c_splinefit, "o-", markersize=4, color="tab:blue", label=r"Chord ($c$)")
+    ax1.set_title(r"\textbf{Optimum Chord \& Twist Distribution}")
+    ax1.set_ylabel(r"Chord (mm)", color="tab:blue")
+    ax1.set_xlabel(r"Radius ($r$) [mm]")
+    ax1.set_xlim(left=0)
+    ax1.tick_params(axis='y', labelcolor="tab:blue")
+    ax1.grid(True, linestyle='--', alpha=0.6)
+
+    # Beta Distribution
+    ax2 = fig.add_subplot(1, 2, 2)
+    line2 = ax2.plot(r, beta_splinefit, 'o-', color="tab:red", markersize=4, label=r"Twist ($\beta$)")
+    ax2.set_xlim(left=0)
+    ax2.set_ylabel(r"Twist ($^\circ$)", color="tab:red")
+    ax2.tick_params(axis='y', labelcolor="tab:red")
+    plt.show()

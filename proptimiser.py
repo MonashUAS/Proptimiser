@@ -246,8 +246,11 @@ def run_optimization(params_base):
             implicit_diff=True, 
             jit=True
         )
-        
+        print("Initialising Solver...")
         state = solver.init_state(init_params=vars_scaled, bounds=bounds, params_list=params_struct)
+        print(f"{'Iter':<6} | {'Cond':<5} | {'Power':<12} | {'Thrust':<12} | {'T-Err':<12} | {'MIL':<10} | {'OptErr':<11} | {'Time'}")
+        print("-" * 90)
+
         for i in range(Inputs.opt_max_iter): 
             vars_scaled, state = solver.update(vars_scaled, 
                                                state=state, 
@@ -260,39 +263,32 @@ def run_optimization(params_base):
             c_scaled, beta_scaled = vars_scaled    
             c = params_struct.c_scale[:, None] * c_scaled[None, :]
             beta = params_struct.beta_scale[:, None] * beta_scaled[None, :]
-            # Extract the updated V_ia_0 from state.aux and update params_struct
+            # Extract the updated V_ia_0, omega from state.aux and update params_struct
             V_ia_0, omega = state.aux
-
             params_struct = eqx.tree_at(lambda p: (p.c, p.beta, p.omega, p.V_ia_0), params_struct, (c, beta, omega, V_ia_0))
 
-            # Check if we should print this iteration
+            # Print Statements for this Iteration
             is_terminal = state.error < Inputs.opt_tol
             is_checkpoint = (time.time() - print_time > 5) or (i % 5 == 0)
 
             if is_terminal or is_checkpoint:
-                # Vector-map our single-condition objectives function across axis 0
                 vmapped_objectives = jax.vmap(objectives, in_axes=0)
                 powers, thrusts, rms_MIL_errs, _ = vmapped_objectives(params_struct)
                 
-                # Loop through and print metrics for each flight condition individually
-                num_conditions = len(powers)
-                for cond_idx in range(num_conditions):
-                    pwr = float(powers[cond_idx])
-                    thr = float(thrusts[cond_idx])
-                    t_target = float(params_struct.thrust_target[cond_idx])
-                    mil = float(rms_MIL_errs[cond_idx])
+                for idx, (pwr, thr, mil) in enumerate(zip(powers, thrusts, rms_MIL_errs)):
+                    t_err = thr - params_struct.thrust_target[idx]
                     
-                    # Tie the global optimization error and iteration timing to the first condition row
-                    err_str = f"{state.error:11.4e}" if cond_idx == 0 else ""
-                    time_str = f"{time.time() - iter_time:3.1f}" if cond_idx == 0 else ""
-                    iter_str = f"{i:<5}\n" if cond_idx == 0 else ""
+                    # Only print iteration metadata on the first condition row
+                    iter_info = f"{i:<6} |" if idx == 0 else f"{'':<6} |"
+                    opt_err = f"{state.error:<11.3f}" if idx == 0 else f"{'':<11}"
+                    timing = f"{time.time() - iter_time:<4.1f}s" if idx == 0 else ""
+                    
+                    print(f"{iter_info} C{idx:<3} | {pwr:<12.4f} | {thr:<12.4f} | {t_err:<12.4f} | {mil:<10.4f} | {opt_err} | {timing}")
 
-                    print(f"{iter_str} | C{cond_idx:<3} | {pwr:<12.4f} | {thr:<12.4f} | {thr - t_target:<12.4f} | {mil:<10.4f} | {err_str:<12.2f} | {time_str}s")
-                
                 print_time = time.time()
                 
-                if is_terminal: 
-                    print(f"\nStopping: Gradient stationarity reached at step {i}")
+                if is_terminal:
+                    print(f"\nStopping: Convergence reached at step {i}")
                     break
 
             # Update Error Log, Iter Time
