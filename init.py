@@ -46,12 +46,12 @@ class Inputs(eqx.Module):
     newton_eps: float = 1e-3
 
     #Augmented Lagrangian params
-    eta_tol = 1e-2
+    eta_tol = 1e-3
 
 
     # ----- Discretisation parameters -----
     # Radial discretisation
-    n_r: int = 8
+    n_r: int = 25
     # Azimuthal discretisation (for skewed inflow)
     n_psi: int = 36
 
@@ -81,7 +81,7 @@ class Inputs(eqx.Module):
     # Lookup blending steps
     Iterations_initialising: int = 2
     Iterations_blending: int = 6
-    Iterations_solving: int = 17
+    Iterations_solving: int = 7
     
 
     # ----- Siagnostic and debugging flags -----
