@@ -16,26 +16,26 @@ class Inputs(eqx.Module):
     ## Optimisation / design settings which remain constant during execution
     # Outer-loop Optimisation (L-BFGS or ADAM)
     opt_solver: str = "L-BFGS-B" # Toggle Optimisation Loop (type of optimisation algorithm.)
-    opt_max_iter: int = 100 
+    opt_max_iter: int = 40  
     opt_tol: float = 1e-2   # Optimiser Stability Criteria
     opt_weights: int = 2    # Number of Weights for the Cost Function
 
     # Induced Velocity Settings
-    V_ia_0_max_iter: int = 100
+    V_ia_0_max_iter: int = 50
     V_ia_0_eps: float = 5e-2
 
     # Omega Solver Settings
     omega_max_iter: int = 20
-    omega_eps: float = 1e-2
+    omega_eps: float = 5e-2
 
     # Solver Type (Thrust Constraint)
     solvertype: str = "T"
 
     ## Discretisation settings
     # Radial discretisation
-    n_r: int = 25
+    n_r: int = 15
     # Azimuthal discretisation (for skewed inflow)
-    n_psi: int = 12
+    n_psi: int = 6
 
     # diagnostics/debugging
     verbose: bool = False
@@ -62,7 +62,7 @@ class Inputs(eqx.Module):
 
     # Aerodynamic Models Selection
     inflow_model: int = 1 # 0 = basic, 1 = Pitt & Peters, 2 = DTU (WIP)
-    coeff_method: int = 0 # 0 = parametric, 1 = alpha/reynolds, 2 = alpha/mach/reynolds
+    coeff_method: int = 2 # 0 = parametric, 1 = alpha/reynolds, 2 = alpha/mach/reynolds
     tip_loss_model: int = 1 # 0 = none, 1 = Prandtl
     root_loss_model: int = 1 # 0 = none, 1 = Prandtl
 
@@ -147,7 +147,7 @@ class Params(eqx.Module):
         eqx.tree_serialise_leaves(filename, self)
         print(f"Params state successfully written to: {filename}")
 
-    def load_state(self, filename: str = "propellers/params_state.eqx"):
+    def load_state(self, filename: str = "params_state.eqx"):
         """
         Loads saved binary array weights back into a Params class instance.n
 
@@ -190,7 +190,7 @@ if __name__ == "__main__":
     # Interpolate airfoil data
     airfoil_interp = load_airfoil_data("arad10")
 
-    # Initialise Params Class
+    # Initialise Params Class (will be duplicated for inputs in run_optimisation)
     params_init = Params(
         airfoil = airfoil,
         airfoil_interp=airfoil_interp,
@@ -199,18 +199,18 @@ if __name__ == "__main__":
         beta=init_beta,
         r=r, dr=dr,    
         psi=psi, dpsi=dpsi, 
-        V_x=jnp.array([Inputs.V_x]), V_yz=jnp.array([Inputs.V_yz]),
-        omega=jnp.array([Inputs.omega]), 
-        V_ia_0=jnp.full((len(Inputs.thrust_target), Inputs.n_r), 4.0), # Induced Velocity Field for Each Thrust Conditon
+        V_x=jnp.array([Inputs.V_x[0]]), V_yz=jnp.array([Inputs.V_yz[0]]),
+        omega=jnp.array([Inputs.omega[0]]), 
+        V_ia_0=jnp.full((Inputs.n_r), 4.0), # Induced Velocity Field guess
         c_scale = c_scale,
         beta_scale = beta_scale,
         error_log = jnp.array([1.0]),
         time_log = jnp.array([0]),
 
         # Cost Weights
-        objective_thrust=jnp.array([1.0]),
-        objective_MIL=jnp.array([0.3]),
-        objective_power=jnp.array([0.005]),
+        objective_thrust=jnp.array([1.0/Inputs.thrust_target[0]]),
+        objective_MIL=jnp.array([1.0]),
+        objective_power=jnp.array([0.1/5000]),
         objective_weight=Inputs.objective_weight,
         thrust_target=Inputs.thrust_target,
         
@@ -219,10 +219,7 @@ if __name__ == "__main__":
     print(f"Initialised Airfoil Fit with airfoil {params_init.airfoil}")
 
     # Run Optimiser
-    params_opt = proptimiser.run_optimization(params_init)
-
-    # Take first flight condition for plotting
-    params_opt_hover = jax.tree_map(lambda x: x[0], params_opt)
+    params_opt_hover = proptimiser.run_optimization(params_init)
 
     # Save Results/Export Geometry if Required
     user_input = input('Save Propeller? (y/n): ')
@@ -249,7 +246,7 @@ if __name__ == "__main__":
     # Plot Info
     results.propinfoplot(params_opt_hover)
 
-    # check interpolated plot
+    ## Check interpolated plot
     import numpy as np
     from scipy import UnivariateSpline
     import matplotlib.pyplot as plt
@@ -275,7 +272,6 @@ if __name__ == "__main__":
     # Evaluate how much the spline altered the original data
     c_max_deviation = np.max(np.abs(c_spline(r_opt) - c_opt))
     print(f"Max chord smoothing deviation: {c_max_deviation:.4f} m")
-    polyorder = 5
 
     # Let the plotting begin
     fig = plt.figure(figsize=(14, 10))
@@ -283,7 +279,7 @@ if __name__ == "__main__":
     # Optimum Chord & Twist Distribution (Combined)
     # Chord Distribution
     ax1 = fig.add_subplot(1, 2, 1)
-    line1 = ax1.plot(r, c_splinefit, "o-", markersize=4, color="tab:blue", label=r"Chord ($c$)")
+    line1 = ax1.plot(r_splinefit, c_splinefit, "o-", markersize=4, color="tab:blue", label=r"Chord ($c$)")
     ax1.set_title(r"\textbf{Optimum Chord \& Twist Distribution}")
     ax1.set_ylabel(r"Chord (mm)", color="tab:blue")
     ax1.set_xlabel(r"Radius ($r$) [mm]")
@@ -293,7 +289,7 @@ if __name__ == "__main__":
 
     # Beta Distribution
     ax2 = fig.add_subplot(1, 2, 2)
-    line2 = ax2.plot(r, beta_splinefit, 'o-', color="tab:red", markersize=4, label=r"Twist ($\beta$)")
+    line2 = ax2.plot(r_splinefit, beta_splinefit, 'o-', color="tab:red", markersize=4, label=r"Twist ($\beta$)")
     ax2.set_xlim(left=0)
     ax2.set_ylabel(r"Twist ($^\circ$)", color="tab:red")
     ax2.tick_params(axis='y', labelcolor="tab:red")

@@ -1,7 +1,6 @@
 import jax.numpy as jnp
 from init import Inputs
 from jax import lax
-import jax
 
 ##  Dimensionless Constants 
 def calc_mach(V, a):
@@ -9,7 +8,6 @@ def calc_mach(V, a):
     Computes the Mach number as the ratio of velocity to speed of sound.
     '''
     return V / a
-
 
 def calc_reynolds(rho, V, c, mu):
     ''' 

@@ -128,7 +128,7 @@ def jax_idw_3d_grid(scattered_points, scattered_values, grid_X, grid_Y, power=2.
     return interp_flat.reshape(scattered_values.shape[0], grid_X.shape[0], grid_X.shape[1])
 
 def load_airfoil_data(airfoilname):
-    if Inputs.coeff_method<3:
+    if Inputs.coeff_method<2:
         '''
         Fit 2D Alpha/Reynolds Interpolator
         '''

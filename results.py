@@ -111,11 +111,13 @@ def loadplotprop(propfilename):
     '''
     load and plot a propeller from a saved file
     load_state assumes propellers are contained in the path /propellers
+    TODO: Input/shape matching for default params file
     '''
+  
     params = init.Params.load_state(propfilename)
 
     propinfoplot(params)
 
 
-if "__name__" == "__main__":
-    loadplotprop("params_state")
+if __name__ == "__main__":
+    loadplotprop("prop_params_20260522-1244")

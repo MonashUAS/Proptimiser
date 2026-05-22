@@ -213,14 +213,14 @@ def run_optimization(params_base):
             params_base,
             V_x=Inputs.V_x[0], V_yz=Inputs.V_yz[0], omega=Inputs.omega[0],
             thrust_target=Inputs.thrust_target[0], objective_weight=Inputs.objective_weight[0],
-            objective_thrust=1.0, objective_MIL=1.0, objective_power=0.0,
+            objective_thrust=1.0/Inputs.thrust_target[0], objective_MIL=1.0, objective_power=0.1/5000,
             V_ia_0=jnp.full((Inputs.n_r,), 4.0)
         ),
         replace(
             params_base,
             V_x=Inputs.V_x[1], V_yz=Inputs.V_yz[1], omega=Inputs.omega[1],
             thrust_target=Inputs.thrust_target[1], objective_weight=Inputs.objective_weight[1],
-            objective_thrust=1.0, objective_MIL=1.0, objective_power=0.0,
+            objective_thrust=1.0/Inputs.thrust_target[1], objective_MIL=1.0, objective_power=0.1/5000,
             V_ia_0=jnp.full((Inputs.n_r,), 4.0)
         )
     ]
@@ -308,11 +308,19 @@ def run_optimization(params_base):
     solve_time = time.time() - start_time
     print(f"\nTotal Solve Time: {solve_time:.2f} seconds")
 
-    # Extract 1D base slice representations of the final geometry arrays to return back to base instance
+    # Extract 1D base slice representations of the final arrays
     final_c = params_struct.c[0]
     final_beta = params_struct.beta[0]
+    final_omega = params_struct.omega[0]
+    final_V_ia_0 = params_struct.V_ia_0[0]
 
-    return replace(params_base, c=final_c, beta=final_beta, error_log=error_log, time_log=time_log)
+    return replace(params_base, 
+                   c=final_c, 
+                   beta=final_beta, 
+                   omega=final_omega,
+                   V_ia_0=final_V_ia_0,
+                   error_log=error_log, 
+                   time_log=time_log)
 
 if __name__ == "__main__":
     # Enable LaTeX formatting for pretty titles
