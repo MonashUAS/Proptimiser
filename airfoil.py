@@ -136,7 +136,17 @@ def load_airfoil_data(airfoilname):
         if not files:
             raise FileNotFoundError(f"No CSVs for {airfoilname}")
 
-        alpha_grid = jnp.linspace(-jnp.pi, jnp.pi, 500)
+        # Define regions of interest (in degrees, then convert to radians)
+        alpha_deg = jnp.concatenate([
+            jnp.linspace(-180, -30, 10),    # Deep negative stall (Coarse)
+            jnp.linspace(-29, -12, 8),     # Negative stall transition (Medium)
+            jnp.linspace(-11, 15, 27),     # Linear lift & Positive Stall (Fine: ~1 deg spacing)
+            jnp.linspace(16, 35, 10),      # Post-stall recovery (Medium)
+            jnp.linspace(36, 180, 11)      # Deep positive stall (Coarse)
+        ])
+
+        # Remove any accidental duplicates at the boundaries and sort
+        alpha_grid = jnp.unique(jnp.radians(alpha_deg))
         raw_data = []
         
         # Analytical Constants
@@ -222,7 +232,17 @@ def load_airfoil_data(airfoilname):
         if not files:
             raise FileNotFoundError(f"No CSVs found for 3D interpolation in airfoils/{airfoilname}/Polars/")
 
-        alpha_grid = jnp.linspace(-jnp.pi, jnp.pi, 500)
+        # Define regions of interest (in degrees, then convert to radians)
+        alpha_deg = jnp.concatenate([
+            jnp.linspace(-180, -30, 10),    # Deep negative stall (Coarse)
+            jnp.linspace(-29, -12, 8),     # Negative stall transition (Medium)
+            jnp.linspace(-11, 15, 27),     # Linear lift & Positive Stall (Fine: ~1 deg spacing)
+            jnp.linspace(16, 35, 10),      # Post-stall recovery (Medium)
+            jnp.linspace(36, 180, 11)      # Deep positive stall (Coarse)
+        ])
+
+        # Remove any accidental duplicates at the boundaries and sort
+        alpha_grid = jnp.unique(jnp.radians(alpha_deg))
         raw_data = []
 
         # Background Analytical Model (Flat Plate)

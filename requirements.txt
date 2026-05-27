@@ -10,3 +10,4 @@ jaxopt
 optax
 scipy
 equinox
+interpax

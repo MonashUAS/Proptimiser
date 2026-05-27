@@ -131,7 +131,9 @@ def prandtl_tip_loss(V_ia, params):
     R = jnp.max(r)
     phi = jnp.abs(resultantVelocityComponents(V_ia, params)[1]) # get only second output
 
-    f_tip = B/2 * (R - r[:, None]) / (r[:, None] * jnp.sin(phi))
+    sin_phi = jnp.maximum(jnp.sin(phi), 1e-8)   # safeguard against div by zero
+
+    f_tip = B/2 * (R - r[:, None]) / (r[:, None] * sin_phi)
     
     # exp(-f_tip) can exceed 1.0 slightly due to floating point error, we 
     # need to clip this to guarantee that arccos functions as expected
@@ -156,7 +158,9 @@ def prandtl_root_loss(V_ia, params):
     R_hub = jnp.min(r)
     phi = jnp.abs(resultantVelocityComponents(V_ia, params)[1]) # get only second output
 
-    f_root = B/2 * (r[:, None] - R_hub) / (r[:, None] * jnp.sin(phi) + eps) 
+    sin_phi = jnp.maximum(jnp.sin(phi), 1e-8)   # safeguard against div by zero
+
+    f_root = B/2 * (r[:, None] - R_hub) / (r[:, None] * sin_phi) 
     
     # exp(-f_root) can exceed 1.0 slightly due to floating point error, we 
     # need to clip this to guarantee that arccos functions as expected

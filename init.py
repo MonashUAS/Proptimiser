@@ -16,29 +16,32 @@ class Inputs(eqx.Module):
     ## Optimisation / design settings which remain constant during execution
     # Outer-loop Optimisation (L-BFGS or ADAM)
     opt_solver: str = "L-BFGS-B" # Toggle Optimisation Loop (type of optimisation algorithm.)
-    opt_max_iter: int = 40  
+    opt_smoothing: str = "bezier"
+    opt_max_iter: int = 200 
     opt_tol: float = 1e-2   # Optimiser Stability Criteria
-    opt_weights: int = 2    # Number of Weights for the Cost Function
 
     # Induced Velocity Settings
-    V_ia_0_max_iter: int = 50
-    V_ia_0_eps: float = 5e-2
+    V_ia_0_max_iter: int = 100
+    V_ia_0_eps: float = 1e-3
 
     # Omega Solver Settings
-    omega_max_iter: int = 20
-    omega_eps: float = 5e-2
+    omega_max_iter: int = 100
+    omega_eps: float = 1e-3
 
     # Solver Type (Thrust Constraint)
     solvertype: str = "T"
 
     ## Discretisation settings
     # Radial discretisation
-    n_r: int = 15
+    n_r: int = 25
     # Azimuthal discretisation (for skewed inflow)
-    n_psi: int = 6
+    n_psi: int = 16
+    # Number of Control Points
+    n_cp: int = 8
 
     # diagnostics/debugging
     verbose: bool = False
+    jax_tracing: bool = False
 
     ## Input Parameters
     # Geometry Setup (universal across propeller)
@@ -46,14 +49,14 @@ class Inputs(eqx.Module):
     R_hub = 0.025
 
     ## --- FLIGHT CONDITIONS (Batched as Arrays) ---
-    # Index 0: Hover | Index 1: Forward Flight
-    thrust_target = jnp.array([22.0, 30.0])
+    # Index 0: Hover | Index 1: Forward Flight | etc...            
+    thrust_target = jnp.array([29.6])
     
-    V_x = jnp.array([0.0, 0.0])
-    V_yz = jnp.array([10.0, 0.0])
-    omega= jnp.array([640.0, 640.0])
+    V_x = jnp.array([8.60])
+    V_yz = jnp.array([12.29])
+    omega= jnp.array([640.0])
     
-    objective_weight = jnp.array([0.7, 0.3])
+    objective_weight = jnp.array([1])
 
     # Motor Information
     I_0: float = 0.7           # Zero Load Current (amps)
@@ -62,7 +65,7 @@ class Inputs(eqx.Module):
 
     # Aerodynamic Models Selection
     inflow_model: int = 1 # 0 = basic, 1 = Pitt & Peters, 2 = DTU (WIP)
-    coeff_method: int = 2 # 0 = parametric, 1 = alpha/reynolds, 2 = alpha/mach/reynolds
+    coeff_method: int = 0 # 0 = parametric, 1 = alpha/reynolds, 2 = alpha/mach/reynolds
     tip_loss_model: int = 1 # 0 = none, 1 = Prandtl
     root_loss_model: int = 1 # 0 = none, 1 = Prandtl
 
@@ -105,6 +108,9 @@ class Params(eqx.Module):
     N: jnp.ndarray          # number of blades
     c: jnp.ndarray          # chord length at radial stations (m)
     beta: jnp.ndarray       # blade twist angle (rad)
+
+    c_cp: jnp.ndarray       # chord control points
+    beta_cp: jnp.ndarray    # twist control points
 
     c_scale: jnp.ndarray    # scale of chord
     beta_scale: jnp.ndarray # scale of angle
@@ -177,18 +183,25 @@ if __name__ == "__main__":
     ## SOLVER SPECS
     airfoil = "arad10"
 
-    c_scale = 0.1                   # Max chord (m)
+    c_scale = 0.2                   # Max chord (m)
     beta_scale = jnp.radians(50)    # Max twist (rad)
 
     # Initial Geometry setup
     psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
     r, dr = propmodel.radial_stops(Inputs.R_tip, Inputs.R_hub, Inputs.n_r)
 
-    init_c = jnp.full((Inputs.n_r,), c_scale/10)
-    init_beta = jnp.full((Inputs.n_r,), beta_scale/10)
+    # Twist distribution starting guess (in degrees): 
+    init_beta_cp = jnp.radians(jnp.array([18.0, 17.0, 15.0, 12.0, 8.0, 4.0, 1.0, 0.0]))
+
+    # Chord distribution (in meters): 
+    init_c_cp = jnp.array([0.03, 0.05, 0.07, 0.08, 0.075, 0.06, 0.04, 0.02])
 
     # Interpolate airfoil data
     airfoil_interp = load_airfoil_data("arad10")
+
+    spline_matrix_init = proptimiser.get_bezier_basis_matrix(r, Inputs.R_hub, Inputs.R_tip, Inputs.n_cp)
+    init_c = jnp.dot(init_c_cp, spline_matrix_init.T)
+    init_beta = jnp.dot(init_beta_cp, spline_matrix_init.T)
 
     # Initialise Params Class (will be duplicated for inputs in run_optimisation)
     params_init = Params(
@@ -197,6 +210,8 @@ if __name__ == "__main__":
         N=2,
         c=init_c,      
         beta=init_beta,
+        c_cp=init_c_cp,
+        beta_cp=init_beta_cp,
         r=r, dr=dr,    
         psi=psi, dpsi=dpsi, 
         V_x=jnp.array([Inputs.V_x[0]]), V_yz=jnp.array([Inputs.V_yz[0]]),
@@ -210,16 +225,27 @@ if __name__ == "__main__":
         # Cost Weights
         objective_thrust=jnp.array([1.0/Inputs.thrust_target[0]]),
         objective_MIL=jnp.array([1.0]),
-        objective_power=jnp.array([0.1/5000]),
+        objective_power=jnp.array([0.1/500]),
         objective_weight=Inputs.objective_weight,
         thrust_target=Inputs.thrust_target,
         
     )
 
     print(f"Initialised Airfoil Fit with airfoil {params_init.airfoil}")
-
+    if Inputs.jax_tracing:
+        print("Starting Profiler...")
+        # This will create a directory called /tmp/jax_trace (or a folder of your choice)
+        jax.profiler.start_trace("/tmp/jax_trace")
+        
     # Run Optimiser
     params_opt_hover = proptimiser.run_optimization(params_init)
+    
+    if Inputs.jax_tracing:
+        # Block until all asynchronous JAX operations finish
+        jax.block_until_ready(params_opt_hover) 
+        
+        jax.profiler.stop_trace()
+        print("Profiler stopped. Trace saved to /tmp/jax_trace")
 
     # Save Results/Export Geometry if Required
     user_input = input('Save Propeller? (y/n): ')
@@ -248,30 +274,7 @@ if __name__ == "__main__":
 
     ## Check interpolated plot
     import numpy as np
-    from scipy import UnivariateSpline
     import matplotlib.pyplot as plt
-
-    # Extract the optimized arrays and convert back to standard NumPy for use in scipy
-    r_opt = np.array(params_opt_hover.r)
-    c_opt = np.array(params_opt_hover.c)
-    beta_opt = np.array(params_opt_hover.beta)
-
-    # Fit the Smoothing Splines
-    # k=3 sets it as a cubic spline
-    # 's' is the smoothing factor. 
-    # -> s=0 forces it through every point. 
-    # -> Increase 's' gradually until the kinks disappear but the global shape remains.
-    c_spline = UnivariateSpline(r_opt, c_opt, k=3, s=1e-5)
-    beta_spline = UnivariateSpline(r_opt, beta_opt, k=3, s=1e-3)
-
-    # Increase Point Density for CAD export
-    r_splinefit = np.linspace(r_opt.min(), r_opt.max(), 100)
-    c_splinefit = c_spline(r_splinefit)
-    beta_splinefit = beta_spline(r_splinefit)
-
-    # Evaluate how much the spline altered the original data
-    c_max_deviation = np.max(np.abs(c_spline(r_opt) - c_opt))
-    print(f"Max chord smoothing deviation: {c_max_deviation:.4f} m")
 
     # Let the plotting begin
     fig = plt.figure(figsize=(14, 10))

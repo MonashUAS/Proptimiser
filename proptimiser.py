@@ -21,6 +21,22 @@ from init import Params, Inputs
 from airfoil import load_airfoil_data
 import propmodel
 from results import propinfoplot
+from jax.scipy.special import gammaln
+
+# Bezier Curve Function for Smoothing
+
+def jax_comb(n, k):
+    """Continuous binomial coefficient for JAX differentiability."""
+    return jnp.exp(gammaln(n + 1) - gammaln(k + 1) - gammaln(n - k + 1))
+
+def get_bezier_basis_matrix(r, R_hub, R_tip, n_cp):
+    t = (r - R_hub) / (R_tip - R_hub)
+    n = n_cp - 1
+    i = jnp.arange(n + 1)
+    t_expand = t[:, None]
+    binom = jax_comb(n, i)
+    basis = binom * (t_expand ** i) * ((1 - t_expand) ** (n - i))
+    return basis # Shape: (n_r, n_cp)
 
 def minimumInducedLossCost(V_ia_0, scale=1):
     """
@@ -96,9 +112,9 @@ def solve_omega(params):
     Root find the rotational velocity that matches the thrust residual exactly for ONE condition
     '''
     # We turn OFF implicit_diff in jaxopt here because we are manually defining the 1D gradient below!
-    solver = jaxopt.Broyden(fun=omega_thrust_residual, maxiter=Inputs.omega_max_iter, tol=Inputs.omega_eps, implicit_diff=False)
+    omega_thrust_solver = jaxopt.Broyden(fun=omega_thrust_residual, maxiter=Inputs.omega_max_iter, tol=Inputs.omega_eps, implicit_diff=False)
     
-    (omega, info) = solver.run(params.omega, params)
+    (omega, info) = omega_thrust_solver.run(params.omega, params)
     return omega
 
 # Define the Custom Vector Jacobian Product to Prevent NotImplementedErrors
@@ -148,17 +164,43 @@ def cost_fn(params):
 
 
 @jax.jit
-def objectives_fn(opt_vars_scaled, params_list): 
+def objectives_fn(opt_vars_scaled, params_list, spline_matrix): 
     '''
     Vectorized objective function mapping over an ensemble of single-condition Params
     '''
-    # Unpack and Scale Optimisation Variables
-    c_scaled, beta_scaled = opt_vars_scaled
-    c = params_list.c_scale[:, None] * c_scaled[None, :]
-    beta = params_list.beta_scale[:, None] * beta_scaled[None, :]
+    # Unpack Scaled Control Points
+    c_cp_scaled, beta_cp_scaled = opt_vars_scaled
+    
+    var1_scaled, var2_scaled = opt_vars_scaled
+    
+    if Inputs.opt_smoothing == "bezier":
+        c_cp = params_list.c_scale[:, None] * var1_scaled[None, :]
+        beta_cp = params_list.beta_scale[:, None] * var2_scaled[None, :]
+        c = jnp.dot(c_cp, spline_matrix.T)
+        beta = jnp.dot(beta_cp, spline_matrix.T)
+    else:
+        # Direct pointwise variable assignment
+        c = params_list.c_scale[:, None] * var1_scaled[None, :]
+        beta = params_list.beta_scale[:, None] * var2_scaled[None, :]
+        # Keep PyTree structure identical
+        c_cp = params_list.c_cp
+        beta_cp = params_list.beta_cp
 
-    # Update parameters list with new geometry
-    params_list = eqx.tree_at(lambda p: (p.c, p.beta), params_list, (c, beta))
+    # Update parameters list with new geometry and control points
+    params_list = eqx.tree_at(
+        lambda p: (p.c, p.beta, p.c_cp, p.beta_cp), 
+        params_list, 
+        (c, beta, c_cp, beta_cp)
+    )
+
+    
+
+    # Update parameters list with new geometry and control points
+    params_list = eqx.tree_at(
+        lambda p: (p.c, p.beta, p.c_cp, p.beta_cp), 
+        params_list, 
+        (c, beta, c_cp, beta_cp)
+    )
 
     # vmap omega solving over parameters list
     solve_omega_vmap = jax.vmap(solve_omega, in_axes=0)
@@ -176,17 +218,10 @@ def objectives_fn(opt_vars_scaled, params_list):
     # Sum up total scalar cost across conditions, pass the array of updated V_ia_0 states as aux data
     return jnp.sum(costs), aux
 
-def compute_gradient_scales(init_c, init_beta, params_static):
-    '''
-    Scale Gradients of variables using upper bounds
-
-    CURRENTLY DEPRECIATED - JUST USE MAX BOUNDS
-    '''
-    
-    c_scale = 0.1            # Max chord is 0.1m
-    beta_scale = jnp.radians(50)  # Max twist is 50 degrees
-
-    return c_scale, beta_scale
+@jax.jit
+def evaluate_all_conditions(params_struct):
+    vmapped_obj = jax.vmap(objectives, in_axes=0)
+    return vmapped_obj(params_struct)
 
 def run_optimization(params_base):
     '''
@@ -198,35 +233,51 @@ def run_optimization(params_base):
         res_check = propmodel.thrust_residual(params_base.V_ia_0, params_base)
         jax.debug.print("Initial Residuals Check: {dT_res}", dT_res=res_check)
 
-    vars_scaled = (
-        params_base.c / params_base.c_scale,
-        params_base.beta / params_base.beta_scale
-    )
+    # Select optimization variables and bounds based on mode
+    if Inputs.opt_smoothing == "bezier":
+        vars_scaled = (
+            params_base.c_cp / params_base.c_scale,
+            params_base.beta_cp / params_base.beta_scale
+        )
+        bounds = (
+            (jnp.full_like(params_base.c_cp, 1e-4), jnp.full_like(params_base.beta_cp, 0)),
+            (jnp.full_like(params_base.c_cp, 1), jnp.full_like(params_base.beta_cp, 1))
+        )
+    elif Inputs.opt_smoothing == "pointwise":
+        vars_scaled = (
+            params_base.c / params_base.c_scale,
+            params_base.beta / params_base.beta_scale
+        )
+        bounds = (
+            (jnp.full_like(params_base.c, 1e-4), jnp.full_like(params_base.beta, 0)),
+            (jnp.full_like(params_base.c, 1), jnp.full_like(params_base.beta, 1))
+        )
+    else:
+        raise ValueError("Inputs.opt_smoothing must be 'bezier' or 'pointwise'")
 
-    bounds = (
-        (jnp.full_like(params_base.c, 1e-4), jnp.full_like(params_base.beta, 0)),
-        (jnp.full_like(params_base.c, 1), jnp.full_like(params_base.beta, 1))
-    )
+    num_conditions = len(Inputs.V_x)
 
     conditions_list = [
         replace(
             params_base,
-            V_x=Inputs.V_x[0], V_yz=Inputs.V_yz[0], omega=Inputs.omega[0],
-            thrust_target=Inputs.thrust_target[0], objective_weight=Inputs.objective_weight[0],
-            objective_thrust=1.0/Inputs.thrust_target[0], objective_MIL=1.0, objective_power=0.1/5000,
-            V_ia_0=jnp.full((Inputs.n_r,), 4.0)
-        ),
-        replace(
-            params_base,
-            V_x=Inputs.V_x[1], V_yz=Inputs.V_yz[1], omega=Inputs.omega[1],
-            thrust_target=Inputs.thrust_target[1], objective_weight=Inputs.objective_weight[1],
-            objective_thrust=1.0/Inputs.thrust_target[1], objective_MIL=1.0, objective_power=0.1/5000,
+            V_x=Inputs.V_x[i],
+            V_yz=Inputs.V_yz[i],
+            omega=Inputs.omega[i],
+            thrust_target=Inputs.thrust_target[i],
+            objective_weight=Inputs.objective_weight[i],
+            objective_thrust=1.0 / Inputs.thrust_target[i],
+            objective_MIL=1.0,
+            objective_power=0,
             V_ia_0=jnp.full((Inputs.n_r,), 4.0)
         )
+        for i in range(num_conditions)
     ]
     
     # Convert list into a stacked PyTree object that JAX natively unrolls via vmap
     params_struct = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *conditions_list)
+
+    # Set up control point to spline matrix
+    spline_matrix = get_bezier_basis_matrix(params_struct.r[0], Inputs.R_hub, Inputs.R_tip, Inputs.n_cp)
 
     # Start the clock
     start_time = time.time()
@@ -247,80 +298,100 @@ def run_optimization(params_base):
             jit=True
         )
         print("Initialising Solver...")
-        state = solver.init_state(init_params=vars_scaled, bounds=bounds, params_list=params_struct)
-        print(f"{'Iter':<6} | {'Cond':<5} | {'Power':<12} | {'Thrust':<12} | {'T-Err':<12} | {'MIL':<10} | {'OptErr':<11} | {'Time'}")
-        print("-" * 90)
+        state = solver.init_state(init_params=vars_scaled, bounds=bounds, params_list=params_struct, spline_matrix=spline_matrix)
+        print(f"{'Iter':<6} | {'Cond':<5} | {'Omega':<10} | {'Power':<12} | {'Thrust':<12} | {'T-Err':<12} | {'MIL':<10} | {'OptErr':<11} | {'Time'}")
+        print("-" * 103)
+        try:
+            for i in range(Inputs.opt_max_iter): 
+                vars_scaled, state = solver.update(vars_scaled, 
+                                                state=state, 
+                                                bounds=bounds, 
+                                                params_list=params_struct,
+                                                spline_matrix=spline_matrix
+                                                )
+                # state.aux captures the updated tracking profiles (shape: [2, n_r])
+                # We assign them directly back to keep Newton warm-starts efficient
 
-        for i in range(Inputs.opt_max_iter): 
-            vars_scaled, state = solver.update(vars_scaled, 
-                                               state=state, 
-                                               bounds=bounds, 
-                                               params_list=params_struct)
-            # state.aux captures the updated tracking profiles (shape: [2, n_r])
-            # We assign them directly back to keep Newton warm-starts efficient
-
-            # Scale Variables
-            c_scaled, beta_scaled = vars_scaled    
-            c = params_struct.c_scale[:, None] * c_scaled[None, :]
-            beta = params_struct.beta_scale[:, None] * beta_scaled[None, :]
-            # Extract the updated V_ia_0, omega from state.aux and update params_struct
-            V_ia_0, omega = state.aux
-            params_struct = eqx.tree_at(lambda p: (p.c, p.beta, p.omega, p.V_ia_0), params_struct, (c, beta, omega, V_ia_0))
-
-            # Print Statements for this Iteration
-            is_terminal = state.error < Inputs.opt_tol
-            is_checkpoint = (time.time() - print_time > 5) or (i % 5 == 0)
-
-            if is_terminal or is_checkpoint:
-                vmapped_objectives = jax.vmap(objectives, in_axes=0)
-                powers, thrusts, rms_MIL_errs, _ = vmapped_objectives(params_struct)
+                var1_scaled, var2_scaled = vars_scaled    
                 
-                for idx, (pwr, thr, mil) in enumerate(zip(powers, thrusts, rms_MIL_errs)):
-                    t_err = thr - params_struct.thrust_target[idx]
+                if Inputs.opt_smoothing == "bezier":
+                    c_cp = params_struct.c_scale[:, None] * var1_scaled[None, :]
+                    beta_cp = params_struct.beta_scale[:, None] * var2_scaled[None, :]
+                    c = jnp.dot(c_cp, spline_matrix.T)
+                    beta = jnp.dot(beta_cp, spline_matrix.T)
+                else: # pointwise
+                    c = params_struct.c_scale[:, None] * var1_scaled[None, :]
+                    beta = params_struct.beta_scale[:, None] * var2_scaled[None, :]
+                    c_cp = params_struct.c_cp # Pass through dummy CPs to keep eqx.tree_at happy
+                    beta_cp = params_struct.beta_cp
+
+                # Extract the updated V_ia_0, omega from state.aux and update params_struct
+                V_ia_0, omega = state.aux
+                params_struct = eqx.tree_at(
+                    lambda p: (p.c, p.beta, p.c_cp, p.beta_cp, p.omega, p.V_ia_0), 
+                    params_struct, 
+                    (c, beta, c_cp, beta_cp, omega, V_ia_0)
+                )
+
+                # Print Statements for this Iteration
+                is_terminal = state.error < Inputs.opt_tol
+                is_checkpoint = (time.time() - print_time > 5) or (i % 5 == 0)
+
+                if is_terminal or is_checkpoint:
+                    powers, thrusts, rms_MIL_errs, _ = evaluate_all_conditions(params_struct)
                     
-                    # Only print iteration metadata on the first condition row
-                    iter_info = f"{i:<6} |" if idx == 0 else f"{'':<6} |"
-                    opt_err = f"{state.error:<11.3f}" if idx == 0 else f"{'':<11}"
-                    timing = f"{time.time() - iter_time:<4.1f}s" if idx == 0 else ""
+                    for idx, (pwr, thr, mil) in enumerate(zip(powers, thrusts, rms_MIL_errs)):
+                        t_err = thr - params_struct.thrust_target[idx]
+                        omega_cond = omega[idx]
+                        # Only print iteration metadata on the first condition row
+                        iter_info = f"{i:<6} |" if idx == 0 else f"{'':<6} |"
+                        opt_err = f"{state.error:<11.3f}" if idx == 0 else f"{'':<11}"
+                        timing = f"{time.time() - iter_time:<4.1f}s" if idx == 0 else ""
+                        
+                        print(f"{iter_info} C{idx:<3} | {omega_cond:<5.2f} | {pwr:<12.4f} | {thr:<12.4f} | {t_err:<12.4f} | {mil:<10.4f} | {opt_err} | {timing}")
+
+                    print_time = time.time()
                     
-                    print(f"{iter_info} C{idx:<3} | {pwr:<12.4f} | {thr:<12.4f} | {t_err:<12.4f} | {mil:<10.4f} | {opt_err} | {timing}")
+                    if is_terminal:
+                        print(f"\nStopping: Convergence reached at step {i}")
+                        break
 
-                print_time = time.time()
-                
-                if is_terminal:
-                    print(f"\nStopping: Convergence reached at step {i}")
-                    break
+                # Update Error Log, Iter Time
+                error_log = jnp.append(error_log, state.error)
+                time_log = jnp.append(time_log, time.time() - iter_time)
+                iter_time = time.time()
+        except KeyboardInterrupt:
+            print(f"\n[Interrupt] Optimization paused manually by user at iteration {i}.")
+            print("Extracting current state variables and returning progress...")
+        else:
+            # Final terminal backup evaluation if max iterations is hit
+            vmapped_objectives = jax.vmap(objectives, in_axes=0)
+            _, thrusts, _, _ = vmapped_objectives(params_struct)
+            for cond_idx in range(len(thrusts)):
+                err = float(thrusts[cond_idx] - params_struct.thrust_target[cond_idx])
+                print(f"Warning: max iterations reached. Final thrust error [Cond {cond_idx}]: {err:.2e}")
+        
+        # Clock Time of solve
+        solve_time = time.time() - start_time
+        print(f"\nTotal Solve Time: {solve_time:.2f} seconds")
 
-            # Update Error Log, Iter Time
-            error_log = jnp.append(error_log, state.error)
-            time_log = jnp.append(time_log, time.time() - iter_time)
-            iter_time = time.time()
+        # CHANGED: Final return extraction
+        final_c = params_struct.c[0]
+        final_beta = params_struct.beta[0]
+        final_c_cp = params_struct.c_cp[0]          
+        final_beta_cp = params_struct.beta_cp[0]   
+        final_omega = params_struct.omega[0]
+        final_V_ia_0 = params_struct.V_ia_0[0]
 
-    else:
-        # Final terminal backup evaluation if max iterations is hit
-        vmapped_objectives = jax.vmap(objectives, in_axes=0)
-        _, thrusts, _, _ = vmapped_objectives(params_struct)
-        for cond_idx in range(len(thrusts)):
-            err = float(thrusts[cond_idx] - params_struct.thrust_target[cond_idx])
-            print(f"Warning: max iterations reached. Final thrust error [Cond {cond_idx}]: {err:.2e}")
-    
-    # Clock Time of solve
-    solve_time = time.time() - start_time
-    print(f"\nTotal Solve Time: {solve_time:.2f} seconds")
-
-    # Extract 1D base slice representations of the final arrays
-    final_c = params_struct.c[0]
-    final_beta = params_struct.beta[0]
-    final_omega = params_struct.omega[0]
-    final_V_ia_0 = params_struct.V_ia_0[0]
-
-    return replace(params_base, 
-                   c=final_c, 
-                   beta=final_beta, 
-                   omega=final_omega,
-                   V_ia_0=final_V_ia_0,
-                   error_log=error_log, 
-                   time_log=time_log)
+        return replace(params_base, 
+                    c=final_c, 
+                    beta=final_beta, 
+                    c_cp=final_c_cp,               
+                    beta_cp=final_beta_cp,          
+                    omega=final_omega,
+                    V_ia_0=final_V_ia_0,
+                    error_log=error_log, 
+                    time_log=time_log)
 
 if __name__ == "__main__":
     # Enable LaTeX formatting for pretty titles
