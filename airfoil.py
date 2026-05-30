@@ -84,13 +84,13 @@ class AlphaMachReInterpolator:
         # 3D Interpolation (Alpha, Mach, Reynolds)
         Cl = interpax.interp3d(alpha_flat, mach_clipped, log_re_clipped, 
                                self.alpha_grid, self.mach_grid, self.re_grid_log, 
-                               self.cl_grid, method='linear')
+                               self.cl_grid, method='cubic')
         Cd = interpax.interp3d(alpha_flat, mach_clipped, log_re_clipped, 
                                self.alpha_grid, self.mach_grid, self.re_grid_log, 
-                               self.cd_grid, method='linear')
+                               self.cd_grid, method='cubic')
         Cm = interpax.interp3d(alpha_flat, mach_clipped, log_re_clipped, 
                                self.alpha_grid, self.mach_grid, self.re_grid_log, 
-                               self.cm_grid, method='linear')
+                               self.cm_grid, method='cubic')
         return Cl.reshape(input_shape), Cd.reshape(input_shape), Cm.reshape(input_shape)
 
 
@@ -128,6 +128,10 @@ def jax_idw_3d_grid(scattered_points, scattered_values, grid_X, grid_Y, power=2.
     return interp_flat.reshape(scattered_values.shape[0], grid_X.shape[0], grid_X.shape[1])
 
 def load_airfoil_data(airfoilname):
+    '''
+    Loads airfoil data and constructs interpolator function.
+
+    '''
     if Inputs.coeff_method<2:
         '''
         Fit 2D Alpha/Reynolds Interpolator

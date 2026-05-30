@@ -412,7 +412,7 @@ def actuator_disk_power(T, params):
     T is from momentum theory, 
     '''
     rho = params.rho
-    R   = params.R
+    R   = Inputs.R_tip
     V_x = params.V_x # freestream velocity
 
     A = jnp.pi*R**2 # disc area

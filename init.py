@@ -3,7 +3,7 @@ import jax
 jax.config.update("jax_traceback_filtering", "quiet_remove_frames")
 jax.config.update("jax_check_tracer_leaks", "off")
 jax.config.update("jax_disable_jit", False)
-jax.config.update("jax_debug_nans", False)
+jax.config.update("jax_debug_nans", True)
 jax.config.update("jax_enable_x64", True)
 
 # External Imports
@@ -16,9 +16,9 @@ class Inputs(eqx.Module):
     ## Optimisation / design settings which remain constant during execution
     # Outer-loop Optimisation (L-BFGS or ADAM)
     opt_solver: str = "L-BFGS-B" # Toggle Optimisation Loop (type of optimisation algorithm.)
-    opt_smoothing: str = "bezier"
-    opt_max_iter: int = 200 
-    opt_tol: float = 1e-2   # Optimiser Stability Criteria
+    opt_smoothing: str = "pointwise" # pointwise or bezier. Bezier often breaks propeller shape.
+    opt_max_iter: int = 400
+    opt_tol: float = 1e-5   # Optimiser Stability Criteria
 
     # Induced Velocity Settings
     V_ia_0_max_iter: int = 100
@@ -33,7 +33,7 @@ class Inputs(eqx.Module):
 
     ## Discretisation settings
     # Radial discretisation
-    n_r: int = 25
+    n_r: int = 50
     # Azimuthal discretisation (for skewed inflow)
     n_psi: int = 16
     # Number of Control Points
@@ -49,23 +49,24 @@ class Inputs(eqx.Module):
     R_hub = 0.025
 
     ## --- FLIGHT CONDITIONS (Batched as Arrays) ---
+    n_cond: int = 1
     # Index 0: Hover | Index 1: Forward Flight | etc...            
-    thrust_target = jnp.array([29.6])
+    thrust_target = jnp.array([29.6,22.5])
     
-    V_x = jnp.array([8.60])
-    V_yz = jnp.array([12.29])
-    omega= jnp.array([640.0])
+    V_x = jnp.array([8.60,0])
+    V_yz = jnp.array([12.29,0])
+    omega= jnp.array([500.0,400.0])
     
-    objective_weight = jnp.array([1])
+    objective_weight = jnp.array([0.8,0.2])
 
     # Motor Information
     I_0: float = 0.7           # Zero Load Current (amps)
     R_m: float = 0.120         # Coil Resistance   (ohms)
-    k_V: float = 150            # Motor kV          (RPM/Volt)
+    k_V: float = 150           # Motor kV          (RPM/Volt)
 
     # Aerodynamic Models Selection
     inflow_model: int = 1 # 0 = basic, 1 = Pitt & Peters, 2 = DTU (WIP)
-    coeff_method: int = 0 # 0 = parametric, 1 = alpha/reynolds, 2 = alpha/mach/reynolds
+    coeff_method: int = 2 # 0 = parametric, 1 = alpha/reynolds, 2 = alpha/mach/reynolds
     tip_loss_model: int = 1 # 0 = none, 1 = Prandtl
     root_loss_model: int = 1 # 0 = none, 1 = Prandtl
 
@@ -118,12 +119,14 @@ class Params(eqx.Module):
     # Inflow / rotor state
     V_x: jnp.ndarray        # axial inflow velocity (ms^{-1})
     V_yz: jnp.ndarray       # In plane inflow velocity (ms^{-1})
+
     omega: jnp.ndarray      # rotational speed (rad/s)
+    omega_max: jnp.ndarray  # max subsonic omega
 
     # Cost Weights
     objective_thrust: jnp.ndarray
     objective_MIL:  jnp.ndarray     
-    objective_power: jnp.ndarray    # Use MIL instead of power consumption
+    objective_power: jnp.ndarray
     objective_weight: jnp.ndarray 
 
     # Target objective
@@ -142,6 +145,7 @@ class Params(eqx.Module):
     # Aerodynamic Constants
     rho: float = 1.225          # air density (kgm^{-3})
     mu: float = 1.798e-5        # air viscosity (kgm^-1s^-1)
+    a: float = 343.0            # speed of sound (m/s)
 
     def save_state(self, filename: str = "params_state.eqx"):
         """Saves the array parameters to an Equinox file."""
@@ -188,13 +192,14 @@ if __name__ == "__main__":
 
     # Initial Geometry setup
     psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
+    
     r, dr = propmodel.radial_stops(Inputs.R_tip, Inputs.R_hub, Inputs.n_r)
 
     # Twist distribution starting guess (in degrees): 
-    init_beta_cp = jnp.radians(jnp.array([18.0, 17.0, 15.0, 12.0, 8.0, 4.0, 1.0, 0.0]))
+    init_beta_cp = jnp.radians(jnp.array([18.0,16.0,12.0,11.0,6.0,4.0,1.0,0.0]))
 
     # Chord distribution (in meters): 
-    init_c_cp = jnp.array([0.03, 0.05, 0.07, 0.08, 0.075, 0.06, 0.04, 0.02])
+    init_c_cp = jnp.array([0.07,0.09,0.07,0.05,0.04,0.03,0.03,0.02])
 
     # Interpolate airfoil data
     airfoil_interp = load_airfoil_data("arad10")
@@ -215,7 +220,8 @@ if __name__ == "__main__":
         r=r, dr=dr,    
         psi=psi, dpsi=dpsi, 
         V_x=jnp.array([Inputs.V_x[0]]), V_yz=jnp.array([Inputs.V_yz[0]]),
-        omega=jnp.array([Inputs.omega[0]]), 
+        omega=jnp.array([Inputs.omega[0]]),
+        omega_max = Params.a / Inputs.R_tip,
         V_ia_0=jnp.full((Inputs.n_r), 4.0), # Induced Velocity Field guess
         c_scale = c_scale,
         beta_scale = beta_scale,
@@ -223,12 +229,11 @@ if __name__ == "__main__":
         time_log = jnp.array([0]),
 
         # Cost Weights
-        objective_thrust=jnp.array([1.0/Inputs.thrust_target[0]]),
+        objective_thrust=jnp.array([50.0]),
         objective_MIL=jnp.array([1.0]),
-        objective_power=jnp.array([0.1/500]),
+        objective_power=jnp.array([1.0]),
         objective_weight=Inputs.objective_weight,
         thrust_target=Inputs.thrust_target,
-        
     )
 
     print(f"Initialised Airfoil Fit with airfoil {params_init.airfoil}")

@@ -149,13 +149,19 @@ def cost_fn(params):
     ''' 
     Computes cost and returns updated V_ia_0 for exactly ONE condition 
     '''
+    # unpack objectives and induced velocity
     motor_power, thrust, rms_MIL_err, V_ia_0 = objectives(params)
-    
+    # calculate scaled variables
+    thrust_err_rel = (thrust - params.thrust_target)/params.thrust_target
+    # efficiency compared to actuator disk
+    actuator_disk_power = propmodel.actuator_disk_power(params.thrust_target, params)
+    efficiency = motor_power/actuator_disk_power
+
     # Calculate base cost using this condition's specific targets
     cost = (
-        params.objective_thrust * (thrust - params.thrust_target)**2 + 
+        params.objective_thrust * thrust_err_rel**2 + 
         params.objective_MIL * rms_MIL_err**2 + 
-        params.objective_power * motor_power**2
+        params.objective_power * efficiency**2
     )
     
     # Scale by the relative importance weight of this flight condition
@@ -168,52 +174,36 @@ def objectives_fn(opt_vars_scaled, params_list, spline_matrix):
     '''
     Vectorized objective function mapping over an ensemble of single-condition Params
     '''
-    # Unpack Scaled Control Points
-    c_cp_scaled, beta_cp_scaled = opt_vars_scaled
-    
-    var1_scaled, var2_scaled = opt_vars_scaled
+    # Unpack Scaled Control Points    
+    c_scaled, beta_scaled, omega_scaled = opt_vars_scaled
     
     if Inputs.opt_smoothing == "bezier":
-        c_cp = params_list.c_scale[:, None] * var1_scaled[None, :]
-        beta_cp = params_list.beta_scale[:, None] * var2_scaled[None, :]
+        c_cp = params_list.c_scale[:, None] * c_scaled[None, :]
+        beta_cp = params_list.beta_scale[:, None] * beta_scaled[None, :]
         c = jnp.dot(c_cp, spline_matrix.T)
         beta = jnp.dot(beta_cp, spline_matrix.T)
     else:
         # Direct pointwise variable assignment
-        c = params_list.c_scale[:, None] * var1_scaled[None, :]
-        beta = params_list.beta_scale[:, None] * var2_scaled[None, :]
+        c = params_list.c_scale[:, None] * c_scaled[None, :]
+        beta = params_list.beta_scale[:, None] * beta_scaled[None, :]
         # Keep PyTree structure identical
         c_cp = params_list.c_cp
         beta_cp = params_list.beta_cp
 
-    # Update parameters list with new geometry and control points
-    params_list = eqx.tree_at(
-        lambda p: (p.c, p.beta, p.c_cp, p.beta_cp), 
-        params_list, 
-        (c, beta, c_cp, beta_cp)
-    )
-
-    
+    omega = omega_scaled*params_list.omega_max
 
     # Update parameters list with new geometry and control points
     params_list = eqx.tree_at(
-        lambda p: (p.c, p.beta, p.c_cp, p.beta_cp), 
+        lambda p: (p.c, p.beta, p.c_cp, p.beta_cp, p.omega), 
         params_list, 
-        (c, beta, c_cp, beta_cp)
+        (c, beta, c_cp, beta_cp, omega)
     )
-
-    # vmap omega solving over parameters list
-    solve_omega_vmap = jax.vmap(solve_omega, in_axes=0)
-    omega = solve_omega_vmap(params_list)
-
-    # Update parameters list with new rotational speeds
-    params_list = eqx.tree_at(lambda p: p.omega, params_list, omega)
 
     # vmap cost function over parameters list
     cost_fn_vmap = jax.vmap(cost_fn, in_axes=0)
     costs, V_ia_0 = cost_fn_vmap(params_list)
 
-    aux = (V_ia_0, omega)
+    aux = (V_ia_0)
     
     # Sum up total scalar cost across conditions, pass the array of updated V_ia_0 states as aux data
     return jnp.sum(costs), aux
@@ -233,48 +223,51 @@ def run_optimization(params_base):
         res_check = propmodel.thrust_residual(params_base.V_ia_0, params_base)
         jax.debug.print("Initial Residuals Check: {dT_res}", dT_res=res_check)
 
-    # Select optimization variables and bounds based on mode
-    if Inputs.opt_smoothing == "bezier":
-        vars_scaled = (
-            params_base.c_cp / params_base.c_scale,
-            params_base.beta_cp / params_base.beta_scale
-        )
-        bounds = (
-            (jnp.full_like(params_base.c_cp, 1e-4), jnp.full_like(params_base.beta_cp, 0)),
-            (jnp.full_like(params_base.c_cp, 1), jnp.full_like(params_base.beta_cp, 1))
-        )
-    elif Inputs.opt_smoothing == "pointwise":
-        vars_scaled = (
-            params_base.c / params_base.c_scale,
-            params_base.beta / params_base.beta_scale
-        )
-        bounds = (
-            (jnp.full_like(params_base.c, 1e-4), jnp.full_like(params_base.beta, 0)),
-            (jnp.full_like(params_base.c, 1), jnp.full_like(params_base.beta, 1))
-        )
-    else:
-        raise ValueError("Inputs.opt_smoothing must be 'bezier' or 'pointwise'")
-
-    num_conditions = len(Inputs.V_x)
-
     conditions_list = [
-        replace(
+    replace(
             params_base,
             V_x=Inputs.V_x[i],
             V_yz=Inputs.V_yz[i],
             omega=Inputs.omega[i],
             thrust_target=Inputs.thrust_target[i],
             objective_weight=Inputs.objective_weight[i],
-            objective_thrust=1.0 / Inputs.thrust_target[i],
-            objective_MIL=1.0,
-            objective_power=0,
             V_ia_0=jnp.full((Inputs.n_r,), 4.0)
         )
-        for i in range(num_conditions)
+        for i in range(Inputs.n_cond)
     ]
     
     # Convert list into a stacked PyTree object that JAX natively unrolls via vmap
     params_struct = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *conditions_list)
+
+    # Define optimisation variables and bounds
+    if Inputs.opt_smoothing == "bezier":
+        vars_scaled = (
+            params_base.c_cp / params_base.c_scale,
+            params_base.beta_cp / params_base.beta_scale,
+            params_struct.omega / params_base.omega_max # Shape (2,)
+        )
+    elif Inputs.opt_smoothing == "pointwise":
+        vars_scaled = (
+            params_base.c / params_base.c_scale,
+            params_base.beta / params_base.beta_scale,
+            params_struct.omega / params_base.omega_max # Shape (2,)
+        )
+    else:
+        raise ValueError("Inputs.opt_smoothing must be 'bezier' or 'pointwise'")
+
+    lower_bounds = (
+        jnp.full_like(vars_scaled[0], 1e-4),
+        jnp.full_like(vars_scaled[1], 0.0),
+        jnp.full_like(vars_scaled[2], 300/params_base.omega_max)
+    )
+    
+    upper_bounds = (
+        jnp.full_like(vars_scaled[0], 1.0),
+        jnp.full_like(vars_scaled[1], 1.0),
+        jnp.full_like(vars_scaled[2], 1.0)
+    )
+    
+    bounds = (lower_bounds, upper_bounds)
 
     # Set up control point to spline matrix
     spline_matrix = get_bezier_basis_matrix(params_struct.r[0], Inputs.R_hub, Inputs.R_tip, Inputs.n_cp)
@@ -312,21 +305,22 @@ def run_optimization(params_base):
                 # state.aux captures the updated tracking profiles (shape: [2, n_r])
                 # We assign them directly back to keep Newton warm-starts efficient
 
-                var1_scaled, var2_scaled = vars_scaled    
+                c_scaled, beta_scaled, omega_scaled = vars_scaled
+                omega = params_struct.omega_max * omega_scaled
                 
                 if Inputs.opt_smoothing == "bezier":
-                    c_cp = params_struct.c_scale[:, None] * var1_scaled[None, :]
-                    beta_cp = params_struct.beta_scale[:, None] * var2_scaled[None, :]
+                    c_cp = params_struct.c_scale[:, None] * c_scaled[None, :]
+                    beta_cp = params_struct.beta_scale[:, None] * beta_scaled[None, :]
                     c = jnp.dot(c_cp, spline_matrix.T)
                     beta = jnp.dot(beta_cp, spline_matrix.T)
                 else: # pointwise
-                    c = params_struct.c_scale[:, None] * var1_scaled[None, :]
-                    beta = params_struct.beta_scale[:, None] * var2_scaled[None, :]
+                    c = params_struct.c_scale[:, None] * c_scaled[None, :]
+                    beta = params_struct.beta_scale[:, None] * beta_scaled[None, :]
                     c_cp = params_struct.c_cp # Pass through dummy CPs to keep eqx.tree_at happy
                     beta_cp = params_struct.beta_cp
 
-                # Extract the updated V_ia_0, omega from state.aux and update params_struct
-                V_ia_0, omega = state.aux
+                # Extract the updated V_ia_0 from state.aux and update params_struct
+                V_ia_0 = state.aux
                 params_struct = eqx.tree_at(
                     lambda p: (p.c, p.beta, p.c_cp, p.beta_cp, p.omega, p.V_ia_0), 
                     params_struct, 
