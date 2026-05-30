@@ -11,3 +11,4 @@ optax
 scipy
 equinox
 interpax
+slsqp-jax

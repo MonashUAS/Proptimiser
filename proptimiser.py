@@ -1,17 +1,12 @@
-import jax
-# Set jax debugging
-jax.config.update("jax_traceback_filtering", "quiet_remove_frames")
-jax.config.update("jax_check_tracer_leaks", "off")
-jax.config.update("jax_disable_jit", False)
-jax.config.update("jax_debug_nans", False)
-jax.config.update("jax_enable_x64", True)
-
 # External Imports
+import jax
 import time
 import jax.numpy as jnp
 import jaxopt
 import matplotlib.pyplot as plt
-import scipy.optimize as scipyopt
+from jax.flatten_util import ravel_pytree
+import optimistix as optx
+from slsqp_jax import SLSQP, SLSQPConfig, ToleranceConfig
 from dataclasses import replace
 from jax import lax
 import equinox as eqx
@@ -75,7 +70,6 @@ def motorPower(torque: float, omega: float, I_0: float = 0.7, R_m: float = 0.120
 
     return P_in
 
-@jax.jit
 def objectives(params):
     '''
     Return the Base Objective Values of the Solver given an input of parameters
@@ -92,58 +86,6 @@ def objectives(params):
 
     # Return V_ia_0 so we can catch it!
     return motor_power, thrust, rms_MIL_err, V_ia_0 
-
-def omega_thrust_residual(omega_guess, params):
-    '''
-    Calculate thrust residual for Given Parameters and a guess of omega
-
-    Returns:
-        thrust_residual: current thrust residual for given parameters and rotational speed
-    '''
-    params = eqx.tree_at(lambda p: p.omega, params, omega_guess)
-    V_ia, _ = propmodel.induced_velocity(params)
-    thrust = propmodel.thrust(V_ia, params)
-
-    return thrust-params.thrust_target
-
-@jax.custom_vjp
-def solve_omega(params):
-    '''
-    Root find the rotational velocity that matches the thrust residual exactly for ONE condition
-    '''
-    # We turn OFF implicit_diff in jaxopt here because we are manually defining the 1D gradient below!
-    omega_thrust_solver = jaxopt.Broyden(fun=omega_thrust_residual, maxiter=Inputs.omega_max_iter, tol=Inputs.omega_eps, implicit_diff=False)
-    
-    (omega, info) = omega_thrust_solver.run(params.omega, params)
-    return omega
-
-# Define the Custom Vector Jacobian Product to Prevent NotImplementedErrors
-def solve_omega_fwd(params):
-    # Forward pass: Return the primal omega, and save (omega, params) for the backward pass
-    omega = solve_omega(params)
-    return omega, (omega, params)
-
-def solve_omega_bwd(res, g):
-    # Backward pass: Calculate exact 1D implicit differentiation
-    omega, params = res
-    
-    # Derivative of residual w.r.t omega (a simple scalar)
-    dR_domega = jax.grad(omega_thrust_residual, argnums=0)(omega, params)
-    
-    # Prevent division by zero if gradient goes flat
-    dR_domega = jnp.where(jnp.abs(dR_domega) < 1e-10, 1e-10, dR_domega)
-    
-    # Scale the incoming outer gradient (g) by the implicit function theorem
-    scalar_factor = -g / dR_domega
-    
-    # Pull the scaled gradient back through the parameters structure
-    _, vjp_params = jax.vjp(lambda p: omega_thrust_residual(omega, p), params)
-    grad_params = vjp_params(scalar_factor)[0]
-    
-    return (grad_params,)
-
-# Bind the custom forward and backward passes to the solver
-solve_omega.defvjp(solve_omega_fwd, solve_omega_bwd)
 
 def cost_fn(params):
     ''' 
@@ -168,8 +110,6 @@ def cost_fn(params):
     weighted_cost = cost * params.objective_weight
     return weighted_cost, V_ia_0
 
-
-@jax.jit
 def objectives_fn(opt_vars_scaled, params_list, spline_matrix): 
     '''
     Vectorized objective function mapping over an ensemble of single-condition Params
@@ -177,18 +117,12 @@ def objectives_fn(opt_vars_scaled, params_list, spline_matrix):
     # Unpack Scaled Control Points    
     c_scaled, beta_scaled, omega_scaled = opt_vars_scaled
     
-    if Inputs.opt_smoothing == "bezier":
-        c_cp = params_list.c_scale[:, None] * c_scaled[None, :]
-        beta_cp = params_list.beta_scale[:, None] * beta_scaled[None, :]
-        c = jnp.dot(c_cp, spline_matrix.T)
-        beta = jnp.dot(beta_cp, spline_matrix.T)
-    else:
-        # Direct pointwise variable assignment
-        c = params_list.c_scale[:, None] * c_scaled[None, :]
-        beta = params_list.beta_scale[:, None] * beta_scaled[None, :]
-        # Keep PyTree structure identical
-        c_cp = params_list.c_cp
-        beta_cp = params_list.beta_cp
+    # Direct pointwise variable assignment
+    c = params_list.c_scale[:, None] * c_scaled[None, :]
+    beta = params_list.beta_scale[:, None] * beta_scaled[None, :]
+    # Keep PyTree structure identical
+    c_cp = params_list.c_cp
+    beta_cp = params_list.beta_cp
 
     omega = omega_scaled*params_list.omega_max
 
@@ -208,10 +142,108 @@ def objectives_fn(opt_vars_scaled, params_list, spline_matrix):
     # Sum up total scalar cost across conditions, pass the array of updated V_ia_0 states as aux data
     return jnp.sum(costs), aux
 
+def apply_vars_to_struct(vars_scaled, params_struct, spline_matrix):
+    """
+    Helper function to apply scaled variables to the batched parameter structure.
+    """
+    c_scaled, beta_scaled, omega_scaled = vars_scaled
+    
+    # Direct pointwise variable assignment
+    c = params_struct.c_scale[:, None] * c_scaled[None, :]
+    beta = params_struct.beta_scale[:, None] * beta_scaled[None, :]
+    c_cp = params_struct.c_cp
+    beta_cp = params_struct.beta_cp
+
+    omega = omega_scaled * params_struct.omega_max
+
+    # Update parameters list with new geometry and control points
+    return replace(params_struct, c=c, beta=beta, c_cp=c_cp, beta_cp=beta_cp, omega=omega)
+
+def slsqp_objective(vars_scaled, params_struct, spline_matrix):
+    '''
+    Pure performance cost function (Power & MIL) for the slsqp solver.
+    '''
+    # Debug: Print shapes of input variables
+    jax.debug.print("Objective - vars_scaled shapes: {x}", 
+                    x=jax.tree_util.tree_map(jnp.shape, vars_scaled))
+
+    # Pass PyTree directly to the struct applier
+    params_updated = apply_vars_to_struct(vars_scaled, params_struct, spline_matrix)
+    
+    # Evaluate objectives across all conditions
+    motor_power, _, rms_MIL_err, _ = evaluate_all_conditions(params_updated)
+    
+    # Debug: Print shape of outputs
+    jax.debug.print("Objective - motor_power shape: {m}, rms_MIL_err shape: {r}", 
+                    m=jnp.shape(motor_power), r=jnp.shape(rms_MIL_err))
+
+    # Calculate efficiency compared to actuator disk
+    actuator_disk_power = jax.vmap(propmodel.actuator_disk_power)(params_updated.thrust_target, params_updated)
+    efficiency = motor_power / actuator_disk_power
+    
+    # Optimize strictly for power efficiency and minimum induced loss
+    cost = (
+        params_updated.objective_MIL * rms_MIL_err**2 + 
+        params_updated.objective_power * efficiency**2
+    )
+    
+    # Scale by the relative importance weight of this flight condition
+    weighted_cost = cost * params_updated.objective_weight
+    
+    total_cost = jnp.sum(weighted_cost)
+    jax.debug.print("Objective - final cost shape: {s}", s=jnp.shape(total_cost))
+    
+    return total_cost
+
+def slsqp_eq_constraints(vars_scaled, params_struct, spline_matrix):
+    '''
+    Equality constraints for slsqp-jax. Returns an array of relative thrust errors.
+    '''
+    # Debug: Print shapes of input variables
+    jax.debug.print("Constraint - vars_scaled shapes: {x}", 
+                    x=jax.tree_util.tree_map(jnp.shape, vars_scaled))
+
+    params_updated = apply_vars_to_struct(vars_scaled, params_struct, spline_matrix)
+    
+    # We only need thrust for the constraint
+    _, thrust, _, _ = evaluate_all_conditions(params_updated)
+    
+    # Relative thrust error (Shape: (n_cond,))
+    thrust_err_rel = (thrust - params_updated.thrust_target) / params_updated.thrust_target
+    
+    # Debug: Print shape of constraint output
+    jax.debug.print("Constraint - thrust_err_rel shape: {s}", s=jnp.shape(thrust_err_rel))
+    
+    return thrust_err_rel
+
 @jax.jit
 def evaluate_all_conditions(params_struct):
     vmapped_obj = jax.vmap(objectives, in_axes=0)
     return vmapped_obj(params_struct)
+
+def get_manual_unflatten(c_shape, b_shape, o_shape):
+    """
+    Returns a closure that unflattened flat_x into the required tuple.
+    We pass shapes as arguments to keep the closure clean for JIT.
+    """
+    c_size = int(jnp.prod(jnp.array(c_shape)))
+    b_size = int(jnp.prod(jnp.array(b_shape)))
+    o_size = int(jnp.prod(jnp.array(o_shape)))
+    
+    def manual_unflatten(flat_x):
+        # 1. Pointer arithmetic for slicing
+        # Ensure we are working with concrete integers
+        c_end = c_size
+        b_end = c_end + b_size
+        
+        # 2. Extract and Reshape
+        c_new = flat_x[:c_end].reshape(c_shape)
+        beta_new = flat_x[c_end:b_end].reshape(b_shape)
+        omega_new = flat_x[b_end:].reshape(o_shape)
+        
+        return (c_new, beta_new, omega_new)
+    
+    return manual_unflatten
 
 def run_optimization(params_base):
     '''
@@ -258,7 +290,7 @@ def run_optimization(params_base):
     lower_bounds = (
         jnp.full_like(vars_scaled[0], 1e-4),
         jnp.full_like(vars_scaled[1], 0.0),
-        jnp.full_like(vars_scaled[2], 300/params_base.omega_max)
+        jnp.full_like(vars_scaled[2], 400/params_base.omega_max)
     )
     
     upper_bounds = (
@@ -282,8 +314,148 @@ def run_optimization(params_base):
     error_log = jnp.array([1.0])
     time_log = jnp.array([0])
 
-    ## Solver Selection - Full solver regime must be specified here since many solvers have different inputs
-    if Inputs.opt_solver == "L-BFGS-B":
+
+    if Inputs.opt_solver == "SLSQP":
+        print("Initialising SciPy SLSQP Solver...")
+        import scipy.optimize as spo
+        import numpy as np
+        from jax.flatten_util import ravel_pytree
+        
+        # 1. FLATTEN STATE AND BOUNDS FOR SCIPY
+        flat_vars, unflatten_fn = ravel_pytree(vars_scaled)
+        flat_lower, _ = ravel_pytree(lower_bounds)
+        flat_upper, _ = ravel_pytree(upper_bounds)
+        
+        # SciPy expects bounds as a list of tuples or a Bounds object
+        bounds_scipy = list(zip(np.array(flat_lower), np.array(flat_upper)))
+        flat_vars_np = np.array(flat_vars, dtype=np.float64)
+
+        # 2. DEFINE MUTABLE CONTAINER FOR PYTHON STATE & WARM-STARTS
+        state_container = {
+            "params_struct": params_struct,
+            "last_jac": None
+        }
+
+        # 3. DEFINE JIT-COMPILED CORE JAX FUNCTIONS
+        @jax.jit
+        def compute_obj_val_and_grad(flat_x, current_params):
+            def f(x):
+                vars_scl = unflatten_fn(x)
+                params_updated = apply_vars_to_struct(vars_scl, current_params, spline_matrix)
+                motor_power, _, rms_MIL_err, final_V_ia_0 = evaluate_all_conditions(params_updated)
+                
+                actuator_disk_power = jax.vmap(propmodel.actuator_disk_power)(params_updated.thrust_target, params_updated)
+                efficiency = motor_power / actuator_disk_power
+                
+                cost = (
+                    params_updated.objective_MIL * rms_MIL_err**2 + 
+                    params_updated.objective_power * efficiency**2
+                )
+                weighted_cost = cost * params_updated.objective_weight
+                total_cost = jnp.sum(weighted_cost)
+                return total_cost, final_V_ia_0
+
+            (cost, final_V_ia_0), grad = jax.value_and_grad(f, has_aux=True)(flat_x)
+            return cost, grad, final_V_ia_0
+
+        @jax.jit
+        def compute_con_val_and_jac(flat_x, current_params):
+            def c_fn(x):
+                vars_scl = unflatten_fn(x)
+                params_updated = apply_vars_to_struct(vars_scl, current_params, spline_matrix)
+                _, thrust, _, final_V_ia_0 = evaluate_all_conditions(params_updated)
+                thrust_err_rel = (thrust - params_updated.thrust_target) / params_updated.thrust_target
+                return thrust_err_rel, final_V_ia_0
+
+            val, final_V_ia_0 = c_fn(flat_x)
+            # Shared graph computation via XLA means c_fn evaluates efficiently here
+            jac = jax.jacobian(lambda x: c_fn(x)[0])(flat_x)
+            return val, jac, final_V_ia_0
+
+        # 4. DEFINE SCIPY-COMPATIBLE WRAPPERS (Converts JAX types to NumPy)
+        def scipy_objective(flat_x_np):
+            flat_x = jnp.array(flat_x_np, dtype=jnp.float64)
+            current_params = state_container["params_struct"]
+            cost, grad, final_V_ia_0 = compute_obj_val_and_grad(flat_x, current_params)
+            
+            # Catch the updated inner-solver state and feed it forward as a warm start
+            state_container["params_struct"] = eqx.tree_at(
+                lambda p: p.V_ia_0, current_params, final_V_ia_0
+            )
+            return float(cost), np.array(grad, dtype=np.float64)
+
+        def scipy_constraint(flat_x_np):
+            flat_x = jnp.array(flat_x_np, dtype=jnp.float64)
+            current_params = state_container["params_struct"]
+            val, jac, final_V_ia_0 = compute_con_val_and_jac(flat_x, current_params)
+            
+            # Sync the warm-start state and cache the Jacobian array 
+            state_container["params_struct"] = eqx.tree_at(
+                lambda p: p.V_ia_0, current_params, final_V_ia_0
+            )
+            state_container["last_jac"] = jac
+            return np.array(val, dtype=np.float64)
+
+        def scipy_constraint_jac(flat_x_np):
+            # Eliminates duplicate execution by returning the pre-cached Jacobian 
+            return np.array(state_container["last_jac"], dtype=np.float64)
+
+        # 5. DEFINE ITERATION CALLBACK FOR LIVE TERMINAL DISPLAY
+        iteration_counter = [0]
+        print(f"\n{'Iter':<5} | {'Cond':<5} | {'Omega':<10} | {'Power':<12} | {'Thrust':<12} | {'T-Err':<12} | {'MIL':<10} | {'Time'}")
+        print("-" * 90)
+
+        def scipy_callback(xk):
+            iteration_counter[0] += 1
+            flat_x = jnp.array(xk, dtype=jnp.float64)
+            current_params = state_container["params_struct"]
+            vars_scl = unflatten_fn(flat_x)
+            params_updated = apply_vars_to_struct(vars_scl, current_params, spline_matrix)
+            
+            powers, thrusts, rms_MIL_errs, _ = evaluate_all_conditions(params_updated)
+            
+            for idx, (pwr, thr, mil) in enumerate(zip(powers, thrusts, rms_MIL_errs)):
+                t_err = thr - params_updated.thrust_target[idx]
+                omega_cond = params_updated.omega[idx]
+                iter_str = f"{iteration_counter[0]:<5}" if idx == 0 else f"{'':<5}"
+                timing = f"{time.time() - start_time:<4.1f}s" if idx == 0 else ""
+                print(f"{iter_str} | C{idx:<3} | {omega_cond:<10.2f} | {pwr:<12.4f} | {thr:<12.4f} | {t_err:<12.4f} | {mil:<10.4f} | {timing}")
+            print("-" * 90)
+
+        # 6. EXECUTE SCIPY MINIMIZATION
+        constraints = [
+            {
+                'type': 'eq',
+                'fun': scipy_constraint,
+                'jac': scipy_constraint_jac
+            }
+        ]
+
+        res = spo.minimize(
+            fun=scipy_objective,
+            x0=flat_vars_np,
+            method='SLSQP',
+            jac=True,  # Tells SciPy that scipy_objective returns (cost, grad)
+            bounds=bounds_scipy,
+            constraints=constraints,
+            callback=scipy_callback,
+            options={'maxiter': Inputs.opt_max_iter, 'ftol': Inputs.opt_tol}
+        )
+
+        # 7. RECONSTRUCT THE PYTREE RESULTS FROM THE FINAL SCIPY STATE
+        final_flat_vars = jnp.array(res.x)
+        vars_scaled_opt = unflatten_fn(final_flat_vars)
+        
+        params_struct = state_container["params_struct"]
+        params_struct = apply_vars_to_struct(vars_scaled_opt, params_struct, spline_matrix)
+        
+        powers, thrusts, rms_MIL_errs, final_V_ia_0 = evaluate_all_conditions(params_struct)
+        params_struct = eqx.tree_at(lambda p: p.V_ia_0, params_struct, final_V_ia_0)
+        
+        print(f"\nOptimization Complete. Status: {res.message}")
+        time_log = jnp.append(time_log, time.time() - start_time)
+
+    elif Inputs.opt_solver == "L-BFGS-B":
         solver = jaxopt.LBFGSB(
             fun=objectives_fn, 
             has_aux=True,
@@ -369,23 +541,23 @@ def run_optimization(params_base):
         solve_time = time.time() - start_time
         print(f"\nTotal Solve Time: {solve_time:.2f} seconds")
 
-        # CHANGED: Final return extraction
-        final_c = params_struct.c[0]
-        final_beta = params_struct.beta[0]
-        final_c_cp = params_struct.c_cp[0]          
-        final_beta_cp = params_struct.beta_cp[0]   
-        final_omega = params_struct.omega[0]
-        final_V_ia_0 = params_struct.V_ia_0[0]
+    # return optimised variables
+    final_c = params_struct.c[0]
+    final_beta = params_struct.beta[0]
+    final_c_cp = params_struct.c_cp[0]          
+    final_beta_cp = params_struct.beta_cp[0]   
+    final_omega = params_struct.omega[0]
+    final_V_ia_0 = params_struct.V_ia_0[0]
 
-        return replace(params_base, 
-                    c=final_c, 
-                    beta=final_beta, 
-                    c_cp=final_c_cp,               
-                    beta_cp=final_beta_cp,          
-                    omega=final_omega,
-                    V_ia_0=final_V_ia_0,
-                    error_log=error_log, 
-                    time_log=time_log)
+    return replace(params_base, 
+                c=final_c, 
+                beta=final_beta, 
+                c_cp=final_c_cp,               
+                beta_cp=final_beta_cp,          
+                omega=final_omega,
+                V_ia_0=final_V_ia_0,
+                error_log=error_log, 
+                time_log=time_log)
 
 if __name__ == "__main__":
     # Enable LaTeX formatting for pretty titles
