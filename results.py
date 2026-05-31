@@ -3,10 +3,15 @@
 # External Imports
 import numpy as np
 import matplotlib.pyplot as plt
+import jax
+import jax.numpy as jnp
+
 
 # Internal Imports
 import propmodel
 import init
+import geometry
+
 def propinfoplot(params, show=True):
     '''
     Plot Propeller Solve Info, Including Geometry, Solver Info,
@@ -107,17 +112,137 @@ def propinfoplot(params, show=True):
         plt.show()
     return fig
 
-def loadplotprop(propfilename):
+def is_serialisable_leaf(x):
     '''
-    load and plot a propeller from a saved file
-    load_state assumes propellers are contained in the path /propellers
-    TODO: Input/shape matching for default params file
+    Determines if a PyTree leaf is a data type that Equinox serialises by default.
     '''
-  
-    params = init.Params.load_state(propfilename)
+    if isinstance(x, (jax.Array, np.ndarray, bool, int, float, complex)):
+        return True
+    return False
 
-    propinfoplot(params)
+def load_perfect_skeleton(filename, base_skeleton):
+    '''
+    Reads an .eqx file to discover the exact shapes of stored arrays,
+    then updates a dummy base_skeleton PyTree to match those shapes perfectly,
+    skipping non-serialisable configuration fields like strings or functions.
+    '''
+    if not filename.endswith(".eqx"):
+        filename += ".eqx"
+        
+    # 1. Read all array/scalar shapes sequentially from the binary file stream
+    file_shapes = []
+    with open("propellers/"+filename, "rb") as f:
+        while True:
+            try:
+                # np.load automatically advances the file pointer across saved entries
+                arr = np.load(f)
+                file_shapes.append(arr.shape)
+            except Exception:
+                break
+
+    # 2. Flatten the dummy skeleton to get its structural blueprint
+    dummy_leaves, treedef = jax.tree_util.tree_flatten(base_skeleton)
+
+    # 3. Match file shapes ONLY to fields Equinox actually serialises
+    perfect_leaves = []
+    file_idx = 0
+    
+    for leaf in dummy_leaves:
+        if is_serialisable_leaf(leaf):
+            if file_idx >= len(file_shapes):
+                raise RuntimeError(
+                    f"Structure mismatch for {filename}: the file contains fewer serialized items "
+                    f"({len(file_shapes)}) than the class definition expects."
+                )
+            shape = file_shapes[file_idx]
+            file_idx += 1
+            
+            # FIX: For 0D scalar shapes, preserve the original Python primitive type (int, float, bool)
+            # so structural configurations (like n_r, n_psi) remain concrete Python constants.
+            if shape == () and isinstance(leaf, (bool, int, float, complex)) and not isinstance(leaf, jax.Array):
+                perfect_leaves.append(type(leaf)(0))
+            else:
+                perfect_leaves.append(jnp.zeros(shape))
+        else:
+            # Leave non-serialisable elements (strings, functions) completely untouched
+            perfect_leaves.append(leaf)
+
+    if file_idx != len(file_shapes):
+        raise RuntimeError(
+            f"Structure mismatch for {filename}: the file contains {len(file_shapes)} serialised items, "
+            f"but the skeleton layout identified {file_idx} serialisable fields."
+        )
+
+    # 4. Reconstruct the perfectly shaped skeleton PyTree
+    perfect_skeleton = jax.tree_util.tree_unflatten(treedef, perfect_leaves)
+    return perfect_skeleton
+
+
+def loadprop(prop_timestamp):
+    '''
+    Load and plot a propeller from saved files using just the timestamp.
+    Automatically detects and handles all array dimensions (including dynamic logs).
+    '''
+    inputs_filename = f"prop_inputs_{prop_timestamp}"
+    params_filename = f"prop_params_{prop_timestamp}"
+
+    # --- 1. Load Inputs ---
+    print(f"Loading {inputs_filename}.eqx...")
+    dummy_inputs = init.Inputs()
+    perfect_inputs_skeleton = load_perfect_skeleton(inputs_filename, dummy_inputs)
+    inputs = perfect_inputs_skeleton.load_state(inputs_filename)
+
+    # --- 2. Load Params ---
+    print(f"Loading {params_filename}.eqx...")
+    
+    # Define a fast dummy airfoil interpolator to bypass slow loading & NaN errors
+    def dummy_airfoil_interp(*args, **kwargs):
+        return jnp.zeros(1), jnp.zeros(1), jnp.zeros(1)
+
+    # Initialize a baseline structure using generic 0D scalar arrays
+    dummy_scalar = jnp.array(0.0)
+    base_params = init.Params(
+        airfoil="arad10",
+        airfoil_interp=dummy_airfoil_interp,
+        N=2,
+        c=dummy_scalar, beta=dummy_scalar, c_cp=dummy_scalar, beta_cp=dummy_scalar,
+        r=dummy_scalar, dr=dummy_scalar, psi=dummy_scalar, dpsi=dummy_scalar,
+        V_x=dummy_scalar, V_yz=dummy_scalar, omega=dummy_scalar, omega_max=0.0,
+        V_ia_0=dummy_scalar, c_scale=0.0, beta_scale=0.0,
+        error_log=dummy_scalar, time_log=dummy_scalar,
+        objective_thrust=dummy_scalar, objective_MIL=dummy_scalar, objective_power=int(1),
+        objective_weight=dummy_scalar, thrust_target=dummy_scalar,
+    )
+
+    # Automatically adapt the base_params structure to match the file's exact shapes
+    perfect_params_skeleton = load_perfect_skeleton(params_filename, base_params)
+    params = perfect_params_skeleton.load_state(params_filename)
+
+    return inputs, params
+
+def iterativesmoothing(params):
+    return params
 
 
 if __name__ == "__main__":
-    loadplotprop("prop_params_20260522-1244")
+    # pass the base name/timestamp
+    timestamp = "20260531-1754"
+    inputs, params = loadprop(timestamp)
+
+    ## Prompts for Data Processing
+    user_input = input("Would you like to plot solver outputs? (y/n) \n")
+    if user_input.lower() == "y":
+        print("Plotting Solver Ouput...")
+        # Plot the results
+        propinfoplot(params)
+
+    user_input = input("Does your propeller need control-point based smoothing? \n")
+
+    user_input = input('Export Propeller Geometry to .pts files? (y/n): \n')
+    if user_input.lower() == 'y':
+        exportname = f"prop_pts_{timestamp}"
+        foilpoints = geometry.upperlowerairfoil(params.airfoil)
+        geometry.ptsfilegenerator(params.r, params.c, params.beta, foilpoints, exportname)
+        print(f'Saving Propeller Geometry to {exportname}.pts')
+
+    

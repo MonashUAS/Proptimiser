@@ -3,7 +3,7 @@ import jax
 jax.config.update("jax_traceback_filtering", "quiet_remove_frames")
 jax.config.update("jax_check_tracer_leaks", "off")
 jax.config.update("jax_disable_jit", False)
-jax.config.update("jax_debug_nans", True)
+jax.config.update("jax_debug_nans", False)
 jax.config.update("jax_enable_x64", True)
 
 # External Imports
@@ -17,19 +17,16 @@ class Inputs(eqx.Module):
     # Outer-loop Optimisation (L-BFGS or ADAM)
     opt_solver: str = "L-BFGS-B" # Toggle Optimisation Loop (type of optimisation algorithm.)
     opt_smoothing: str = "pointwise" # pointwise or bezier. Bezier often breaks propeller shape.
-    opt_max_iter: int = 400
-    opt_tol: float = 1e-5   # Optimiser Stability Criteria
+    opt_max_iter: int = 1000
+    opt_tol: float = 1e-3   # Optimiser Stability Criteria
 
     # Induced Velocity Settings
     V_ia_0_max_iter: int = 100
     V_ia_0_eps: float = 1e-3
 
-    # Omega Solver Settings
-    omega_max_iter: int = 100
-    omega_eps: float = 1e-3
-
-    # Solver Type (Thrust Constraint)
+    # Solver Type
     solvertype: str = "T"
+    solve_omega: int = 0 # 0 for fixed omega, 1 for omega solving
 
     ## Discretisation settings
     # Radial discretisation
@@ -37,7 +34,7 @@ class Inputs(eqx.Module):
     # Azimuthal discretisation (for skewed inflow)
     n_psi: int = 16
     # Number of Control Points
-    n_cp: int = 8
+    n_cp: int = 12
 
     # diagnostics/debugging
     verbose: bool = False
@@ -51,13 +48,13 @@ class Inputs(eqx.Module):
     ## --- FLIGHT CONDITIONS (Batched as Arrays) ---
     n_cond: int = 1
     # Index 0: Hover | Index 1: Forward Flight | etc...            
-    thrust_target = jnp.array([29.6,22.5])
+    thrust_target = jnp.array([22.5])
     
-    V_x = jnp.array([8.60,0])
-    V_yz = jnp.array([12.29,0])
-    omega= jnp.array([500.0,400.0])
+    V_x = jnp.array([0])
+    V_yz = jnp.array([0])
+    omega= jnp.array([400.0])
     
-    objective_weight = jnp.array([0.8,0.2])
+    objective_weight = jnp.array([1.0])
 
     # Motor Information
     I_0: float = 0.7           # Zero Load Current (amps)
@@ -196,10 +193,10 @@ if __name__ == "__main__":
     r, dr = propmodel.radial_stops(Inputs.R_tip, Inputs.R_hub, Inputs.n_r)
 
     # Twist distribution starting guess (in degrees): 
-    init_beta_cp = jnp.radians(jnp.array([18.0,16.0,12.0,11.0,6.0,4.0,1.0,0.0]))
+    init_beta_cp = jnp.radians(jnp.array([18.0,16.0,16.0,16.0,14.0,7.0,7.0,4.0,4.0,4.0,4.0,4.0]))
 
     # Chord distribution (in meters): 
-    init_c_cp = jnp.array([0.07,0.09,0.07,0.05,0.04,0.03,0.03,0.02])
+    init_c_cp = jnp.array([0.05,0.05,0.05,0.05,0.05,0.05,0.04,0.03,0.03,0.03,0.03,0.03])
 
     # Interpolate airfoil data
     airfoil_interp = load_airfoil_data("arad10")
@@ -229,12 +226,13 @@ if __name__ == "__main__":
         time_log = jnp.array([0]),
 
         # Cost Weights
-        objective_thrust=jnp.array([50.0]),
+        objective_thrust=jnp.array([15.0]),
         objective_MIL=jnp.array([1.0]),
-        objective_power=jnp.array([1.0]),
+        objective_power=jnp.array([0.0]),
         objective_weight=Inputs.objective_weight,
         thrust_target=Inputs.thrust_target,
     )
+
 
     print(f"Initialised Airfoil Fit with airfoil {params_init.airfoil}")
     if Inputs.jax_tracing:
@@ -265,7 +263,6 @@ if __name__ == "__main__":
         Inputs().save_state(inputsfile)
     
     user_input = input('Export Propeller Geometry to .pts files? (y/n): ')
-
     if user_input.lower() == 'y':
         exportname = f"prop_pts_{timestamp}"
         foilpoints = geometry.upperlowerairfoil(params_opt_hover.airfoil)
@@ -276,29 +273,3 @@ if __name__ == "__main__":
 
     # Plot Info
     results.propinfoplot(params_opt_hover)
-
-    ## Check interpolated plot
-    import numpy as np
-    import matplotlib.pyplot as plt
-
-    # Let the plotting begin
-    fig = plt.figure(figsize=(14, 10))
-
-    # Optimum Chord & Twist Distribution (Combined)
-    # Chord Distribution
-    ax1 = fig.add_subplot(1, 2, 1)
-    line1 = ax1.plot(r_splinefit, c_splinefit, "o-", markersize=4, color="tab:blue", label=r"Chord ($c$)")
-    ax1.set_title(r"\textbf{Optimum Chord \& Twist Distribution}")
-    ax1.set_ylabel(r"Chord (mm)", color="tab:blue")
-    ax1.set_xlabel(r"Radius ($r$) [mm]")
-    ax1.set_xlim(left=0)
-    ax1.tick_params(axis='y', labelcolor="tab:blue")
-    ax1.grid(True, linestyle='--', alpha=0.6)
-
-    # Beta Distribution
-    ax2 = fig.add_subplot(1, 2, 2)
-    line2 = ax2.plot(r_splinefit, beta_splinefit, 'o-', color="tab:red", markersize=4, label=r"Twist ($\beta$)")
-    ax2.set_xlim(left=0)
-    ax2.set_ylabel(r"Twist ($^\circ$)", color="tab:red")
-    ax2.tick_params(axis='y', labelcolor="tab:red")
-    plt.show()

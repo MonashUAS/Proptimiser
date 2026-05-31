@@ -93,58 +93,6 @@ def objectives(params):
     # Return V_ia_0 so we can catch it!
     return motor_power, thrust, rms_MIL_err, V_ia_0 
 
-def omega_thrust_residual(omega_guess, params):
-    '''
-    Calculate thrust residual for Given Parameters and a guess of omega
-
-    Returns:
-        thrust_residual: current thrust residual for given parameters and rotational speed
-    '''
-    params = eqx.tree_at(lambda p: p.omega, params, omega_guess)
-    V_ia, _ = propmodel.induced_velocity(params)
-    thrust = propmodel.thrust(V_ia, params)
-
-    return thrust-params.thrust_target
-
-@jax.custom_vjp
-def solve_omega(params):
-    '''
-    Root find the rotational velocity that matches the thrust residual exactly for ONE condition
-    '''
-    # We turn OFF implicit_diff in jaxopt here because we are manually defining the 1D gradient below!
-    omega_thrust_solver = jaxopt.Broyden(fun=omega_thrust_residual, maxiter=Inputs.omega_max_iter, tol=Inputs.omega_eps, implicit_diff=False)
-    
-    (omega, info) = omega_thrust_solver.run(params.omega, params)
-    return omega
-
-# Define the Custom Vector Jacobian Product to Prevent NotImplementedErrors
-def solve_omega_fwd(params):
-    # Forward pass: Return the primal omega, and save (omega, params) for the backward pass
-    omega = solve_omega(params)
-    return omega, (omega, params)
-
-def solve_omega_bwd(res, g):
-    # Backward pass: Calculate exact 1D implicit differentiation
-    omega, params = res
-    
-    # Derivative of residual w.r.t omega (a simple scalar)
-    dR_domega = jax.grad(omega_thrust_residual, argnums=0)(omega, params)
-    
-    # Prevent division by zero if gradient goes flat
-    dR_domega = jnp.where(jnp.abs(dR_domega) < 1e-10, 1e-10, dR_domega)
-    
-    # Scale the incoming outer gradient (g) by the implicit function theorem
-    scalar_factor = -g / dR_domega
-    
-    # Pull the scaled gradient back through the parameters structure
-    _, vjp_params = jax.vjp(lambda p: omega_thrust_residual(omega, p), params)
-    grad_params = vjp_params(scalar_factor)[0]
-    
-    return (grad_params,)
-
-# Bind the custom forward and backward passes to the solver
-solve_omega.defvjp(solve_omega_fwd, solve_omega_bwd)
-
 def cost_fn(params):
     ''' 
     Computes cost and returns updated V_ia_0 for exactly ONE condition 
@@ -190,7 +138,7 @@ def objectives_fn(opt_vars_scaled, params_list, spline_matrix):
         c_cp = params_list.c_cp
         beta_cp = params_list.beta_cp
 
-    omega = omega_scaled*params_list.omega_max
+    omega = lax.switch(Inputs.solve_omega, [lambda _: params_list.omega, lambda _: params_list.omega_max * omega_scaled], None)
 
     # Update parameters list with new geometry and control points
     params_list = eqx.tree_at(
@@ -204,8 +152,6 @@ def objectives_fn(opt_vars_scaled, params_list, spline_matrix):
     costs, V_ia_0 = cost_fn_vmap(params_list)
 
     aux = (V_ia_0)
-    
-    # Sum up total scalar cost across conditions, pass the array of updated V_ia_0 states as aux data
     return jnp.sum(costs), aux
 
 @jax.jit
@@ -306,7 +252,8 @@ def run_optimization(params_base):
                 # We assign them directly back to keep Newton warm-starts efficient
 
                 c_scaled, beta_scaled, omega_scaled = vars_scaled
-                omega = params_struct.omega_max * omega_scaled
+                # toggle for omega
+                omega = lax.switch(Inputs.solve_omega, [lambda _: params_struct.omega, lambda _: params_struct.omega_max * omega_scaled], None)
                 
                 if Inputs.opt_smoothing == "bezier":
                     c_cp = params_struct.c_scale[:, None] * c_scaled[None, :]
