@@ -8,6 +8,7 @@ from init import Params, Inputs
 import propmodel
 import airfoil
 import pandas as pd
+from jax import numpy as jnp
 
 from Foil_Interpolators import RationalFunctionInterp, RationalFunction
 from airflow import resultantVelocityComponents, tip_root_loss_factors
@@ -37,45 +38,155 @@ def minimumInducedLossCost(V_ia_0):
 
 
 #Returns the power, thrust error and smoothness penalty
-def base_objective(c, beta, params_static):
-
-    params = replace(params_static, c=c, beta=beta)
-    V_ia, V_ia_0   = propmodel.induced_velocity(params)
+def base_objective_single(c, beta, omega, params_static, thrust_target):
+    """
+    Evaluates propeller performance for ONE flight condition.
+    thrust_target is passed explicitly so hover/cruise can differ.
+    """
+    params = replace(params_static, c=c, beta=beta, omega=omega)
+    V_ia, V_ia_0 = propmodel.induced_velocity(params)
 
     power  = jnp.squeeze(propmodel.mechanicalPower(V_ia, params))
     thrust = jnp.squeeze(propmodel.thrust(V_ia, params))
+    torque = jnp.squeeze(propmodel.torque(V_ia, params))
 
-    thrust_err = thrust - Inputs.thrust
+    thrust_err   = thrust - thrust_target
+    rms_MIL_err  = minimumInducedLossCost(V_ia_0)
 
-    rms_MIL_err = minimumInducedLossCost(V_ia_0)
+    motor_power = motorPower(torque, omega)
 
-    return power, thrust_err, thrust, rms_MIL_err
+    return power, motor_power, thrust_err, thrust, rms_MIL_err, V_ia_0
+
+
+def motorPower(torque: float, speed: float, I_0: float = 0.7, R_m: float = 0.120, K_v: float = 150):
+    """
+    torque: torque of the motor (Nm)
+    speed: rotational rate of the motor (rad/s)
+    I_0: zero load current (A)
+    R_m: Coil resistance (ohms)
+    K_v: motor speed constant (RPM/volt)
+    """
+
+    P_out = torque*speed
+
+    K_t = 60 / (2*jnp.pi*K_v) # Calculate the torque constant (Nm/A)
+
+    I = torque / K_t # calculate the current consumed by the motor
+
+    V = speed*60/(2*jnp.pi) / K_v
+
+    P_in = P_out + R_m * (I+I_0)**2 + V*I_0
+
+    return P_in
 
 
 #Scaled Aug. lagrangian, returns the actual Lagrangian 
-def objective_fn(opt_vars_scaled, params_static, c_scale, beta_scale, scale_MIL_err=0.3, scale_THR_err=15.0, scale_POW_cost=0.01):
+def objective_fn(opt_vars_scaled,
+                params_hover, params_cruise,
+                c_scale, beta_scale,
+                omegas,
+                scale_MIL_err=0.3,
+                scale_THR_err=15.0,
+                scale_POW_cost=0.065,
+                w_hover=0.5,
+                w_cruise=0.5
+                ):
+
     c_scaled, beta_scaled = opt_vars_scaled
-    
-    c = c_scaled*c_scale
-    beta = beta_scaled*beta_scale
+    c = c_scaled * c_scale
+    beta = beta_scaled * beta_scale
 
-    power, thrust_err, _, rms_MIL_err = base_objective(c, beta, params_static)
-    #print(power)
+    #print("Hover case")
+    #Calculate the cost for both hover and cruise conditions. 
+    # Hover cost
+    #omega_hover = determine_speed(opt_vars_scaled, params_hover, c_scale, beta_scale, Inputs.thrust_hover)
+    omega_hover = determine_speed(opt_vars_scaled, params_hover, c_scale, beta_scale, Inputs.thrust_hover, omegas[0])
+    _, pow_h, thr_err_h, _, mil_h, _ = base_objective_single(c, beta, omega_hover, params_hover, Inputs.thrust_hover)
 
-    rms_MIL_err = rms_MIL_err * scale_MIL_err
-    thrust_err = thrust_err * scale_THR_err
-    power_cost = power * scale_POW_cost
+    #print("Cruise case")
+    # Cruise cost
+    #omega_cruise = determine_speed(opt_vars_scaled, params_cruise, c_scale, beta_scale, Inputs.thrust_cruise)
+    omega_cruise = determine_speed(opt_vars_scaled, params_hover, c_scale, beta_scale, Inputs.thrust_hover, omegas[1])
+    _, pow_c, thr_err_c, _, mil_c, _ = base_objective_single(c, beta, omega_cruise, params_cruise, Inputs.thrust_cruise)
 
-    return jnp.sqrt(thrust_err**2 + rms_MIL_err**2 + power_cost**2)
+    cost_h = jnp.sqrt(
+        (thr_err_h*scale_THR_err) ** 2
+        + (mil_h*scale_MIL_err) ** 2
+        + (pow_h*scale_POW_cost) ** 2
+    )
+
+    cost_c = jnp.sqrt(
+        (thr_err_c*scale_THR_err) ** 2
+        + (mil_c*scale_MIL_err) ** 2
+        + (pow_c*scale_POW_cost) ** 2
+    )
+
+    net_cost = w_hover * cost_h + w_cruise * cost_c
+
+    # Weighted combination of cruise/hover
+    return net_cost
+
+
+#Scaled Aug. lagrangian, returns the actual Lagrangian 
+def determine_speed(opt_vars_scaled,
+                    params,
+                    c_scale, beta_scale,
+                    thrust_target,
+                    omega_guess):
+
+    c_scaled, beta_scaled = opt_vars_scaled
+    c = c_scaled * c_scale
+    beta = beta_scaled * beta_scale
+
+    def wrapped_base_objective_function(x):
+        """
+            A wrapper necessary for RPM optimisation, shuffles inputs for base objective function
+        """
+        _, _, thr_err, _, _, _ = base_objective_single(c, beta, x, params, thrust_target)
+
+        return thr_err
+
+    # Newton Solver for Induced Velocity
+    omega = homeRolledRootSolver(wrapped_base_objective_function, lower=omega_guess*0.8, upper=omega_guess*1.2, iters=8)
+
+    # Weighted combination of cruise/hover
+    return omega
+
+
+def homeRolledRootSolver(fun, lower, upper, iters=20):
+        """
+        Home rolled implementation of fixed iteration number bisection method, janky way to implement nested loops without jax crashing out
+        """
+
+        w = 0.33 # Weighting parameter for finding the new A and B, between 0 and 1 inclusive
+
+        A = lower # lower bound
+        B = upper # Upper bound
+        C = (A + B)/2
+        
+        for iteration in range(iters):
+            # Get the residual at A
+            r_A =  fun(A)
+
+            # Get the residual at B
+            r_B = fun(B)
+
+            C = A - r_A*(B - A)/(r_B - r_A)
+
+            A = (A*(1-w) + C*(1+w))/2
+            B = (B*(1-w) + C*(1+w))/2
+
+        return C
 
 
 #Gradient scaling (compute c and beta scales)
 # TODO: FInish implementation of this function or deprecate it
 def compute_gradient_scales(init_c, init_beta, params_static):
-    c_scale    = 500
-    beta_scale = 1
+    c_scale    = 1
+    beta_scale = 20
+    omega_scale = 100
 
-    return c_scale, beta_scale
+    return c_scale, beta_scale, omega_scale
 
 
 def debugPlotting(V_ia_0_new, params):
@@ -151,208 +262,246 @@ def debugPlotting(V_ia_0_new, params):
 
 # Optimisation
 def run_optimization():
-    jax.config.update("jax_enable_x64", True) # Use 64 Bit Precision
+    jax.config.update("jax_enable_x64", True)
 
-    # Geometry setup
     psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
-    r, dr = propmodel.radial_stops(Inputs.tip_diameter/2, Inputs.hub_diameter/2, Inputs.n_r)
-
-    init_c = jnp.linspace(0.030, 0.015, Inputs.n_r)
-    # Linearly decreasing profile to start
-    init_beta = jnp.linspace(jnp.radians(15), jnp.radians(5), Inputs.n_r)
-    
-    print("\n--> Initialising")
-
-    # Define the input tables
-    input_filename = "compiledData-ARAD10.txt"
-
-    # Generate the reynolds and mach lists
-    Re_list = 150000 * jnp.ones(jnp.size(r))
-    Ma_list = 0.15 * jnp.ones(jnp.size(r))
-    Re_list_new = 150000 * jnp.ones(jnp.size(r))
-    Ma_list_new = 0.15 * jnp.ones(jnp.size(r))
-
-    # Generate the interpolators
-    cl_interpolator, cd_interpolator = airfoil.loadAirfoilData(input_filename, Re_list, Ma_list, Inputs.n_r)
-
-    params_static = Params(
-        N=2,
-        R=jnp.max(r),
-        c=init_c[:, None],
-        beta=init_beta[:,None],
-        r=r[:, None], dr=dr,
-        psi=psi[None, :], dpsi=dpsi,
-        V_x=jnp.array([0]), V_yz=jnp.array([0]),
-        omega=jnp.array([8000/60*2*3.14159]), # rad/s
-        V_ia_0 = jnp.full((Inputs.n_r,), jnp.array([4.0])),
-        cdInterpolator=cd_interpolator,
-        clInterpolator=cl_interpolator
+    r,   dr   = propmodel.radial_stops(
+        Inputs.tip_diameter/2, Inputs.hub_diameter/2, Inputs.n_r
     )
 
-    print("\t--> Initialisation complete!")
+    #Initialise chord and beta with linearly decreasing profiles
+    init_c    = jnp.linspace(0.030, 0.015, Inputs.n_r)
+    init_beta = jnp.linspace(jnp.radians(15), jnp.radians(5), Inputs.n_r)
+    
+    # Set an intial guess for the optimum RPMs, one for each case in the optimiser
+    omegas = jnp.array([4300/60*2*jnp.pi, 5000/60*2*jnp.pi])
 
-    P_c = Inputs.Ord_Numerator_c
-    Q_c = Inputs.Ord_Denominator_c
+    input_filename = "compiledData-ARAD10.txt"
 
+    P_c    = Inputs.Ord_Numerator_c
+    Q_c    = Inputs.Ord_Denominator_c
     P_beta = Inputs.Ord_Denominator_beta
     Q_beta = Inputs.Ord_Numerator_beta
 
-    Smoothing_log = Inputs.Smoothing_log
 
+    # Initial Re/Ma guesses per condition (will be updated each iteration)
+    Re_hover = 150000 * jnp.ones(Inputs.n_r)
+    Ma_hover = 0.10   * jnp.ones(Inputs.n_r)
 
-    #Calculate the gradient scales
-    c_scale, beta_scale = compute_gradient_scales(init_c, init_beta, params_static)
+    Re_cruise = 150000 * jnp.ones(Inputs.n_r)
+    Ma_cruise = 0.15   * jnp.ones(Inputs.n_r) #In cruise expected to be slightly higher
 
-    # Scale initial variables
-    vars_scaled = (
-        init_c/c_scale,
-        init_beta/beta_scale
+    cl_h, cd_h = airfoil.loadAirfoilData(input_filename, Re_hover,  Ma_hover,  Inputs.n_r)
+    cl_c, cd_c = airfoil.loadAirfoilData(input_filename, Re_cruise, Ma_cruise, Inputs.n_r)
+
+    # Both conditions share the same propeller geoemtry, 
+    _common = dict(
+        N=2, R=jnp.max(r),
+        c=init_c[:, None], beta=init_beta[:, None],
+        r=r[:, None], dr=dr,
+        psi=psi[None, :], dpsi=dpsi,
     )
 
-    #Bounds (chord + beta pairs) (scaled)
-    bounds = (
-        (
-            jnp.full_like(params_static.c, Inputs.min_chord/c_scale),
-            jnp.full_like(params_static.beta, jnp.radians(Inputs.min_twist) / beta_scale),
-        ),
-        (
-            jnp.full_like(params_static.c, Inputs.max_chord/c_scale),
-            jnp.full_like(params_static.beta, jnp.radians(Inputs.max_twist) / beta_scale),
-        )
+    # Create params object for both cruise and hover. 
+    params_hover = Params(
+        **_common,
+        V_x=jnp.array([Inputs.V_x_hover]),
+        V_yz=jnp.array([Inputs.V_yz_hover]),
+        omega=omegas[0],
+        V_ia_0=jnp.full((Inputs.n_r,), 4.0),
+        clInterpolator=cl_h, cdInterpolator=cd_h,
     )
 
-    #Solver
-    solver = jaxopt.ScipyBoundedMinimize(fun=objective_fn, method="L-BFGS-B", tol=Inputs.opt_tol, maxiter=Inputs.opt_max_iter)
+    params_cruise = Params(
+        **_common,
+        V_x=jnp.array([Inputs.V_x_cruise]),
+        V_yz=jnp.array([Inputs.V_yz_cruise]),
+        omega=omegas[1],
+        V_ia_0=jnp.full((Inputs.n_r,), 2.0),  # cruise has lower inflow perturbation
+        clInterpolator=cl_c, cdInterpolator=cd_c,
+    )
 
-    #Initialise the global best cost variable
+    c_scale, beta_scale, omega_scale = compute_gradient_scales(init_c, init_beta, params_hover)
+
+    c = init_c
+    beta = init_beta
+    #omegas is unchanged
+
+    vars_scaled = (c / c_scale, beta / beta_scale)
+
+    solver = jaxopt.ScipyBoundedMinimize(
+        fun=objective_fn, method="L-BFGS-B",
+        tol=Inputs.opt_tol, maxiter=Inputs.opt_max_iter
+    )
+
     global_best_cost = jnp.inf
-    global_best_c = init_c
-    global_best_beta = init_beta
-    
-    total_iter = Inputs.Iterations_initialising + Inputs.Iterations_blending + Inputs.Iterations_solving
+    global_best_c = c
+    global_best_beta = beta
+
+    total_iter = (
+        Inputs.Iterations_initialising
+        + Inputs.Iterations_blending
+        + Inputs.Iterations_solving
+    )
 
     for i in range(total_iter):
+        print(f"\n--> Running solver (iter {i})")
 
-        print("\n--> Running solver")
+        # Re-establish bounds
+        bounds = (
+            (
+                jnp.full_like(params_hover.c, Inputs.min_chord / c_scale),
+                jnp.full_like(params_hover.beta, jnp.radians(Inputs.min_twist) / beta_scale)
+            ),
+            (
+                jnp.full_like(params_hover.c, Inputs.max_chord / c_scale),
+                jnp.full_like(params_hover.beta, jnp.radians(Inputs.max_twist) / beta_scale)
+            ),
+        )
 
         sol = solver.run(
             vars_scaled,
             bounds=bounds,
-            params_static=params_static,
+            params_hover=params_hover,
+            params_cruise=params_cruise,
             c_scale=c_scale,
+            omegas=omegas,
             beta_scale=beta_scale,
             scale_MIL_err=0.25,
-            scale_THR_err=1.5
+            scale_THR_err=4.5,
+            w_hover=Inputs.w_hover,
+            w_cruise=Inputs.w_cruise,
         )
-        
-        print("\t--> Solver complete!")
-        
+
         vars_scaled = sol.params
+        c      = vars_scaled[0] * c_scale
+        beta   = vars_scaled[1] * beta_scale
 
-        #Unscale C and beta
-        c = vars_scaled[0] * c_scale
-        beta = vars_scaled[1] * beta_scale
+        # Smooth geometry 
+        c_fit    = RationalFunctionInterp(r, jnp.squeeze(c),    P_c,    Q_c,    method='trf')
+        beta_fit = RationalFunctionInterp(r, jnp.squeeze(beta), P_beta, Q_beta, method='trf')
 
-        # Use the foil interpolators to generate rational functions for the chord and beta distribution
-        # Refer to https://www.itl.nist.gov/div898/handbook/pmd/section8/pmd812b.htm for choosing P and Q
-        c_fit_params = RationalFunctionInterp(r, jnp.squeeze(c), P_c, Q_c, verbose=Smoothing_log, extendedChecking=True, method='trf')
-        beta_fit_params = RationalFunctionInterp(r, jnp.squeeze(beta), P_beta, Q_beta, verbose=Smoothing_log, extendedChecking=True, method='trf')
+        c    = RationalFunction(r, list(c_fit[0:P_c]),       list(c_fit[P_c:]))
+        beta = RationalFunction(r, list(beta_fit[0:P_beta]), list(beta_fit[P_beta:]))
 
-        # Use the fit params to calculate smoothed beta and chord distributions
-        c_smoothed = RationalFunction(r, list(c_fit_params[0:P_c]), list(c_fit_params[P_c:len(c_fit_params)]))
-        beta_smoothed = RationalFunction(r, list(beta_fit_params[0:P_beta]), list(beta_fit_params[P_beta:len(beta_fit_params)]))
+        vars_scaled = (c / c_scale, beta / beta_scale)
 
-        c = c_smoothed
-        beta = beta_smoothed
+        # calculate the final RPMs:
+        print("--> Recalculating rotational speeds")
+        omegas = omegas.at[0].set(determine_speed(vars_scaled, params_hover, c_scale, beta_scale, Inputs.thrust_hover, omegas[0]))
+        omegas = omegas.at[1].set(determine_speed(vars_scaled, params_cruise, c_scale, beta_scale, Inputs.thrust_cruise, omegas[1]))
 
-        params_warm = replace(params_static, c=jnp.squeeze(c), beta=jnp.squeeze(beta))
+        for label, params_static, Re_list, Ma_list, omega in [("hover",  params_hover,  Re_hover,  Ma_hover, omegas[0]),
+                                                              ("cruise", params_cruise, Re_cruise, Ma_cruise, omegas[1]),]:
 
-        V_ia_converged, V_ia_0_new = propmodel.induced_velocity(params_warm)
+            params_warm = replace(params_static, c=jnp.squeeze(c), beta=jnp.squeeze(beta))
+            print(f"Calculating with omega = {omega*60/(2*jnp.pi)}RPM")
+            V_ia_conv, V_ia_0_new = propmodel.induced_velocity(params_warm)
 
+            # Re/Ma update
+            V_R, _ = resultantVelocityComponents(V_ia_conv, params_warm)
+            V_R_aved = jnp.mean(V_R, axis=1)
+            Re_new = params_static.rho * c * V_R_aved / params_static.mu
+            Ma_new = V_R_aved / params_static.v_sound
 
-        print("\n--> Regenerating interpolators")
+            cl_interp = params_static.clInterpolator
+            cd_interp = params_static.cdInterpolator
 
-        # Generate the new reynolds and mach lists
-        V_R, _ = resultantVelocityComponents(V_ia_converged, params_warm)
-        V_R_aved = jnp.mean(V_R, axis=1)
-        Re_list_new = params_static.rho * c * V_R_aved / params_static.mu
-        Ma_list_new = V_R_aved / params_static.v_sound
+            for rr in range(Inputs.n_r):
+                re_drift = jnp.abs((Re_new[rr] - Re_list[rr]) / Re_list[rr])
+                ma_drift = jnp.abs(Ma_new[rr] - Ma_list[rr])
+                if re_drift > 0.1 or ma_drift > 0.05:
+                    print(f"  [{label}] Regenerating interpolator at r={rr+1}/{Inputs.n_r}")
+                    Re_list = Re_list.at[rr].set(Re_new[rr])
+                    Ma_list = Ma_list.at[rr].set(Ma_new[rr])
 
-        if (i >= Inputs.Iterations_initialising) and (i <= Inputs.Iterations_initialising + Inputs.Iterations_blending):
-            params_static = replace(params_static, blendingParam = (i - Inputs.Iterations_initialising)/Inputs.Iterations_blending)
+                    cl_p, cd_p = airfoil.loadAirfoilDataSingle(input_filename, Re_list[rr], Ma_list[rr])
+                    
+                    cl_interp = cl_interp.at[rr].set(cl_p)
+                    cd_interp = cd_interp.at[rr].set(cd_p)
 
-        # Generate the interpolators
-        for rr in range(Inputs.n_r):
-            if (jnp.abs((Re_list_new[rr]-Re_list[rr])/Re_list[rr])>0.1) or (jnp.abs(Ma_list_new[rr]-Ma_list[rr])>0.05):
-                print("Regenerating interpolator at radial position " + str(rr+1) + " of " + str(Inputs.n_r))
+            # Write updated state back into the correct params object
+            updated = replace(
+                params_static,
+                c=jnp.squeeze(c), beta=jnp.squeeze(beta), omega=omega,
+                V_ia_0=V_ia_0_new,
+                clInterpolator=cl_interp,
+                cdInterpolator=cd_interp,
+            )
+            if label == "hover":
+                params_hover = updated
+                Re_hover = Re_list
+                Ma_hover = Ma_list
+            else:
+                params_cruise = updated
+                Re_cruise = Re_list
+                Ma_cruise = Ma_list
 
-                Re_list = Re_list.at[rr].set(Re_list_new[rr])
-                Ma_list = Ma_list.at[rr].set(Ma_list_new[rr])
+        # Blending
+        if Inputs.Iterations_initialising <= i <= Inputs.Iterations_initialising + Inputs.Iterations_blending:
+            blend = (i - Inputs.Iterations_initialising) / Inputs.Iterations_blending
+            params_hover  = replace(params_hover,  blendingParam=blend)
+            params_cruise = replace(params_cruise, blendingParam=blend)
 
-                # check if the mach or reynolds has changed more than 10%
-                cl_params, cd_params = airfoil.loadAirfoilDataSingle(input_filename, Re_list[rr], Ma_list[rr])
-                
-                # store the data in the interpolator arrays
-                cl_interpolator = cl_interpolator.at[rr].set(cl_params)
-                cd_interpolator = cd_interpolator.at[rr].set(cd_params)
-
-        params_static = replace(params_static, clInterpolator=cl_interpolator, cdInterpolator=cd_interpolator)
-
-        print("\t--> Interpolators complete!")
-
-
-        params_static = replace(params_static, V_ia_0=V_ia_0_new)
-
-        power, thrust_err, thrust, rms_MIL_err = base_objective(c, beta, params_static)
-
-        #The cost as calculated by the solver (sol.state.fun_val) doesnt capture the smoothed geometry. 
-        current_smoothed_cost = objective_fn(
-            (c / c_scale, beta / beta_scale), 
-            params_static, 
-            c_scale, 
-            beta_scale, 
-            scale_MIL_err=0.25, 
-            scale_THR_err=1.5
+        pow_h, _, thr_err_h, thr_h, mil_h, _ = base_objective_single(
+            c, beta, omegas[0], params_hover, Inputs.thrust_hover
         )
 
-        # Calculate the thrust efficiency
-        thrust_eff = thrust/9.81*1000/power
+        pow_c, _, thr_err_c, thr_c, mil_c, _ = base_objective_single(
+            c, beta, omegas[1],  params_cruise, Inputs.thrust_cruise
+        )
 
-        print("\n")
-        print(f"{'Iter':<6} | {'Power':<12} | {'Thrust (N)':<12} | {'Thrust Err':<12} | {'MIL rms':<10} | {'Smoothed cost':<12} | {'Blending Parameter':<10} | Thrust efficiency (g/W)")
-        print("-" * 90)
-        print(f"{i:<6} | {float(power):<12.4f} | {float(thrust):<12.4f} | {float(thrust_err):<12.4f} | {rms_MIL_err:<10.1f} | {current_smoothed_cost:<13.4f} | {params_static.blendingParam:<18.4f} | {thrust_eff:<20.4f}")
-        print("\n")
+        # Calculate cost to be displayed, ensure scale factors are actually what's being used (consolidate in future!)
+        current_cost = objective_fn(
+            (c / c_scale, beta / beta_scale),
+            params_hover, params_cruise,
+            c_scale, beta_scale, 
+            omegas,
+            scale_MIL_err=0.25, scale_THR_err=1.5,
+            w_hover=Inputs.w_hover, w_cruise=Inputs.w_cruise,
+        )
 
-        vars_scaled = (c/c_scale,beta_smoothed/beta_scale)
+        print(f"\n{'Iter':<5} | {'Cond':<8} | {'Power':>10} | {'Thrust':>10} | {'Thr Err':>10} | {'MIL rms':>10}  | {'Operating point RPM':>10}")
+        print("-" * 65)
+        print(f"{i:<5} | {'hover':<8} | {float(pow_h):>10.3f} | {float(thr_h):>10.3f} | {float(thr_err_h):>10.4f} | {float(mil_h):>10.3f}  | {float(omegas[0]*60/(2*jnp.pi)):>5.3f}")
+        print(f"{i:<5} | {'cruise':<8} | {float(pow_c):>10.3f} | {float(thr_c):>10.3f} | {float(thr_err_c):>10.4f} | {float(mil_c):>10.3f}  | {float(omegas[1]*60/(2*jnp.pi)):>5.3f}")
+        print(f"       Combined cost: {float(current_cost):.5f}  |  Blending: {params_hover.blendingParam:.2f}")
 
-        #Check if current (smoothed) cost is better than global.
-        if current_smoothed_cost <= global_best_cost:
-            global_best_cost = current_smoothed_cost
-            global_best_c = c
+        if current_cost <= global_best_cost:
+            global_best_cost = current_cost
+            global_best_c    = c
             global_best_beta = beta
+            global_best_omegas = omegas
 
-        # Convergence, don't want to prematurely return a solution
-        if abs(thrust_err) < Inputs.eta_tol and params_static.blendingParam == 1:
-            print(f"\nConverged at iteration {i} with thrust error {thrust_err:.2e}")
+        # Converge only when BOTH thrust errors are within tolerance and ensure full CFD data is being used.
+        both_converged = (
+            abs(thr_err_h) < Inputs.eta_tol
+            and abs(thr_err_c) < Inputs.eta_tol
+            and params_hover.blendingParam == 1.0
+        )
+        if both_converged:
+            print(f"\nConverged at iteration {i}")
             break
 
-        #AL update
-
-        if Inputs.interIterationDebug:
-            debugPlotting(V_ia_0_new, params_warm)
-        
     else:
-        print(f"\nWarning: max iterations reached. Final thrust error: {thrust_err:.2e}")
+        print(f"\nWarning: max iterations reached.")
 
-    return replace(params_static, c=global_best_c, beta=global_best_beta)
+    return (
+        replace(params_hover,  c=global_best_c, beta=global_best_beta, omega=global_best_omegas[0]),
+        replace(params_cruise, c=global_best_c, beta=global_best_beta, omega=global_best_omegas[1]),
+    )
 
-#Run + plotting
+#Run + plotting (two plots, one for each condition)
 if __name__ == "__main__":
-    params_opt = run_optimization()
+    params_hover_opt, params_cruise_opt = run_optimization()
 
-    V_ia_converged, V_ia_0_new = propmodel.induced_velocity(params_opt)
-    debugPlotting(V_ia_0_new, params_opt)
+    print("\n--- Hover ---")
+    V_ia_h, V_ia_0_h = propmodel.induced_velocity(params_hover_opt)
+    debugPlotting(V_ia_0_h, params_hover_opt)
+
+    print("\n---Cruise ---")
+    V_ia_c, V_ia_0_c = propmodel.induced_velocity(params_cruise_opt)
+    debugPlotting(V_ia_0_c, params_cruise_opt)
 
     #Propeller geometry files
     upper_points,lower_points = UpperLowerPoints(r"+AirfoilData\ARAD05_half_camber\ARA-D 5% AIRFOIL half camber.dat")

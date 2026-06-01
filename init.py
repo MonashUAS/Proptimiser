@@ -5,11 +5,25 @@ import jax.scipy as jsp
 
 # Freeze configuration parameters at runtime
 class Inputs(eqx.Module):
-    # Optimisation / design settings which remain constant during execution
+    # Optimisation / desig  n settings which remain constant during execution
 
+    # Hover condition 
+    thrust_hover   = 21 # N
+    V_x_hover      = 0.0 # m/s
+    V_yz_hover     = 0.0 # m/s 
+
+    # Cruise condition
+    thrust_cruise  = 23.5 # N 
+    V_x_cruise     = 10.0 # m/s
+    V_yz_cruise    = 0.0 # m/s
+
+    # Multi-objective weighting, balance between achieving hover/cruise optimality 
+    w_hover  = 0.3
+    w_cruise = 0.7
+    
     # ----- Geometric parameters -----
     hub_diameter: float = 0.050 # DIAMETER in meters
-    tip_diameter: float = 0.450 # DIAMETER in meters
+    tip_diameter: float = 0.50 # DIAMETER in meters
 
     # max and min chords in meters
     max_chord: float = 0.050
@@ -21,23 +35,23 @@ class Inputs(eqx.Module):
 
     # ----- Solution parameters -----
     solvertype: str = "T" # Thrust constraint (T) or torque constraint (Q)
-    thrust: float = 100 # Newtons
+    #Thrust targets defined above, under each condition. 
 
-
+    
     # ----- Optimiser parameters -----
     # Newton solver settings
     opt_max_iter: int = 1000
-    opt_tol: float = 1e-2
-    newton_max_iter: int = 100
+    opt_tol: float = 1e-3
+    newton_max_iter: int = 200
     newton_eps: float = 1e-3
 
     #Augmented Lagrangian params
-    eta_tol = 1e-2
+    eta_tol = 1e-3
 
 
     # ----- Discretisation parameters -----
     # Radial discretisation
-    n_r: int = 20
+    n_r: int = 25
     # Azimuthal discretisation (for skewed inflow)
     n_psi: int = 36
 
@@ -50,12 +64,12 @@ class Inputs(eqx.Module):
 
     # ----- Chord and twist smoothing parameters -----
     # Set the highest power in the numerator and denominator of the chord smoothing function
-    Ord_Denominator_c = 4
-    Ord_Numerator_c = 2
-
+    Ord_Numerator_c = 4
+    Ord_Denominator_c = 2
+    
     # Set the highest power in the numerator and denominator of the beta smoothing function
+    Ord_Numerator_beta = 2
     Ord_Denominator_beta = 2
-    Ord_Numerator_beta = 1
 
 
     # ----- Lookup method parameters -----
@@ -66,8 +80,8 @@ class Inputs(eqx.Module):
     
     # Lookup blending steps
     Iterations_initialising: int = 2
-    Iterations_blending: int = 13
-    Iterations_solving: int = 10
+    Iterations_blending: int = 6
+    Iterations_solving: int = 7
     
 
     # ----- Siagnostic and debugging flags -----
@@ -117,35 +131,4 @@ class Params(eqx.Module):
 
     #Blending parameter, ranges between 0->1 (full parametric -> full lookup)
     blend_alpha: float = 0.0
-
-
-
-def blade_design_mask(params: Params):
-    """
-    Mask specifying which Params fields are optimized.
-    True  -> optimized
-    False -> frozen
-    """
-    return Params(
-        # Domain of integration
-        r=False,
-        dr=False,
-        psi=False,
-        dpsi=False,
-
-        # Geometry & discretization (DESIGN VARIABLES)
-        N=False,
-        R=False,
-        c=True,
-        beta=True,
-
-        # Inflow / rotor state
-        V_x=False,
-        V_yz=False,
-        omega=False,
-        V_ia_0=False,
-
-        # Physical properties
-        rho=False
-    )
 
