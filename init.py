@@ -17,19 +17,16 @@ class Inputs(eqx.Module):
     # Outer-loop Optimisation (L-BFGS or ADAM)
     opt_solver: str = "SLSQP" # Toggle Optimisation Loop (type of optimisation algorithm.)
     opt_smoothing: str = "pointwise" # pointwise or bezier. Bezier often breaks propeller shape.
-    opt_max_iter: int = 400
-    opt_tol: float = 1e-5   # Optimiser Stability Criteria
+    opt_max_iter: int = 1000
+    opt_tol: float = 1e-3   # Optimiser Stability Criteria
 
     # Induced Velocity Settings
     V_ia_0_max_iter: int = 100
     V_ia_0_eps: float = 1e-3
 
-    # Omega Solver Settings
-    omega_max_iter: int = 100
-    omega_eps: float = 1e-3
-
-    # Solver Type (Thrust Constraint)
+    # Solver Type
     solvertype: str = "T"
+    solve_omega: int = 0 # 0 for fixed omega, 1 for omega solving
 
     ## Discretisation settings
     # Radial discretisation
@@ -37,7 +34,7 @@ class Inputs(eqx.Module):
     # Azimuthal discretisation (for skewed inflow)
     n_psi: int = 16
     # Number of Control Points
-    n_cp: int = 8
+    n_cp: int = 12
 
     # diagnostics/debugging
     verbose: bool = False
@@ -51,13 +48,13 @@ class Inputs(eqx.Module):
     ## --- FLIGHT CONDITIONS (Batched as Arrays) ---
     n_cond: int = 2
     # Index 0: Hover | Index 1: Forward Flight | etc...            
-    thrust_target = jnp.array([29.6,22.5])
+    thrust_target = jnp.array([22.5])
     
-    V_x = jnp.array([8.60,0])
-    V_yz = jnp.array([12.29,0])
-    omega= jnp.array([500.0,400.0])
+    V_x = jnp.array([0])
+    V_yz = jnp.array([0])
+    omega= jnp.array([400.0])
     
-    objective_weight = jnp.array([0.8, 0.2])
+    objective_weight = jnp.array([1.0])
 
     # Motor Information
     I_0: float = 0.7           # Zero Load Current (amps)
@@ -196,10 +193,10 @@ if __name__ == "__main__":
     r, dr = propmodel.radial_stops(Inputs.R_tip, Inputs.R_hub, Inputs.n_r)
 
     # Twist distribution starting guess (in degrees): 
-    init_beta_cp = jnp.radians(jnp.array([18.0,16.0,12.0,11.0,6.0,4.0,1.0,0.0]))
+    init_beta_cp = jnp.radians(jnp.array([18.0,16.0,16.0,16.0,14.0,7.0,7.0,4.0,4.0,4.0,4.0,4.0]))
 
     # Chord distribution (in meters): 
-    init_c_cp = jnp.array([0.07,0.09,0.07,0.05,0.04,0.03,0.03,0.02])
+    init_c_cp = jnp.array([0.05,0.05,0.05,0.05,0.05,0.05,0.04,0.03,0.03,0.03,0.03,0.03])
 
     # Interpolate airfoil data
     airfoil_interp = load_airfoil_data("arad10")
@@ -229,12 +226,13 @@ if __name__ == "__main__":
         time_log = jnp.array([0]),
 
         # Cost Weights
-        objective_thrust=jnp.array([1000.0]),
+        objective_thrust=jnp.array([15.0]),
         objective_MIL=jnp.array([1.0]),
-        objective_power=jnp.array([0.1]),
+        objective_power=jnp.array([0.0]),
         objective_weight=Inputs.objective_weight,
         thrust_target=Inputs.thrust_target,
     )
+
 
     print(f"Initialised Airfoil Fit with airfoil {params_init.airfoil}")
 
@@ -266,7 +264,6 @@ if __name__ == "__main__":
         Inputs().save_state(inputsfile)
     
     user_input = input('Export Propeller Geometry to .pts files? (y/n): ')
-
     if user_input.lower() == 'y':
         exportname = f"prop_pts_{timestamp}"
         foilpoints = geometry.upperlowerairfoil(params_opt_hover.airfoil)

@@ -34,6 +34,7 @@ def angular_stops(n_psi):
     dpsi = jnp.ones_like(psi)*(2 * jnp.pi) / n_psi
     return psi, dpsi
 
+
 ### Calculate thrust, hub and torque elements
 def dT_blade(V_ia: jnp.ndarray, params: Params, debug: bool=False):
     """
@@ -201,7 +202,6 @@ def dQ_blade(V_ia, params, debug=False):
 
     return dQ_blade_ave
 
-
 ### Calculate thrust elements using momentum imparted to the air
 def dT_momentum(V_ia, params, debug=False):
     """
@@ -258,7 +258,6 @@ def dT_momentum(V_ia, params, debug=False):
         print("------dT_momentum DEBUG------")
 
     return dT_momentum
-
 
 def thrust_residual(V_ia_0_guess, params):
     """
@@ -324,7 +323,6 @@ def induced_velocity(params):
 
     return V_ia, V_ia_0
 
-
 def torque(V_ia, params, debug=False):
     """
     Calculates the total torque on the propeller by integrating the average torque per annulus per rotation
@@ -352,7 +350,6 @@ def torque(V_ia, params, debug=False):
 
     return Q
 
-
 def thrust(V_ia, params):
     '''
     Calculate total thrust from solved induced velocity
@@ -364,7 +361,6 @@ def thrust(V_ia, params):
     T = jnp.trapezoid(dT, x=r)
 
     return T
-
 
 def power(V_ia, params):
     '''
@@ -386,7 +382,6 @@ def power(V_ia, params):
 
     P = jnp.trapezoid(jnp.trapezoid(dP,x=r,axis=0),x=psi)
     return P
-
 
 def mechanicalPower(V_ia, params):
     '''

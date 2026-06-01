@@ -33,7 +33,7 @@ def get_bezier_basis_matrix(r, R_hub, R_tip, n_cp):
     basis = binom * (t_expand ** i) * ((1 - t_expand) ** (n - i))
     return basis # Shape: (n_r, n_cp)
 
-def minimumInducedLossCost(V_ia_0, scale=1):
+def minimumInducedLossCost(V_ia_0):
     """
     Returns the cost function of minimum induced loss, that is the RMS of the 
     variation of the induced velocity at the center of the propeller by each annulus
@@ -45,7 +45,7 @@ def minimumInducedLossCost(V_ia_0, scale=1):
 
     rms_err = jnp.sqrt(jnp.sum(squared_err))
 
-    return rms_err*scale
+    return rms_err
 
 def motorPower(torque: float, omega: float, I_0: float = 0.7, R_m: float = 0.120, k_V: float = 150):
     """
@@ -124,7 +124,7 @@ def objectives_fn(opt_vars_scaled, params_list, spline_matrix):
     c_cp = params_list.c_cp
     beta_cp = params_list.beta_cp
 
-    omega = omega_scaled*params_list.omega_max
+    omega = lax.switch(Inputs.solve_omega, [lambda _: params_list.omega, lambda _: params_list.omega_max * omega_scaled], None)
 
     # Update parameters list with new geometry and control points
     params_list = eqx.tree_at(
@@ -138,8 +138,6 @@ def objectives_fn(opt_vars_scaled, params_list, spline_matrix):
     costs, V_ia_0 = cost_fn_vmap(params_list)
 
     aux = (V_ia_0)
-    
-    # Sum up total scalar cost across conditions, pass the array of updated V_ia_0 states as aux data
     return jnp.sum(costs), aux
 
 def apply_vars_to_struct(vars_scaled, params_struct, spline_matrix):
@@ -478,7 +476,8 @@ def run_optimization(params_base):
                 # We assign them directly back to keep Newton warm-starts efficient
 
                 c_scaled, beta_scaled, omega_scaled = vars_scaled
-                omega = params_struct.omega_max * omega_scaled
+                # toggle for omega
+                omega = lax.switch(Inputs.solve_omega, [lambda _: params_struct.omega, lambda _: params_struct.omega_max * omega_scaled], None)
                 
                 if Inputs.opt_smoothing == "bezier":
                     c_cp = params_struct.c_scale[:, None] * c_scaled[None, :]

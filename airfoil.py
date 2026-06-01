@@ -9,6 +9,8 @@ from jax import lax
 import matplotlib.pyplot as plt
 import interpax
 
+from scipy.ndimage import gaussian_filter
+
 # Note: Assuming init.py and airflow.py contain the necessary structures
 from init import Inputs
 from airflow import resultantVelocityComponents, calc_reynolds
@@ -320,7 +322,12 @@ def load_airfoil_data(airfoilname):
         cd_grid = jax_idw_3d_grid(points, cd_vals_all, M_mesh, Re_mesh)
         cm_grid = jax_idw_3d_grid(points, cm_vals_all, M_mesh, Re_mesh)
 
-        return AlphaMachReInterpolator(alpha_grid, mach_grid, re_grid_log, cl_grid, cd_grid, cm_grid)
+        # Smooth along AoA and Reynolds Axes
+        cl_grid_smooth = gaussian_filter(cl_grid, sigma=(1.5, 0.8, 1.0))
+        cd_grid_smooth = gaussian_filter(cd_grid, sigma=(1.5, 0.8, 1.0))
+        cm_grid_smooth = gaussian_filter(cm_grid, sigma=(1.5, 0.8, 1.0))
+
+        return AlphaMachReInterpolator(alpha_grid, mach_grid, re_grid_log, cl_grid_smooth, cd_grid_smooth, cm_grid_smooth)
     
     else:
         print("Incorrect coefficient method selected (check Inputs)")
