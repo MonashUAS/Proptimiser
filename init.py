@@ -1,7 +1,7 @@
 import jax
 # Set jax debugging
-jax.config.update("jax_traceback_filtering", "quiet_remove_frames")
-jax.config.update("jax_check_tracer_leaks", "off")
+jax.config.update("jax_traceback_filtering", "off")
+jax.config.update("jax_check_tracer_leaks", "on")
 jax.config.update("jax_disable_jit", False)
 jax.config.update("jax_debug_nans", False)
 jax.config.update("jax_enable_x64", True)
@@ -15,7 +15,7 @@ import jax.numpy as jnp
 class Inputs(eqx.Module):
     ## Optimisation / design settings which remain constant during execution
     # Outer-loop Optimisation (L-BFGS or ADAM)
-    opt_solver: str = "L-BFGS-B" # Toggle Optimisation Loop (type of optimisation algorithm.)
+    opt_solver: str = "SLSQP" # Toggle Optimisation Loop (type of optimisation algorithm.)
     opt_smoothing: str = "pointwise" # pointwise or bezier. Bezier often breaks propeller shape.
     opt_max_iter: int = 1000
     opt_tol: float = 1e-3   # Optimiser Stability Criteria
@@ -46,7 +46,7 @@ class Inputs(eqx.Module):
     R_hub = 0.025
 
     ## --- FLIGHT CONDITIONS (Batched as Arrays) ---
-    n_cond: int = 1
+    n_cond: int = 2
     # Index 0: Hover | Index 1: Forward Flight | etc...            
     thrust_target = jnp.array([22.5])
     
@@ -235,6 +235,7 @@ if __name__ == "__main__":
 
 
     print(f"Initialised Airfoil Fit with airfoil {params_init.airfoil}")
+
     if Inputs.jax_tracing:
         print("Starting Profiler...")
         # This will create a directory called /tmp/jax_trace (or a folder of your choice)
