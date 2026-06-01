@@ -38,7 +38,7 @@ def get_bezier_basis_matrix(r, R_hub, R_tip, n_cp):
     basis = binom * (t_expand ** i) * ((1 - t_expand) ** (n - i))
     return basis # Shape: (n_r, n_cp)
 
-def minimumInducedLossCost(V_ia_0, scale=1):
+def minimumInducedLossCost(V_ia_0):
     """
     Returns the cost function of minimum induced loss, that is the RMS of the 
     variation of the induced velocity at the center of the propeller by each annulus
@@ -50,7 +50,7 @@ def minimumInducedLossCost(V_ia_0, scale=1):
 
     rms_err = jnp.sqrt(jnp.sum(squared_err))
 
-    return rms_err*scale
+    return rms_err
 
 def motorPower(torque: float, omega: float, I_0: float = 0.7, R_m: float = 0.120, k_V: float = 150):
     """

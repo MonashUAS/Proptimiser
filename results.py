@@ -5,12 +5,125 @@ import numpy as np
 import matplotlib.pyplot as plt
 import jax
 import jax.numpy as jnp
-
+import equinox as eqx
+from scipy.interpolate import make_interp_spline
 
 # Internal Imports
 import propmodel
+import proptimiser
 import init
 import geometry
+import airfoil
+
+class DraggableSplineEditor:
+    def __init__(self, r_dense, y_dense, num_cps=6, name="Value"):
+        self.r_dense = r_dense
+        self.y_dense = y_dense
+        self.name = name
+        
+        # 1. Initialize Control Points (CPs) evenly spaced across the radius
+        self.cp_r = np.linspace(r_dense.min(), r_dense.max(), num_cps)
+        self.cp_y = np.interp(self.cp_r, r_dense, y_dense)
+        
+        # 2. Setup the plot
+        self.fig, self.ax = plt.subplots(figsize=(10, 6))
+        self.ax.set_title(f"Interactive Editor: {name}\nDrag the red points up/down/left/right. Close window when finished.")
+        self.ax.set_xlabel("Radius (r)")
+        self.ax.set_ylabel(name)
+        
+        # Plot original data as a faint background reference
+        self.ax.plot(r_dense, y_dense, '.', color='gray', alpha=0.5, label='Original Data')
+        
+        # Plot the active spline
+        self._spline_line, = self.ax.plot(r_dense, self._get_spline(), 'b-', linewidth=2, label='Smoothed Spline')
+        
+        # Plot the draggable control points
+        self._cp_scatter = self.ax.scatter(self.cp_r, self.cp_y, c='red', s=100, zorder=5, label='Control Points')
+        
+        self.ax.legend()
+        self.ax.grid(True, linestyle='--', alpha=0.6)
+        
+        # State variable to track which point is currently being dragged
+        self._dragged_idx = None 
+        
+        # 3. Connect Matplotlib Event Listeners
+        self.fig.canvas.mpl_connect('button_press_event', self.on_press)
+        self.fig.canvas.mpl_connect('button_release_event', self.on_release)
+        self.fig.canvas.mpl_connect('motion_notify_event', self.on_motion)
+        
+    def _get_spline(self):
+        # Generate the cubic spline based on current CP positions
+        spline = make_interp_spline(self.cp_r, self.cp_y, k=3)
+        return spline(self.r_dense)
+        
+    def on_press(self, event):
+        if event.inaxes != self.ax: return
+        
+        # Calculate normalized 2D distance for intuitive grabbing
+        x_range = self.cp_r[-1] - self.cp_r[0]
+        y_range = max(self.y_dense.max() - self.y_dense.min(), 1e-6)
+        
+        dx = (self.cp_r - event.xdata) / x_range
+        dy = (self.cp_y - event.ydata) / y_range
+        dist = np.sqrt(dx**2 + dy**2)
+        idx = np.argmin(dist)
+        
+        # If clicked reasonably close to a point (5% of plot area), "grab" it
+        if dist[idx] < 0.05: 
+            self._dragged_idx = idx
+
+    def on_release(self, event):
+        # Release the point
+        self._dragged_idx = None
+
+    def on_motion(self, event):
+        if self._dragged_idx is None: return
+        if event.inaxes != self.ax: return
+        
+        # Update the Y-value for all points freely
+        self.cp_y[self._dragged_idx] = event.ydata
+        
+        # Update the X-value ONLY for internal points 
+        # (Endpoints must stay locked at the hub and tip boundaries)
+        if 0 < self._dragged_idx < len(self.cp_r) - 1:
+            # Constrain X movement so it cannot pass its neighboring points
+            # This ensures X remains strictly increasing, preventing spline crashes
+            min_x = self.cp_r[self._dragged_idx - 1] + 1e-5
+            max_x = self.cp_r[self._dragged_idx + 1] - 1e-5
+            
+            self.cp_r[self._dragged_idx] = np.clip(event.xdata, min_x, max_x)
+        
+        # Redraw the scatter points and the new spline
+        self._cp_scatter.set_offsets(np.c_[self.cp_r, self.cp_y])
+        self._spline_line.set_ydata(self._get_spline())
+        self.fig.canvas.draw_idle()
+        
+    def get_final_data(self):
+        # Called after the window is closed to retrieve the final array
+        return self._get_spline()
+
+def iterativesmoothing(params):
+    '''
+    Opens interactive graphical editors to manually smooth Chord and Beta.
+    '''
+    print("Opening Interactive Smoother for Chord...")
+    chord_editor = DraggableSplineEditor(params.r, params.c, num_cps=10, name="Chord (c)")
+    plt.show() # Pauses execution until the user closes the plot window
+    new_c = chord_editor.get_final_data()
+    
+    print("Opening Interactive Smoother for Twist (Beta)...")
+    beta_editor = DraggableSplineEditor(params.r, params.beta, num_cps=10, name="Twist (Beta)")
+    plt.show()
+    new_beta = beta_editor.get_final_data()
+    
+    # Safely inject the modified arrays back into the PyTree
+    params = eqx.tree_at(
+        lambda p: (p.c, p.beta), 
+        params, 
+        (new_c, new_beta)
+    )
+    
+    return params
 
 def propinfoplot(params, show=True):
     '''
@@ -122,28 +235,30 @@ def is_serialisable_leaf(x):
 
 def load_perfect_skeleton(filename, base_skeleton):
     '''
-    Reads an .eqx file to discover the exact shapes of stored arrays,
-    then updates a dummy base_skeleton PyTree to match those shapes perfectly,
+    Reads an .eqx file to discover the exact shapes and data types of stored arrays,
+    then updates a dummy base_skeleton PyTree to match perfectly,
     skipping non-serialisable configuration fields like strings or functions.
     '''
     if not filename.endswith(".eqx"):
         filename += ".eqx"
         
-    # 1. Read all array/scalar shapes sequentially from the binary file stream
+    # 1. Read all array/scalar shapes and dtypes sequentially from the binary file stream
     file_shapes = []
+    file_dtypes = []
     with open("propellers/"+filename, "rb") as f:
         while True:
             try:
                 # np.load automatically advances the file pointer across saved entries
                 arr = np.load(f)
                 file_shapes.append(arr.shape)
+                file_dtypes.append(arr.dtype)
             except Exception:
                 break
 
     # 2. Flatten the dummy skeleton to get its structural blueprint
     dummy_leaves, treedef = jax.tree_util.tree_flatten(base_skeleton)
 
-    # 3. Match file shapes ONLY to fields Equinox actually serialises
+    # 3. Match file shapes AND dtypes ONLY to fields Equinox actually serialises
     perfect_leaves = []
     file_idx = 0
     
@@ -155,14 +270,17 @@ def load_perfect_skeleton(filename, base_skeleton):
                     f"({len(file_shapes)}) than the class definition expects."
                 )
             shape = file_shapes[file_idx]
+            dtype = file_dtypes[file_idx]
             file_idx += 1
             
-            # FIX: For 0D scalar shapes, preserve the original Python primitive type (int, float, bool)
-            # so structural configurations (like n_r, n_psi) remain concrete Python constants.
+            # For 0D scalar shapes, use the saved dtype to cast a 0 into the correct 
+            # native Python primitive (int, float, bool)
             if shape == () and isinstance(leaf, (bool, int, float, complex)) and not isinstance(leaf, jax.Array):
-                perfect_leaves.append(type(leaf)(0))
+                # .item() safely casts a 0D numpy scalar to the nearest Python type
+                perfect_leaves.append(np.zeros((), dtype=dtype).item())
             else:
-                perfect_leaves.append(jnp.zeros(shape))
+                # Use the extracted dtype for the dummy JAX array
+                perfect_leaves.append(jnp.zeros(shape, dtype=dtype))
         else:
             # Leave non-serialisable elements (strings, functions) completely untouched
             perfect_leaves.append(leaf)
@@ -173,7 +291,7 @@ def load_perfect_skeleton(filename, base_skeleton):
             f"but the skeleton layout identified {file_idx} serialisable fields."
         )
 
-    # 4. Reconstruct the perfectly shaped skeleton PyTree
+    # 4. Reconstruct the perfectly shaped/typed skeleton PyTree
     perfect_skeleton = jax.tree_util.tree_unflatten(treedef, perfect_leaves)
     return perfect_skeleton
 
@@ -186,24 +304,23 @@ def loadprop(prop_timestamp):
     inputs_filename = f"prop_inputs_{prop_timestamp}"
     params_filename = f"prop_params_{prop_timestamp}"
 
-    # --- 1. Load Inputs ---
+    # Load Inputs
     print(f"Loading {inputs_filename}.eqx...")
     dummy_inputs = init.Inputs()
     perfect_inputs_skeleton = load_perfect_skeleton(inputs_filename, dummy_inputs)
     inputs = perfect_inputs_skeleton.load_state(inputs_filename)
 
-    # --- 2. Load Params ---
+    # Load Params
     print(f"Loading {params_filename}.eqx...")
     
     # Define a fast dummy airfoil interpolator to bypass slow loading & NaN errors
-    def dummy_airfoil_interp(*args, **kwargs):
-        return jnp.zeros(1), jnp.zeros(1), jnp.zeros(1)
+    airfoil_interp = airfoil.load_airfoil_data("arad10")
 
     # Initialize a baseline structure using generic 0D scalar arrays
     dummy_scalar = jnp.array(0.0)
     base_params = init.Params(
         airfoil="arad10",
-        airfoil_interp=dummy_airfoil_interp,
+        airfoil_interp=airfoil_interp,
         N=2,
         c=dummy_scalar, beta=dummy_scalar, c_cp=dummy_scalar, beta_cp=dummy_scalar,
         r=dummy_scalar, dr=dummy_scalar, psi=dummy_scalar, dpsi=dummy_scalar,
@@ -220,29 +337,96 @@ def loadprop(prop_timestamp):
 
     return inputs, params
 
-def iterativesmoothing(params):
-    return params
+
+def propgeomblender(timestamps, weights):
+    '''
+    Averages chord and beta across multiple timestamps, 
+    returning params with the updated geometry.
+    '''
+    # Collect data into arrays of shape (len(timestamps), N_radial_stops)
+    all_c = []
+    all_beta = []
+    
+    for ts in timestamps:
+        inputs, params = loadprop(ts)
+        all_c.append(params.c)
+        all_beta.append(params.beta)
+    
+    C_matrix = np.array(all_c)
+    Beta_matrix = np.array(all_beta)
+    
+    avg_c = weights.dot(C_matrix)
+    avg_beta = weights.dot(Beta_matrix)
+
+    params = eqx.tree_at(
+    lambda p: (p.c, p.beta), 
+    params, 
+    (avg_c, avg_beta)
+    )
+    return inputs, params
 
 
 if __name__ == "__main__":
     # pass the base name/timestamp
-    timestamp = "20260531-1754"
-    inputs, params = loadprop(timestamp)
+    timestamps = ["20260531-1734"]
+    weights = np.array([1.0])
+    # Blending with multiple propeller geometries
+    inputs, params = propgeomblender(timestamps, weights)
+    # Specify Inflow Conditions for Plotting/Solving
+    omega = params.omega
+    V_x = jnp.array([8.60])
+    V_yz = jnp.array([12.29])
 
-    ## Prompts for Data Processing
-    user_input = input("Would you like to plot solver outputs? (y/n) \n")
-    if user_input.lower() == "y":
-        print("Plotting Solver Ouput...")
-        # Plot the results
-        propinfoplot(params)
+    params = eqx.tree_at(
+    lambda p: (p.omega, p.V_x, p.V_yz), 
+    params, 
+    (omega, V_x, V_yz)
+    )
+    # Solve Induced Velocity
+    _, V_ia_0 = propmodel.induced_velocity(params)
 
-    user_input = input("Does your propeller need control-point based smoothing? \n")
+    params = eqx.tree_at(
+    lambda p: (p.V_ia_0), 
+    params, 
+    (V_ia_0))
 
-    user_input = input('Export Propeller Geometry to .pts files? (y/n): \n')
-    if user_input.lower() == 'y':
-        exportname = f"prop_pts_{timestamp}"
-        foilpoints = geometry.upperlowerairfoil(params.airfoil)
-        geometry.ptsfilegenerator(params.r, params.c, params.beta, foilpoints, exportname)
-        print(f'Saving Propeller Geometry to {exportname}.pts')
+    ## Propeller Post-Processing Loop
+    exit_input = "n"
+    while exit_input != "y":
+        user_input = input("Would you like to plot solver outputs? (y/n) \n")
+        if user_input.lower() == "y":
+            print("Plotting Solver Ouput...")
+            # Plot the results
+            propinfoplot(params)
 
-    
+        user_input = input("Does your propeller need control-point based smoothing? (y/n)\n")
+        if user_input.lower() == 'y':
+            params = iterativesmoothing(params)
+
+        user_input = input('Export Propeller Geometry to .pts files? (y/n): \n')
+        if user_input.lower() == 'y':
+            propname = input('Enter Propeller Name: ')
+            exportname = f"prop_pts_{propname}"
+            foilpoints = geometry.upperlowerairfoil(params.airfoil)
+            geometry.ptsfilegenerator(params.r, params.c, params.beta, foilpoints, exportname)
+            print(f'Saving Propeller Geometry to {exportname}.pts')
+        # Save Results/Export Geometry if Required
+        user_input = input('Save Propeller? (y/n): ')
+        if user_input.lower() == 'y':
+            propname = input('Enter Propeller Name:')
+            paramsfile = "prop_params_" + propname
+            inputsfile = "prop_inputs_" + propname
+            print(f'Saving Propeller Inputs/Parameters to {paramsfile} and {inputsfile}')
+
+            # Use the instantiated object references (params_opt and an Inputs instance)
+            params.save_state(paramsfile)
+            inputs.save_state(inputsfile)
+            
+        # Debug Print Statement (Solve for Current Propeller)
+        pwr, thr, mil, V_ia_0 = proptimiser.objectives(params)
+        omega, pwr, thr, mil = np.squeeze(omega), np.squeeze(pwr), np.squeeze(thr), np.squeeze(mil)
+
+        iter = len(params.error_log)
+        print(f"Iter: {iter:<3} | Omega: {omega:<5.2f} | Motor Power: {pwr:<8.4f} | Thrust: {thr:<8.4f} | MIL RMS: {mil:<10.4f}")
+
+        exit_input = input('Would you like to exit the editor (y) or loop through (n)? (y/n) \n')
