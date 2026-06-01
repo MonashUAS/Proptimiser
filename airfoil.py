@@ -8,7 +8,6 @@ from jax import numpy as jnp
 from jax import lax
 import matplotlib.pyplot as plt
 import interpax
-
 from scipy.ndimage import gaussian_filter
 
 # Note: Assuming init.py and airflow.py contain the necessary structures
@@ -321,7 +320,7 @@ def load_airfoil_data(airfoilname):
         cl_grid = jax_idw_3d_grid(points, cl_vals_all, M_mesh, Re_mesh)
         cd_grid = jax_idw_3d_grid(points, cd_vals_all, M_mesh, Re_mesh)
         cm_grid = jax_idw_3d_grid(points, cm_vals_all, M_mesh, Re_mesh)
-
+        
         # Smooth along AoA and Reynolds Axes
         cl_grid_smooth = gaussian_filter(cl_grid, sigma=(1.5, 0.8, 1.0))
         cd_grid_smooth = gaussian_filter(cd_grid, sigma=(1.5, 0.8, 1.0))
@@ -445,12 +444,73 @@ def xflr5_coeffs(V_ia, params):
 
     return C_L, C_D, C_M
 
+def no_3d_correction(operands):
+    '''
+    Pass-through function for when rotational_correction == 0.
+    '''
+    C_L_2D, C_D_2D, C_M, V_ia, params = operands
+    return C_L_2D, C_D_2D, C_M
+
+def du_selig_correction(operands):
+    '''
+    Applies the Du-Selig 3D Rotational Stall Delay correction.
+    Modifies C_L and C_D based on local chord-to-radius ratios.
+    '''
+    C_L_2D, C_D_2D, C_M, V_ia, params = operands
+    
+    # Extract geometry and prevent division by zero at the exact root
+    c = params.c[:, None]
+    r = params.r[:, None]
+    R = Inputs.R_tip
+    
+    r_safe = jnp.maximum(r, 1e-6)
+    c_over_r = c / r_safe
+    r_over_R = r_safe / R
+    
+    # Calculate Effective Angle of Attack (AoA_eff)
+    # Using your standard AoA_0 from the XFoil/XFLR5 models
+    AoA_0 = jnp.radians(-2) 
+    geometric_angle = params.beta[:, None]
+    _, phi = resultantVelocityComponents(V_ia, params)
+    AoA_eff = geometric_angle - phi - AoA_0
+    
+    # Calculate Du-Selig empirical factor (f1 = f2)
+    denominator = 0.1267 * c_over_r + (1 - r_over_R**2) / r_over_R
+    f1 = (1 / (2 * jnp.pi)) * (1.6 * c_over_r) / jnp.maximum(denominator, 1e-6)
+    
+    # Correct Lift
+    # C_L_inv is the theoretical 2D inviscid lift (2 * pi * AoA_eff)
+    C_L_inv = 2 * jnp.pi * AoA_eff
+    C_L_3D = C_L_2D + f1 * (C_L_inv - C_L_2D)
+    
+    # Correct Drag
+    C_D0 = 0.015 # zero-lift drag
+    C_D_3D = C_D_2D - f1 * (C_D_2D - C_D0)
+    
+    # Ensure physical drag bounds (prevents f1 from forcing drag below baseline)
+    C_D_3D = jnp.maximum(C_D_3D, C_D0)
+    
+    return C_L_3D, C_D_3D, C_M
+
 def aero_coeffs(V_ia, params):
-    # Select Method to Establish Aerodynamic Coefficients
-    C_L, C_D, C_M = lax.switch(Inputs.coeff_method,
-                    [parametric_coeffs, xfoil_coeffs, xflr5_coeffs],
-                    V_ia, params)
-    return C_L, C_D, C_M
+    # Establish Base 2D Aerodynamic Coefficients
+    # Packaging inputs as a tuple to ensure JAX lax.switch compatibility
+    C_L_2D, C_D_2D, C_M = lax.switch(
+        Inputs.coeff_method,
+        [parametric_coeffs, xfoil_coeffs, xflr5_coeffs],
+        V_ia, params 
+    )
+    
+    # Apply 3D Rotational Corrections
+    operands = (C_L_2D, C_D_2D, C_M, V_ia, params)
+    
+    C_L_final, C_D_final, C_M_final = lax.switch(
+        Inputs.rotational_correction,
+        [no_3d_correction, du_selig_correction],
+        operands
+    )
+    
+    return C_L_final, C_D_final, C_M_final
 
 if __name__ == "__main__":
     # mmm pretty latex

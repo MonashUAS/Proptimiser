@@ -15,7 +15,7 @@ import jax.numpy as jnp
 class Inputs(eqx.Module):
     ## Optimisation / design settings which remain constant during execution
     # Outer-loop Optimisation (L-BFGS or ADAM)
-    opt_solver: str = "SLSQP" # Toggle Optimisation Loop (type of optimisation algorithm.)
+    opt_solver: str = "L-BFGS-B" # Toggle Optimisation Loop (type of optimisation algorithm.)
     opt_smoothing: str = "pointwise" # pointwise or bezier. Bezier often breaks propeller shape.
     opt_max_iter: int = 1000
     opt_tol: float = 1e-3   # Optimiser Stability Criteria
@@ -26,7 +26,7 @@ class Inputs(eqx.Module):
 
     # Solver Type
     solvertype: str = "T"
-    solve_omega: int = 0 # 0 for fixed omega, 1 for omega solving
+    solve_omega: int = 1 # 0 for fixed omega, 1 for omega solving
 
     ## Discretisation settings
     # Radial discretisation
@@ -50,11 +50,11 @@ class Inputs(eqx.Module):
     # Index 0: Hover | Index 1: Forward Flight | etc...            
     thrust_target = jnp.array([22.5])
     
-    V_x = jnp.array([0])
-    V_yz = jnp.array([0])
-    omega= jnp.array([400.0])
+    V_x = jnp.array([8.60, 0.0])
+    V_yz = jnp.array([12.29, 0.0])
+    omega= jnp.array([445.0,400.0])
     
-    objective_weight = jnp.array([1.0])
+    objective_weight = jnp.array([0.8,1.0])
 
     # Motor Information
     I_0: float = 0.7           # Zero Load Current (amps)
@@ -66,6 +66,7 @@ class Inputs(eqx.Module):
     coeff_method: int = 2 # 0 = parametric, 1 = alpha/reynolds, 2 = alpha/mach/reynolds
     tip_loss_model: int = 1 # 0 = none, 1 = Prandtl
     root_loss_model: int = 1 # 0 = none, 1 = Prandtl
+    rotational_correction: int = 1 # 0 = none, 1 = Du-Selig 3D
 
     def save_state(self, filename: str = "inputs_state.eqx"):
         """Saves the Inputs configuration to an Equinox file."""
@@ -232,7 +233,6 @@ if __name__ == "__main__":
         objective_weight=Inputs.objective_weight,
         thrust_target=Inputs.thrust_target,
     )
-
 
     print(f"Initialised Airfoil Fit with airfoil {params_init.airfoil}")
 
