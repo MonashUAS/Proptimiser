@@ -96,6 +96,58 @@ def ptsfilegenerator(r, c, beta, foilpoints, exportname, polyorder=6):
     np.savetxt(f"{exportname}_TE.pts",  propgeom_TE_coords,      delimiter=" ", fmt="%.7f")
     np.savetxt(f"{exportname}_airfoil.pts",   propgeom_airfoil_coords, delimiter=" ", fmt="%.7f")
 
+def export_to_creo_ibl(r, c, beta, foilpoints, exportname, scale_to_mm=True):
+    """
+    Combines all radial stations and airfoil profiles into a single unified .ibl 
+    file for direct multi-curve import into Creo Parametric.
+
+    .ibl file documentation: https://support.ptc.com/help/creo/creo_pma/r12/usascii/index.html#page/part_modeling/part_modeling/Example_Blend_File_Format.html#wwID0EHAEU
+    """
+    import numpy as np
+
+    # Unpack normalized airfoil coordinates
+    upper_points, lower_points = foilpoints
+    foil_data = np.vstack([upper_points[::-1], lower_points])
+    foil_x = foil_data[:, 0]
+    foil_y = foil_data[:, 1]
+    
+    # Calculate absolute 3D LE and TE locations
+    le_points, te_points = params_to_le_te(r, c, beta)
+    
+    chord_vectors = te_points - le_points  # Shape: (n_r, 3)
+    chords = np.linalg.norm(chord_vectors, axis=1, keepdims=True)  # Shape: (n_r, 1)
+    
+    u_span = np.array([1.0, 0.0, 0.0])
+    u_chord = chord_vectors / chords
+    u_thick = np.cross(u_span, u_chord)  # Normal thickness vector (n_r, 3)
+    
+    n_r = len(r)
+    n_foil = len(foil_x)
+    scale = 1000.0 if scale_to_mm else 1.0  # Convert meters to mm if true
+
+    # Write out the structural text file
+    with open(f"{exportname}.ibl", "w") as f:
+        # Creo File Headers
+        f.write("Open\n")
+        f.write("Arclength\n")
+        
+        # Loop through every radial station
+        for i in range(n_r):
+            # Creo section comment markers
+            f.write(f"Begin section ! Station {i+1}: r = {r[i]:.4f} m\n")
+            f.write("Begin curve\n")
+            
+            # Generate and write out the 3D coordinates for this profile loop
+            for j in range(n_foil):
+                # 3D transformation logic matching your mesh builder
+                pt = le_points[i] + (foil_x[j] * chord_vectors[i]) + (foil_y[j] * chords[i] * u_thick[i])
+                pt_scaled = pt * scale
+                
+                # Creo requires: [Index (1-based)] [X] [Y] [Z]
+                f.write(f"{j+1}  {pt_scaled[0]:.6f}  {pt_scaled[1]:.6f}  {pt_scaled[2]:.6f}\n")
+                
+    print(f"Successfully generated Creo geometry: {exportname}.ibl ({n_r} sections)")
+
 def build_propeller_mesh(geompoints, foilpoints, num_blades=2):
     """
     Lofts a 3D propeller blade by interpolating between the Leading Edge (LE) 
@@ -115,9 +167,7 @@ def build_propeller_mesh(geompoints, foilpoints, num_blades=2):
     chord_vectors = te_points - le_points  # Shape: (n_r, 3)
     chords = np.linalg.norm(chord_vectors, axis=1, keepdims=True)  # Shape: (n_r, 1)
     
-    # Derive the local thickness orientation vector
-    # By taking the cross product of the span axis (X) and chord direction, 
-    # we dynamically capture the true normal vector for thickness
+    # cross product captures thickness
     u_span = np.array([1.0, 0.0, 0.0])
     u_chord = chord_vectors / chords
     u_thick = np.cross(u_span, u_chord)  # Shape: (n_r, 3)
@@ -156,32 +206,20 @@ if __name__ == "__main__":
     Create and Plot Demo Flatblade Propeller Blade Geometry
     '''
     import matplotlib.pyplot as plt
-    import propmodel
-    from init import Inputs, Params
     import pyvista as pv
-    
+    import results
     # Generate Flat Blade Parameters
-    c_val = 0.1
-    beta_val = np.radians(15)
-
-    # Populate radial/azimuthal stops and initial guess
-    psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
-    r, dr = propmodel.radial_stops(0.25, 0.05, Inputs.n_r)
-    V_ia_0 = np.full_like(r, np.array([10.0]))
-
-    c = np.full((Inputs.n_r,), c_val)
-    beta = np.full((Inputs.n_r,), beta_val)
-
+    inputs, params = results.loadprop('redback_v1')
     airfoil = "ARAD10"
+
+    r, c, beta = params.r, params.c, params.beta
 
     upper_points, lower_points = upperlowerairfoil(airfoil)
 
-    # FIX: Reverse upper points (using [[::-1]) so coordinates sequence seamlessly 
-    # around the perimeter: Trailing Edge -> Leading Edge -> Trailing Edge
+    #Trailing Edge -> Leading Edge -> Trailing Edge
     foil_data = np.vstack([upper_points[::-1], lower_points])
 
-    # FIX: Corrected argument order (r, beta, c) to match function definition
-    le_points, te_points = params_to_le_te(r, beta, c)
+    le_points, te_points = params_to_le_te(r, c, beta)
 
     # Extract x and y coordinates
     foil_x = foil_data[:, 0]
@@ -203,6 +241,8 @@ if __name__ == "__main__":
     foilpoints = (upper_points, lower_points)
 
     prop_mesh = build_propeller_mesh(geompoints, foilpoints, num_blades=2)
+
+    export_to_creo_ibl(r, c, beta, (upper_points, lower_points), "propeller_blade_sections")
 
     # Fire up the local PyVista testing window
     plotter = pv.Plotter()

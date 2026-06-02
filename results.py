@@ -10,10 +10,10 @@ from scipy.interpolate import make_interp_spline
 
 # Internal Imports
 import propmodel
-import proptimiser
 import init
-import geometry
+#import geometry
 import airfoil
+import airflow
 
 class DraggableSplineEditor:
     def __init__(self, r_dense, y_dense, num_cps=6, name="Value"):
@@ -21,11 +21,11 @@ class DraggableSplineEditor:
         self.y_dense = y_dense
         self.name = name
         
-        # 1. Initialize Control Points (CPs) evenly spaced across the radius
+        # Initialize Control Points evenly spaced across the radius
         self.cp_r = np.linspace(r_dense.min(), r_dense.max(), num_cps)
         self.cp_y = np.interp(self.cp_r, r_dense, y_dense)
         
-        # 2. Setup the plot
+        # Setup the plot
         self.fig, self.ax = plt.subplots(figsize=(10, 6))
         self.ax.set_title(f"Interactive Editor: {name}\nDrag the red points up/down/left/right. Close window when finished.")
         self.ax.set_xlabel("Radius (r)")
@@ -46,7 +46,7 @@ class DraggableSplineEditor:
         # State variable to track which point is currently being dragged
         self._dragged_idx = None 
         
-        # 3. Connect Matplotlib Event Listeners
+        # Connect Matplotlib Event Listeners
         self.fig.canvas.mpl_connect('button_press_event', self.on_press)
         self.fig.canvas.mpl_connect('button_release_event', self.on_release)
         self.fig.canvas.mpl_connect('motion_notify_event', self.on_motion)
@@ -225,6 +225,99 @@ def propinfoplot(params, show=True):
         plt.show()
     return fig
 
+def debug_diagnostics_plot(params, cond_idx, show=True):
+    '''
+    Generates a 2x2 diagnostic plot window for a specific flight condition.
+    Displays Twist/Inflow, Lift/Drag Coefficients, Sectional Forces, and Reynolds Number.
+    '''
+    plt.rcParams.update({
+        "text.usetex": True,
+        "font.family": "serif",
+        "axes.labelsize": 12,
+        "axes.titlesize": 14
+    })
+    
+    # Extract Geometry
+    r = params.r * 1000               # Radius in mm
+    beta_deg = np.degrees(params.beta)
+    
+    # Resolve Flow Kinematics
+    V_ia = propmodel.inflow_model(params.V_ia_0, params)
+    V_R, phi = airflow.resultantVelocityComponents(V_ia, params)
+    
+    # Average across the azimuthal axis for 1D plotting
+    phi_mean_deg = np.degrees(jnp.mean(phi, axis=1))
+    VR_mean = jnp.mean(V_R, axis=1)
+    
+    # Extract Aerodynamic Coefficients
+    C_L, C_D, _ = airfoil.aero_coeffs(V_ia, params)
+    CL_mean = jnp.mean(C_L, axis=1)
+    CD_mean = jnp.mean(C_D, axis=1)
+    
+    # Extract Sectional Forces
+    dT_ave, _ = propmodel.dT_blade(V_ia, params)
+    dQ_ave = propmodel.dQ_blade(V_ia, params)
+    
+    # Extract Flow Regime (Reynolds Number)
+    Re = airflow.calc_reynolds(params.rho, jnp.maximum(VR_mean, 1e-6), params.c, params.mu)
+    
+    # Create the Figure
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(rf"\textbf{{Diagnostic Diagnostics: Flight Condition {cond_idx}}}", fontsize=16)
+
+    # Plot 1: Angles (Twist and Inflow)
+    axs[0, 0].plot(r, beta_deg, 'o-', color="tab:red", label=r"Twist ($\beta$)")
+    axs[0, 0].plot(r, phi_mean_deg, 's-', color="tab:cyan", label=r"Inflow Angle ($\phi$)")
+    axs[0, 0].fill_between(r, beta_deg, phi_mean_deg, color='gray', alpha=0.2, label=r"Approx AoA ($\alpha$)")
+    axs[0, 0].set_title(r"Angle Distribution")
+    axs[0, 0].set_ylabel(r"Angle ($^\circ$)")
+    axs[0, 0].grid(True, linestyle='--', alpha=0.6)
+    axs[0, 0].legend()
+
+    # Plot 2: Aerodynamic Coefficients
+    axs[0, 1].plot(r, CL_mean, 'o-', color="tab:blue", label=r"$C_L$")
+    axs[0, 1].set_title(r"Sectional Aerodynamic Coefficients")
+    axs[0, 1].set_ylabel(r"$C_L$", color="tab:blue")
+    axs[0, 1].tick_params(axis='y', labelcolor="tab:blue")
+    axs[0, 1].grid(True, linestyle='--', alpha=0.6)
+    
+    ax01_twin = axs[0, 1].twinx()
+    ax01_twin.plot(r, CD_mean, 's-', color="tab:orange", label=r"$C_D$")
+    ax01_twin.set_ylabel(r"$C_D$", color="tab:orange")
+    ax01_twin.tick_params(axis='y', labelcolor="tab:orange")
+    
+    lines_coeff = axs[0, 1].get_lines() + ax01_twin.get_lines()
+    axs[0, 1].legend(lines_coeff, [l.get_label() for l in lines_coeff], loc="center right")
+
+    # Plot 3: Sectional Forces (Thrust & Torque)
+    axs[1, 0].plot(r, dT_ave, 'o-', color="tab:green", label=r"Thrust ($dT$)")
+    axs[1, 0].set_title(r"Sectional Load Distribution")
+    axs[1, 0].set_ylabel(r"Thrust (N/m)", color="tab:green")
+    axs[1, 0].set_xlabel(r"Radius ($r$) [mm]")
+    axs[1, 0].tick_params(axis='y', labelcolor="tab:green")
+    axs[1, 0].grid(True, linestyle='--', alpha=0.6)
+
+    ax10_twin = axs[1, 0].twinx()
+    ax10_twin.plot(r, dQ_ave, 's-', color="purple", label=r"Torque ($dQ$)")
+    ax10_twin.set_ylabel(r"Torque (Nm/m)", color="purple")
+    ax10_twin.tick_params(axis='y', labelcolor="purple")
+    
+    lines_forces = axs[1, 0].get_lines() + ax10_twin.get_lines()
+    axs[1, 0].legend(lines_forces, [l.get_label() for l in lines_forces], loc="center right")
+
+    # Plot 4: Reynolds Number
+    axs[1, 1].plot(r, Re, 'o-', color="black", label=r"Reynolds Number")
+    axs[1, 1].set_title(r"Local Flow Regime")
+    axs[1, 1].set_ylabel(r"$Re$")
+    axs[1, 1].set_xlabel(r"Radius ($r$) [mm]")
+    axs[1, 1].set_yscale('log') # Log scale is better for Re
+    axs[1, 1].grid(True, linestyle='--', alpha=0.6)
+    
+    plt.tight_layout()
+    if show:
+        plt.show(block=False) # Non-blocking so all windows open together
+    return fig
+
 def is_serialisable_leaf(x):
     '''
     Determines if a PyTree leaf is a data type that Equinox serialises by default.
@@ -242,7 +335,7 @@ def load_perfect_skeleton(filename, base_skeleton):
     if not filename.endswith(".eqx"):
         filename += ".eqx"
         
-    # 1. Read all array/scalar shapes and dtypes sequentially from the binary file stream
+    # Read all array/scalar shapes and dtypes sequentially from the binary file stream
     file_shapes = []
     file_dtypes = []
     with open("propellers/"+filename, "rb") as f:
@@ -255,10 +348,10 @@ def load_perfect_skeleton(filename, base_skeleton):
             except Exception:
                 break
 
-    # 2. Flatten the dummy skeleton to get its structural blueprint
+    # Flatten the dummy skeleton to get its structural blueprint
     dummy_leaves, treedef = jax.tree_util.tree_flatten(base_skeleton)
 
-    # 3. Match file shapes AND dtypes ONLY to fields Equinox actually serialises
+    # Match file shapes AND dtypes ONLY to fields Equinox actually serialises
     perfect_leaves = []
     file_idx = 0
     
@@ -290,8 +383,6 @@ def load_perfect_skeleton(filename, base_skeleton):
             f"Structure mismatch for {filename}: the file contains {len(file_shapes)} serialised items, "
             f"but the skeleton layout identified {file_idx} serialisable fields."
         )
-
-    # 4. Reconstruct the perfectly shaped/typed skeleton PyTree
     perfect_skeleton = jax.tree_util.tree_unflatten(treedef, perfect_leaves)
     return perfect_skeleton
 
@@ -365,68 +456,78 @@ def propgeomblender(timestamps, weights):
     )
     return inputs, params
 
-
 if __name__ == "__main__":
+    import proptimiser
     # pass the base name/timestamp
-    timestamps = ["20260531-1734"]
+    timestamps = ["20260602-1442"]
     weights = np.array([1.0])
+    
     # Blending with multiple propeller geometries
-    inputs, params = propgeomblender(timestamps, weights)
-    # Specify Inflow Conditions for Plotting/Solving
-    omega = params.omega
-    V_x = jnp.array([8.60])
-    V_yz = jnp.array([12.29])
+    inputs, params_base = propgeomblender(timestamps, weights)
 
-    params = eqx.tree_at(
-    lambda p: (p.omega, p.V_x, p.V_yz), 
-    params, 
-    (omega, V_x, V_yz)
-    )
-    # Solve Induced Velocity
-    _, V_ia_0 = propmodel.induced_velocity(params)
+    print(f"--- Evaluating {inputs.n_cond} Flight Conditions ---")
+    omega = jnp.array([601.0,451.91])
 
-    params = eqx.tree_at(
-    lambda p: (p.V_ia_0), 
-    params, 
-    (V_ia_0))
-
-    ## Propeller Post-Processing Loop
+    # Execution & Processing Loop
     exit_input = "n"
     while exit_input != "y":
-        user_input = input("Would you like to plot solver outputs? (y/n) \n")
+        evaluated_conditions = []
+
+        print("\nResolving Induced Velocity Field for all conditions...")
+        for idx in range(inputs.n_cond):
+            # Unpack unique operating points and batched variables
+            cond_omega = omega[idx] # manually input omega above (solver export limitations)
+            cond_Vx = inputs.V_x[idx]
+            cond_Vyz = inputs.V_yz[idx]
+
+            # Evaluate at operating conditons
+            params_cond = eqx.tree_at(
+                lambda p: (p.omega, p.V_x, p.V_yz), 
+                params_base, 
+                (jnp.array([cond_omega]), jnp.array([cond_Vx]), jnp.array([cond_Vyz]))
+            )
+            
+            # This guarantees that geometry changes (e.g. from smoothing) propagate into V_ia.
+            _, V_ia_0_solved = propmodel.induced_velocity(params_cond)
+
+            # write solved V_ia_0 into params
+            params_cond = eqx.tree_at(
+                lambda p: p.V_ia_0, 
+                params_cond, 
+                V_ia_0_solved
+            )
+            
+            evaluated_conditions.append(params_cond)
+            
+            # 5. Extract and print objective metrics
+            pwr, thr, mil, _ = proptimiser.objectives(params_cond)
+            cond_omega, pwr, thr, mil = jnp.squeeze(cond_omega), jnp.squeeze(pwr), jnp.squeeze(thr), jnp.squeeze(mil)
+            print(f"Cond: {idx:<3} | Omega: {float(cond_omega):<6.2f} | Motor Pwr: {float(pwr):<8.4f} | Thrust: {float(thr):<8.4f} | MIL RMS: {float(mil):<10.4f}")
+
+        # Post-Processing User Directives
+        user_input = input("\nWould you like to plot solver outputs? (y/n): ")
         if user_input.lower() == "y":
-            print("Plotting Solver Ouput...")
-            # Plot the results
-            propinfoplot(params)
+            print("Plotting General Info for Condition 0...")
+            propinfoplot(evaluated_conditions[0], show=False) 
+            
+            print("Plotting Detailed Diagnostics for all conditions...")
+            for idx, p_cond in enumerate(evaluated_conditions):
+                debug_diagnostics_plot(p_cond, idx, show=False)
+            
+            plt.show()  # Blocks until all window instances are closed by the user
 
-        user_input = input("Does your propeller need control-point based smoothing? (y/n)\n")
+        user_input = input("\nDoes your propeller need control-point based smoothing? (y/n): ")
         if user_input.lower() == 'y':
-            params = iterativesmoothing(params)
+            # Smoothing modifies the global underlying geometry skeleton
+            params_base = iterativesmoothing(params_base)
+            print("Geometry updated. Induced velocity fields will automatically refresh on the next loop pass.")
 
-        user_input = input('Export Propeller Geometry to .pts files? (y/n): \n')
+        user_input = input('\nExport Propeller Geometry to .pts files? (y/n): ')
         if user_input.lower() == 'y':
             propname = input('Enter Propeller Name: ')
             exportname = f"prop_pts_{propname}"
-            foilpoints = geometry.upperlowerairfoil(params.airfoil)
-            geometry.ptsfilegenerator(params.r, params.c, params.beta, foilpoints, exportname)
+            foilpoints = geometry.upperlowerairfoil(params_base.airfoil)
+            geometry.ptsfilegenerator(params_base.r, params_base.c, params_base.beta, foilpoints, exportname)
             print(f'Saving Propeller Geometry to {exportname}.pts')
-        # Save Results/Export Geometry if Required
-        user_input = input('Save Propeller? (y/n): ')
-        if user_input.lower() == 'y':
-            propname = input('Enter Propeller Name:')
-            paramsfile = "prop_params_" + propname
-            inputsfile = "prop_inputs_" + propname
-            print(f'Saving Propeller Inputs/Parameters to {paramsfile} and {inputsfile}')
-
-            # Use the instantiated object references (params_opt and an Inputs instance)
-            params.save_state(paramsfile)
-            inputs.save_state(inputsfile)
             
-        # Debug Print Statement (Solve for Current Propeller)
-        pwr, thr, mil, V_ia_0 = proptimiser.objectives(params)
-        omega, pwr, thr, mil = np.squeeze(omega), np.squeeze(pwr), np.squeeze(thr), np.squeeze(mil)
-
-        iter = len(params.error_log)
-        print(f"Iter: {iter:<3} | Omega: {omega:<5.2f} | Motor Power: {pwr:<8.4f} | Thrust: {thr:<8.4f} | MIL RMS: {mil:<10.4f}")
-
-        exit_input = input('Would you like to exit the editor (y) or loop through (n)? (y/n) \n')
+        exit_input = input('\nExit configuration loop completely? (y/n): ')
