@@ -26,7 +26,7 @@ class Inputs(eqx.Module):
 
     # Solver Type
     solvertype: str = "T"
-    solve_omega: int = 1 # 0 for fixed omega, 1 for omega solving
+    solve_omega: int = 0 # 0 for fixed omega, 1 for omega solving
 
     ## Discretisation settings
     # Radial discretisation
@@ -46,15 +46,15 @@ class Inputs(eqx.Module):
     R_hub = 0.025
 
     ## --- FLIGHT CONDITIONS (Batched as Arrays) ---
-    n_cond: int = 2
+    n_cond: int = 1
     # Index 0: Hover | Index 1: Forward Flight | etc...            
     thrust_target = jnp.array([22.5])
     
-    V_x = jnp.array([8.60, 0.0])
-    V_yz = jnp.array([12.29, 0.0])
-    omega= jnp.array([445.0,400.0])
+    V_x = jnp.array([0])
+    V_yz = jnp.array([30.0])
+    omega= jnp.array([400.0])
     
-    objective_weight = jnp.array([0.8,1.0])
+    objective_weight = jnp.array([1.0])
 
     # Motor Information
     I_0: float = 0.7           # Zero Load Current (amps)
@@ -66,8 +66,6 @@ class Inputs(eqx.Module):
     coeff_method: int = 2 # 0 = parametric, 1 = alpha/reynolds, 2 = alpha/mach/reynolds
     tip_loss_model: int = 1 # 0 = none, 1 = Prandtl
     root_loss_model: int = 1 # 0 = none, 1 = Prandtl
-    rotational_correction: int = 1 # 0 = none, 1 = Du-Selig 3D
-
     def save_state(self, filename: str = "inputs_state.eqx"):
         """Saves the Inputs configuration to an Equinox file."""
         if not filename.endswith(".eqx"):
@@ -76,7 +74,7 @@ class Inputs(eqx.Module):
         filename = "propellers/"+filename
         eqx.tree_serialise_leaves(filename, self)
         print(f"Inputs state successfully written to: {filename}")
-
+    
     def load_state(self, filename: str = "inputs_state.eqx"):
         """
         Loads and returns a new Inputs instance from an Equinox file.
@@ -207,6 +205,7 @@ if __name__ == "__main__":
     init_beta = jnp.dot(init_beta_cp, spline_matrix_init.T)
 
     # Initialise Params Class (will be duplicated for inputs in run_optimisation)
+
     params_init = Params(
         airfoil = airfoil,
         airfoil_interp=airfoil_interp,
@@ -227,7 +226,7 @@ if __name__ == "__main__":
         time_log = jnp.array([0]),
 
         # Cost Weights
-        objective_thrust=jnp.array([15.0]),
+        objective_thrust=jnp.array([50.0]),
         objective_MIL=jnp.array([1.0]),
         objective_power=jnp.array([0.0]),
         objective_weight=Inputs.objective_weight,

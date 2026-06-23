@@ -96,20 +96,85 @@ def ptsfilegenerator(r, c, beta, foilpoints, exportname, polyorder=6):
     np.savetxt(f"{exportname}_TE.pts",  propgeom_TE_coords,      delimiter=" ", fmt="%.7f")
     np.savetxt(f"{exportname}_airfoil.pts",   propgeom_airfoil_coords, delimiter=" ", fmt="%.7f")
 
-def export_to_creo_ibl(r, c, beta, foilpoints, exportname, scale_to_mm=True):
+def offset_airfoil_profile(foil_x, foil_y, chord, skin_thickness):
+    """
+    Offsets a normalized 2D airfoil inward by a physical skin thickness.
+    Prevents trailing edge self-intersection by clipping crossed lines.
+    Assumes foil coordinates are ordered: TE_upper -> LE -> TE_lower.
+    """
+    import numpy as np
+
+    # 1. Normalize the physical offset to the local chord
+    # Ensure chord is a scalar value (extract from array if necessary)
+    chord_val = chord[0] if isinstance(chord, np.ndarray) else chord
+    offset_mag = skin_thickness / chord_val
+    
+    # 2. Calculate gradients to find normals
+    dx = np.gradient(foil_x)
+    dy = np.gradient(foil_y)
+    length = np.hypot(dx, dy)
+    
+    # Avoid division by zero at sharp edges
+    length[length == 0] = 1e-8
+    
+    # Calculate inward-pointing normals based on the loop direction
+    nx = -dy / length
+    ny = dx / length
+    
+    # 3. Apply the inward offset
+    off_x = foil_x - offset_mag * nx
+    off_y = foil_y - offset_mag * ny
+    
+    # 4. Filter self-intersections (The "Swallowtail" clip)
+    le_idx = np.argmin(off_x)
+    
+    # Split into upper and lower surfaces
+    upper_x, upper_y = off_x[:le_idx+1], off_y[:le_idx+1]
+    lower_x, lower_y = off_x[le_idx:], off_y[le_idx:]
+    
+    # Reverse upper surface so X is strictly increasing (LE -> TE) for interpolation
+    rev_upper_x = upper_x[::-1]
+    rev_upper_y = upper_y[::-1]
+    
+    try:
+        # Interpolate lower surface Y values onto the upper surface X coordinates
+        lower_y_interp = np.interp(rev_upper_x, lower_x, lower_y)
+        
+        # Valid points are where the offset upper surface remains above the lower surface
+        valid_idx = rev_upper_y > lower_y_interp
+        
+        # Revert the valid upper points back to TE -> LE order
+        clean_upper_x = rev_upper_x[valid_idx][::-1]
+        clean_upper_y = rev_upper_y[valid_idx][::-1]
+        
+        # Truncate the lower surface at the new blunt trailing edge
+        max_x = np.max(clean_upper_x)
+        clean_lower_x = lower_x[lower_x <= max_x]
+        clean_lower_y = lower_y[lower_x <= max_x]
+        
+        # Reconstruct the continuous loop
+        clean_core_x = np.concatenate([clean_upper_x, clean_lower_x])
+        clean_core_y = np.concatenate([clean_upper_y, clean_lower_y])
+        
+    except Exception as e:
+        print(f"Warning: Intersection clipping failed, using raw offset. {e}")
+        clean_core_x, clean_core_y = off_x, off_y
+
+    return clean_core_x, clean_core_y
+def export_to_creo_ibl(r, c, beta, foilpoints, exportname, scale_to_mm=True, skin_thickness=0.0):
     """
     Combines all radial stations and airfoil profiles into a single unified .ibl 
     file for direct multi-curve import into Creo Parametric.
-
-    .ibl file documentation: https://support.ptc.com/help/creo/creo_pma/r12/usascii/index.html#page/part_modeling/part_modeling/Example_Blend_File_Format.html#wwID0EHAEU
+    
+    If skin_thickness > 0, the internal profile is offset inward to create core geometry.
     """
     import numpy as np
 
     # Unpack normalized airfoil coordinates
     upper_points, lower_points = foilpoints
     foil_data = np.vstack([upper_points[::-1], lower_points])
-    foil_x = foil_data[:, 0]
-    foil_y = foil_data[:, 1]
+    base_foil_x = foil_data[:, 0]
+    base_foil_y = foil_data[:, 1]
     
     # Calculate absolute 3D LE and TE locations
     le_points, te_points = params_to_le_te(r, c, beta)
@@ -122,7 +187,6 @@ def export_to_creo_ibl(r, c, beta, foilpoints, exportname, scale_to_mm=True):
     u_thick = np.cross(u_span, u_chord)  # Normal thickness vector (n_r, 3)
     
     n_r = len(r)
-    n_foil = len(foil_x)
     scale = 1000.0 if scale_to_mm else 1.0  # Convert meters to mm if true
 
     # Write out the structural text file
@@ -137,16 +201,25 @@ def export_to_creo_ibl(r, c, beta, foilpoints, exportname, scale_to_mm=True):
             f.write(f"Begin section ! Station {i+1}: r = {r[i]:.4f} m\n")
             f.write("Begin curve\n")
             
+            # Determine if we are building the skin or the core
+            if skin_thickness > 0.0:
+                core_x, core_y = offset_airfoil_profile(base_foil_x, base_foil_y, chords[i][0], skin_thickness)
+            else:
+                core_x, core_y = base_foil_x, base_foil_y
+                
+            n_foil = len(core_x)
+            
             # Generate and write out the 3D coordinates for this profile loop
             for j in range(n_foil):
-                # 3D transformation logic matching your mesh builder
-                pt = le_points[i] + (foil_x[j] * chord_vectors[i]) + (foil_y[j] * chords[i] * u_thick[i])
+                # 3D transformation logic
+                pt = le_points[i] + (core_x[j] * chord_vectors[i]) + (core_y[j] * chords[i] * u_thick[i])
                 pt_scaled = pt * scale
                 
                 # Creo requires: [Index (1-based)] [X] [Y] [Z]
                 f.write(f"{j+1}  {pt_scaled[0]:.6f}  {pt_scaled[1]:.6f}  {pt_scaled[2]:.6f}\n")
                 
-    print(f"Successfully generated Creo geometry: {exportname}.ibl ({n_r} sections)")
+    part_type = "Core Insert" if skin_thickness > 0 else "Aerodynamic Skin"
+    print(f"Successfully generated Creo geometry: {exportname}.ibl ({n_r} sections) - {part_type}")
 
 def build_propeller_mesh(geompoints, foilpoints, num_blades=2):
     """
@@ -242,7 +315,12 @@ if __name__ == "__main__":
 
     prop_mesh = build_propeller_mesh(geompoints, foilpoints, num_blades=2)
 
-    export_to_creo_ibl(r, c, beta, (upper_points, lower_points), "propeller_blade_sections")
+    # 1. Export Full Aerodynamic Propeller (For the negative molds)
+    export_to_creo_ibl(r, c, beta, (upper_points, lower_points), "propeller_blade_mold", skin_thickness=0.0)
+
+    # 2. Export Internal Core Insert (1.5mm offset for laminate skins)
+    laminate_thickness_m = 0.0015 # 1.5mm in meters
+    export_to_creo_ibl(r, c, beta, (upper_points, lower_points), "propeller_blade_insert", skin_thickness=laminate_thickness_m)
 
     # Fire up the local PyVista testing window
     plotter = pv.Plotter()

@@ -458,15 +458,16 @@ def propgeomblender(timestamps, weights):
 
 if __name__ == "__main__":
     import proptimiser
+    import geometry
     # pass the base name/timestamp
-    timestamps = ["20260602-1442"]
+    timestamps = ["redback_v1"]
     weights = np.array([1.0])
     
     # Blending with multiple propeller geometries
     inputs, params_base = propgeomblender(timestamps, weights)
 
     print(f"--- Evaluating {inputs.n_cond} Flight Conditions ---")
-    omega = jnp.array([601.0,451.91])
+    omega = jnp.array([480.0,451.91])
 
     # Execution & Processing Loop
     exit_input = "n"
@@ -477,8 +478,8 @@ if __name__ == "__main__":
         for idx in range(inputs.n_cond):
             # Unpack unique operating points and batched variables
             cond_omega = omega[idx] # manually input omega above (solver export limitations)
-            cond_Vx = inputs.V_x[idx]
-            cond_Vyz = inputs.V_yz[idx]
+            cond_Vx = 0 #inputs.V_x[idx]
+            cond_Vyz = 0 #inputs.V_yz[idx]
 
             # Evaluate at operating conditons
             params_cond = eqx.tree_at(
@@ -499,7 +500,7 @@ if __name__ == "__main__":
             
             evaluated_conditions.append(params_cond)
             
-            # 5. Extract and print objective metrics
+            # Extract and print objective metrics
             pwr, thr, mil, _ = proptimiser.objectives(params_cond)
             cond_omega, pwr, thr, mil = jnp.squeeze(cond_omega), jnp.squeeze(pwr), jnp.squeeze(thr), jnp.squeeze(mil)
             print(f"Cond: {idx:<3} | Omega: {float(cond_omega):<6.2f} | Motor Pwr: {float(pwr):<8.4f} | Thrust: {float(thr):<8.4f} | MIL RMS: {float(mil):<10.4f}")

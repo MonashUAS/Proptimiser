@@ -503,9 +503,9 @@ def aero_coeffs(V_ia, params):
     
     # Apply 3D Rotational Corrections
     operands = (C_L_2D, C_D_2D, C_M, V_ia, params)
-    
+    rot_corr = 0
     C_L_final, C_D_final, C_M_final = lax.switch(
-        Inputs.rotational_correction,
+        rot_corr,
         [no_3d_correction, du_selig_correction],
         operands
     )

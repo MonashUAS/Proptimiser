@@ -14,6 +14,7 @@ import equinox as eqx
 # Internal Imports
 from init import Params, Inputs
 from airfoil import load_airfoil_data
+import airflow
 import propmodel
 from results import propinfoplot
 from jax.scipy.special import gammaln
@@ -33,17 +34,35 @@ def get_bezier_basis_matrix(r, R_hub, R_tip, n_cp):
     basis = binom * (t_expand ** i) * ((1 - t_expand) ** (n - i))
     return basis # Shape: (n_r, n_cp)
 
-def minimumInducedLossCost(V_ia_0):
+import airflow  # Ensure airflow is imported at the top of proptimiser.py
+
+def minimumInducedLossCost(V_ia, params):
     """
-    Returns the cost function of minimum induced loss, that is the RMS of the 
-    variation of the induced velocity at the center of the propeller by each annulus
+    Returns the cost function of minimum induced loss, using an azimuthally
+    averaged Prandtl root loss factor to weight the radial variance.
+    
+    V_ia shape: (Nr, Npsi)
     """
+    # 1. Compute the global mean across the entire disk (scalar)
+    mean_V_ia = jnp.mean(V_ia)
 
-    mean_V_ia = jnp.mean(V_ia_0)
+    # 2. Compute the local variance matrix (Nr, Npsi)
+    squared_err = (mean_V_ia - V_ia)**2
 
-    squared_err = (mean_V_ia - V_ia_0)**2
+    # 3. Collapse the azimuthal variation of the squared error to a 1D radial profile (Nr,)
+    radial_squared_err = jnp.mean(squared_err, axis=1)
 
-    rms_err = jnp.sqrt(jnp.sum(squared_err))
+    # 4. Compute the 2D Prandtl root loss factor matrix (Nr, Npsi)
+    root_loss_2d = airflow.prandtl_root_loss(V_ia, params)
+
+    # 5. Take the average of the root loss factor across azimuthal stations (Nr,)
+    mean_root_loss_radial = jnp.mean(root_loss_2d, axis=1)
+
+    # 6. Apply the averaged radial root loss penalty element-wise to the radial error
+    weighted_radial_err = radial_squared_err # mean_root_loss_radial
+
+    # 7. Compute the final RMS error over the radial stations
+    rms_err = jnp.sqrt(jnp.sum(weighted_radial_err))
 
     return rms_err
 
@@ -79,7 +98,7 @@ def objectives(params):
     V_ia, V_ia_0   = propmodel.induced_velocity(params)             # Solve induced velocity field for current guess
     thrust = jnp.squeeze(propmodel.thrust(V_ia, params))            # return the total thrust the propeller produce
     torque = jnp.squeeze(propmodel.torque(V_ia, params))            # return total torque propeller produces
-    rms_MIL_err = minimumInducedLossCost(V_ia_0)                    # minimum induced loss condition root mean square error
+    rms_MIL_err = minimumInducedLossCost(V_ia, params)            # minimum induced loss condition root mean square error
     
     # calculate the motor power
     motor_power = motorPower(torque, params.omega, I_0 = Inputs.I_0, R_m = Inputs.R_m, k_V = Inputs.k_V)
@@ -101,9 +120,9 @@ def cost_fn(params):
 
     # Calculate base cost using this condition's specific targets
     cost = (
-        params.objective_thrust * thrust_err_rel**2 + 
-        params.objective_MIL * rms_MIL_err**2 + 
-        params.objective_power * efficiency**2
+        (params.objective_thrust * thrust_err_rel)**2 + 
+        (params.objective_MIL * rms_MIL_err)**2 + 
+        (params.objective_power * efficiency)**2
     )
     
     # Scale by the relative importance weight of this flight condition
@@ -288,7 +307,7 @@ def run_optimization(params_base):
     lower_bounds = (
         jnp.full_like(vars_scaled[0], 1e-4),
         jnp.full_like(vars_scaled[1], 0.0),
-        jnp.full_like(vars_scaled[2], 400/params_base.omega_max)
+        jnp.full_like(vars_scaled[2], 300/params_base.omega_max)
     )
     
     upper_bounds = (
@@ -514,7 +533,15 @@ def run_optimization(params_base):
                         timing = f"{time.time() - iter_time:<4.1f}s" if idx == 0 else ""
                         
                         print(f"{iter_info} C{idx:<3} | {omega_cond:<5.2f} | {pwr:<12.4f} | {thr:<12.4f} | {t_err:<12.4f} | {mil:<10.4f} | {opt_err} | {timing}")
+                        # Inside the print loop
+                        cost_T = jnp.squeeze(params_struct.objective_thrust[idx] * (t_err / params_struct.thrust_target[idx])**2)
+                        
+                        # Use params_base here to avoid extracting multi-condition batched shapes for rho and R
+                        actuator_pwr_ref = propmodel.actuator_disk_power(params_struct.thrust_target[idx], params_base)
+                        cost_P = jnp.squeeze(params_struct.objective_power[idx] * (pwr / actuator_pwr_ref)**2)
 
+                        # Cast explicitly to float to safely clear any tracer or singleton array wrappers for printing
+                        print(f"Cond {idx} Internal Costs -> Thrust: {float(cost_T):.4e} | Power: {float(cost_P):.4e}")
                     print_time = time.time()
                     
                     if is_terminal:
