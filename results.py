@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 from scipy.interpolate import make_interp_spline
+import queue
 
 # Internal Imports
 import propmodel
@@ -125,105 +126,71 @@ def iterativesmoothing(params):
     
     return params
 
-def propinfoplot(params, show=True):
-    '''
-    Plot Propeller Solve Info, Including Geometry, Solver Info,
-    Induced Velocity Field and Loss Information.
-    '''
-    plt.rcParams.update({
-        "text.usetex": True,
-        "font.family": "serif",
-        "axes.labelsize": 12,
-        "axes.titlesize": 14
-    })
-    # Extract Params
-    r_m = params.r                    # Radial station in m (Needed for polar contour)
-    r = params.r * 1000               # Radial station in mm
-    c = params.c * 1000               # Chord in mm
-    beta = np.degrees(params.beta)    # Twist in Degrees
-    V_ia_0 = params.V_ia_0            # Induced velocity
-    psi = params.psi                  # Azimuthal stops (for polar plot)
-    
-    error_log = params.error_log      # State Error Per iteration
-    time_log = params.time_log        # Time Per Iteration
+class LivePropPlotter:
+    def __init__(self, params_base):
+        # 1. Setup Figure
+        self.fig = plt.figure(figsize=(14, 8))
+        self.r = np.array(params_base.r * 1000)
+        self.r_m = np.array(params_base.r)
+        self.psi = np.array(params_base.psi)
 
-    # Calculate derived metrics
-    V_ia = propmodel.inflow_model(V_ia_0, params)
-    f_root, f_tip = propmodel.tip_root_loss_factors(V_ia, params)
-    prandtl_total = f_root * f_tip * 100
+        # Subplot 1: Chord & Twist
+        self.ax1 = self.fig.add_subplot(2, 2, 1)
+        self.line_c, = self.ax1.plot(self.r, np.zeros_like(self.r), 'b-o', label='Chord (mm)')
+        self.ax1_twin = self.ax1.twinx()
+        self.line_beta, = self.ax1_twin.plot(self.r, np.zeros_like(self.r), 'r-o', label='Beta (deg)')
+        self.ax1.set_title("Chord & Twist")
+        self.ax1.legend(loc="upper left")
+        self.ax1_twin.legend(loc="upper right")
 
-    # Let the plotting begin
-    fig = plt.figure(figsize=(14, 10))
+        # Subplot 2: Convergence
+        self.ax2 = self.fig.add_subplot(2, 2, 2)
+        self.line_err, = self.ax2.plot([], [], 'orange', marker='o', label='State Error')
+        self.ax2.set_title("Convergence")
+        self.ax2.set_yscale('log') # Usually better for error tracking
 
-    # Optimum Chord & Twist Distribution (Combined)
-    # Chord Distribution
-    ax1 = fig.add_subplot(2, 2, 1)
-    line1 = ax1.plot(r, c, "o-", markersize=4, color="tab:blue", label=r"Chord ($c$)")
-    ax1.set_title(r"\textbf{Optimum Chord \& Twist Distribution}")
-    ax1.set_ylabel(r"Chord (mm)", color="tab:blue")
-    ax1.set_xlabel(r"Radius ($r$) [mm]")
-    ax1.set_xlim(left=0)
-    ax1.tick_params(axis='y', labelcolor="tab:blue")
-    ax1.grid(True, linestyle='--', alpha=0.6)
+        # Subplot 3: Polar Map
+        self.ax3 = self.fig.add_subplot(2, 2, 3, projection="polar")
+        self.ax3.set_title("Induced Velocity [m/s]")
+        dummy_V_ia = np.zeros((len(self.r), len(self.psi)))
+        self.contour = self.ax3.contourf(self.psi, self.r_m, dummy_V_ia, cmap='viridis')
+        self.cbar = self.fig.colorbar(self.contour, ax=self.ax3, pad=0.1)
 
-    # Beta Distribution
-    ax1_twin = ax1.twinx()
-    line2 = ax1_twin.plot(r, beta, 'o-', color="tab:red", markersize=4, label=r"Twist ($\beta$)")
-    ax1_twin.set_xlim(left=0)
-    ax1_twin.set_ylabel(r"Twist ($^\circ$)", color="tab:red")
-    ax1_twin.tick_params(axis='y', labelcolor="tab:red")
-    
-    lines = line1 + line2
-    labels = [l.get_label() for l in lines]
-    ax1.legend(lines, labels, loc="best")
-
-    # Convergence & Time Plot (Combined)
-    ax2 = fig.add_subplot(2, 2, 2)
-    iters = range(len(error_log))
-    line3 = ax2.plot(iters, error_log, 'o-', color="orange", markersize=4, label=r"State Error")
-    ax2.set_title(r"\textbf{Convergence \& Computation Time}")
-    ax2.set_ylabel(r"State Error", color="orange")
-    ax2.set_xlabel(r"Iterations")
-    ax2.tick_params(axis='y', labelcolor="orange")
-    ax2.grid(True, linestyle='--', alpha=0.6)
-
-    ax2_twin = ax2.twinx()
-    line4 = ax2_twin.plot(iters, time_log, 'o-', color="purple", markersize=4, label=r"Time / Iter")
-    ax2_twin.set_ylabel(r"Time per Iteration (s)", color="purple")
-    ax2_twin.tick_params(axis='y', labelcolor="purple")
-
-    lines_conv = line3 + line4
-    labels_conv = [l.get_label() for l in lines_conv]
-    ax2.legend(lines_conv, labels_conv, loc="best")
-
-    # Induced Velocity over Propeller Disk (Polar)
-    ax3 = fig.add_subplot(2, 2, 3, projection="polar")
-    # using r_m (meters) so the contour X/Y labels make sense mathematically
-    contour = ax3.contourf(psi, r_m, V_ia, cmap='viridis')
-    cbar = plt.colorbar(contour, ax=ax3, pad=0.1)
-    cbar.set_label(r"Induced Velocity $V_{ia}$ [m/s]")
-    ax3.set_title(r"\textbf{Induced Velocity over Propeller Disk}")
-    ax3.set_xlabel(r"$X$ [m]")
-    ax3.set_ylabel(r"$Y$ [m]", labelpad=30)
-
-    # Induced Loss & Prandtl Factors (Existing Twin Axis)
-    ax4 = fig.add_subplot(2, 2, 4)
-    ax4.plot(r, V_ia_0, 'o-', color="green", label=r"Induced Loss", markersize=4)
-    ax4.set_title(r"\textbf{Loss Metrics by Radius}")
-    ax4.set_ylabel(r"Induced Velocity (m/s)", color="green")
-    ax4.tick_params(axis='y', labelcolor='green')
-    ax4.set_xlabel(r"Radius ($r$) [mm]")
-    ax4.grid(True, linestyle='--', alpha=0.6)
-
-    ax4_twin = ax4.twinx()
-    ax4_twin.plot(r, prandtl_total, color='blue', linestyle='--', label=r"Prandtl Loss Factors")
-    ax4_twin.set_ylabel(r"Prandtl Factor (\%)", color='blue')
-    ax4_twin.tick_params(axis='y', labelcolor='blue')
-
-    if show:
         plt.tight_layout()
-        plt.show()
-    return fig
+
+    def update(self, frame_data, q):
+        """
+        FuncAnimation calls this repeatedly. We drain the queue to get the newest data.
+        """
+        latest_data = None
+        # Drain the queue to only plot the absolute latest state (prevents UI lag)
+        while not q.empty():
+            try:
+                latest_data = q.get_nowait()
+            except queue.Empty:
+                break
+        
+        if latest_data is None:
+            return # Nothing new to plot
+
+        # 1. Update Lines
+        self.line_c.set_ydata(latest_data['c'])
+        self.line_beta.set_ydata(latest_data['beta'])
+        
+        iters = np.arange(len(latest_data['error_log']))
+        self.line_err.set_data(iters, latest_data['error_log'])
+
+        # 2. Re-scale Axes dynamically
+        self.ax1.relim(); self.ax1.autoscale_view()
+        self.ax1_twin.relim(); self.ax1_twin.autoscale_view()
+        self.ax2.relim(); self.ax2.autoscale_view()
+
+        # 3. Update Polar Contour (Requires clearing old collections)
+        for coll in self.ax3.collections:
+            coll.remove()
+        self.contour = self.ax3.contourf(self.psi, self.r_m, latest_data['V_ia'], cmap='viridis')
+
+        return self.line_c, self.line_beta, self.line_err
 
 def debug_diagnostics_plot(params, cond_idx, show=True):
     '''

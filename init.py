@@ -6,72 +6,64 @@ jax.config.update("jax_disable_jit", False)
 jax.config.update("jax_debug_nans", False)
 jax.config.update("jax_enable_x64", True)
 
-# External Imports
 from dataclasses import dataclass
 import equinox as eqx
 import jax.numpy as jnp
 
-# Freeze configuration parameters at runtime
+# Internal Imports
+import geometry
+
 class Inputs(eqx.Module):
-    ## Optimisation / design settings which remain constant during execution
-    # Outer-loop Optimisation (L-BFGS or ADAM)
-    opt_solver: str = "L-BFGS-B" # Toggle Optimisation Loop (type of optimisation algorithm.)
-    opt_smoothing: str = "pointwise" # pointwise or bezier. Bezier often breaks propeller shape.
+    # Outer-loop Optimisation (Currently only L-BFGS-B works)
+    opt_solver: str = "L-BFGS-B"
     opt_max_iter: int = 1000
-    opt_tol: float = 1e-3   # Optimiser Stability Criteria
+    opt_tol: float = 1e-3   
 
     # Induced Velocity Settings
-    V_ia_0_max_iter: int = 100
-    V_ia_0_eps: float = 1e-3
+    V_ia_0_max_iter: int = 500
+    V_ia_0_eps: float = 1e-4
 
     # Solver Type
     solvertype: str = "T"
-    solve_omega: int = 0 # 0 for fixed omega, 1 for omega solving
+    solve_omega: int = 1
 
-    ## Discretisation settings
-    # Radial discretisation
+    # Discretisation settings
     n_r: int = 50
-    # Azimuthal discretisation (for skewed inflow)
     n_psi: int = 16
-    # Number of Control Points
-    n_cp: int = 12
 
-    # diagnostics/debugging
+    # Diagnostics
     verbose: bool = False
     jax_tracing: bool = False
 
-    ## Input Parameters
-    # Geometry Setup (universal across propeller)
+    # Geometry Setup
     R_tip = 0.25
     R_hub = 0.025
 
-    ## --- FLIGHT CONDITIONS (Batched as Arrays) ---
+    # Flight Conditions
     n_cond: int = 1
-    # Index 0: Hover | Index 1: Forward Flight | etc...            
     thrust_target = jnp.array([22.5])
-    
-    V_x = jnp.array([0])
-    V_yz = jnp.array([30.0])
-    omega= jnp.array([400.0])
-    
+    V_x = jnp.array([8.60])
+    V_yz = jnp.array([12.29])
+    omega = jnp.array([480.0])
     objective_weight = jnp.array([1.0])
 
     # Motor Information
-    I_0: float = 0.7           # Zero Load Current (amps)
-    R_m: float = 0.120         # Coil Resistance   (ohms)
-    k_V: float = 150           # Motor kV          (RPM/Volt)
+    I_0: float = 0.7           
+    R_m: float = 0.120         
+    k_V: float = 150
 
     # Aerodynamic Models Selection
-    inflow_model: int = 1 # 0 = basic, 1 = Pitt & Peters, 2 = DTU (WIP)
-    coeff_method: int = 2 # 0 = parametric, 1 = alpha/reynolds, 2 = alpha/mach/reynolds
-    tip_loss_model: int = 1 # 0 = none, 1 = Prandtl
-    root_loss_model: int = 1 # 0 = none, 1 = Prandtl
+    inflow_model: int = 1
+    coeff_method: int = 3 # 0: Parametric, 1: 2D Interp, 2: 3D Interp, 3: NeuralFoil
+    tip_loss_model: int = 1 # 0: No Loss 1: Prandtl
+    root_loss_model: int = 1
+    rot_corr_model: int = 1 # 3D inflow correction model
+    high_induction_model: int = 1 # (0: Classical Momentum, 1: Buhl Correction)
+
     def save_state(self, filename: str = "inputs_state.eqx"):
         """Saves the Inputs configuration to an Equinox file."""
-        if not filename.endswith(".eqx"):
-            filename += ".eqx"
-        # make sure files are saved to propellers
-        filename = "propellers/"+filename
+        if not filename.endswith(".eqx"): filename += ".eqx"
+        filename = "propellers/" + filename
         eqx.tree_serialise_leaves(filename, self)
         print(f"Inputs state successfully written to: {filename}")
     
@@ -80,12 +72,10 @@ class Inputs(eqx.Module):
         Loads and returns a new Inputs instance from an Equinox file.
         Uses 'self' as the structural skeleton.
         """
-        if not filename.endswith(".eqx"):
-            filename += ".eqx"
-        # make sure files are loaded from propellers
-        filename = "propellers/"+filename
-        # Returns a NEW instance with the loaded data
+        if not filename.endswith(".eqx"): filename += ".eqx"
+        filename = "propellers/" + filename
         return eqx.tree_deserialise_leaves(filename, self)
+
 
 class Params(eqx.Module):
     '''
@@ -105,9 +95,6 @@ class Params(eqx.Module):
     N: jnp.ndarray          # number of blades
     c: jnp.ndarray          # chord length at radial stations (m)
     beta: jnp.ndarray       # blade twist angle (rad)
-
-    c_cp: jnp.ndarray       # chord control points
-    beta_cp: jnp.ndarray    # twist control points
 
     c_scale: jnp.ndarray    # scale of chord
     beta_scale: jnp.ndarray # scale of angle
@@ -141,17 +128,14 @@ class Params(eqx.Module):
     # Aerodynamic Constants
     rho: float = 1.225          # air density (kgm^{-3})
     mu: float = 1.798e-5        # air viscosity (kgm^-1s^-1)
-    a: float = 343.0            # speed of sound (m/s)
+    a: float = 343.0            # speed of sound (m/s)      
 
     def save_state(self, filename: str = "params_state.eqx"):
+        
         """Saves the array parameters to an Equinox file."""
-        # ensure extension is used
-        if not filename.endswith(".eqx"):
-            filename += ".eqx"
-        # make sure files are saved to propellers
-        filename = "propellers/"+filename
+        if not filename.endswith(".eqx"): filename += ".eqx"
+        filename = "propellers/" + filename
         eqx.tree_serialise_leaves(filename, self)
-        print(f"Params state successfully written to: {filename}")
 
     def load_state(self, filename: str = "params_state.eqx"):
         """
@@ -159,94 +143,118 @@ class Params(eqx.Module):
 
         Acts on 'self' as the structural skeleton and returns a populated copy.
         """
-        if not filename.endswith(".eqx"):
-            filename += ".eqx"
-        # make sure files are loaded from propellers/ folder
-        filename = "propellers/"+filename
-        # Returns a NEW instance with the loaded data overlaid on the current object's skeleton
+        if not filename.endswith(".eqx"): filename += ".eqx"
+        filename = "propellers/" + filename
         return eqx.tree_deserialise_leaves(filename, self)
-    
-if __name__ == "__main__":
-    '''
-    Complete a Propeller Optimisation Run from the Terminal.
 
-    Modify Values in Init()
-    '''
-    from datetime import datetime
+
+def build_default_propeller(c: float = 0.02, beta: float = 10.0, inputs: Inputs = None, airfoil_name: str = "arad10") -> Params:
+    """
+    Factory function to build a default Params configuration.
+    """
     # Internal Imports
-    import propmodel
-    import proptimiser
-    import results
-    import geometry
     from airfoil import load_airfoil_data
+    if inputs is None:
+        inputs = Inputs()
 
-    ## SOLVER SPECS
-    airfoil = "arad10"
+    # Geometry constraints
+    c_scale = 0.2                   
+    beta_scale = jnp.radians(50)    
 
-    c_scale = 0.2                   # Max chord (m)
-    beta_scale = jnp.radians(50)    # Max twist (rad)
+    # Build Grids
+    psi, dpsi = geometry.angular_stops(inputs.n_psi)
+    r, dr = geometry.radial_stops(inputs.R_tip, inputs.R_hub, inputs.n_r)
 
-    # Initial Geometry setup
-    psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
-    
-    r, dr = propmodel.radial_stops(Inputs.R_tip, Inputs.R_hub, Inputs.n_r)
+    # Constant chord across the whole blade
+    init_c = jnp.full((Inputs.n_r,), c) 
+    # Constant twist across the whole blade
+    init_beta = jnp.full((Inputs.n_r,), jnp.radians(beta))
 
-    # Twist distribution starting guess (in degrees): 
-    init_beta_cp = jnp.radians(jnp.array([18.0,16.0,16.0,16.0,14.0,7.0,7.0,4.0,4.0,4.0,4.0,4.0]))
-
-    # Chord distribution (in meters): 
-    init_c_cp = jnp.array([0.05,0.05,0.05,0.05,0.05,0.05,0.04,0.03,0.03,0.03,0.03,0.03])
-
-    # Interpolate airfoil data
-    airfoil_interp = load_airfoil_data("arad10")
-
-    spline_matrix_init = proptimiser.get_bezier_basis_matrix(r, Inputs.R_hub, Inputs.R_tip, Inputs.n_cp)
-    init_c = jnp.dot(init_c_cp, spline_matrix_init.T)
-    init_beta = jnp.dot(init_beta_cp, spline_matrix_init.T)
-
-    # Initialise Params Class (will be duplicated for inputs in run_optimisation)
-
-    params_init = Params(
-        airfoil = airfoil,
+    # Airfoil Data
+    airfoil_interp = load_airfoil_data(airfoil_name)
+    # Construct Params
+    return Params(
+        airfoil=airfoil_name,
         airfoil_interp=airfoil_interp,
-        N=2,
+        N=jnp.array([2]), # Ensure standard shape
         c=init_c,      
         beta=init_beta,
-        c_cp=init_c_cp,
-        beta_cp=init_beta_cp,
         r=r, dr=dr,    
         psi=psi, dpsi=dpsi, 
-        V_x=jnp.array([Inputs.V_x[0]]), V_yz=jnp.array([Inputs.V_yz[0]]),
-        omega=jnp.array([Inputs.omega[0]]),
-        omega_max = Params.a / Inputs.R_tip,
-        V_ia_0=jnp.full((Inputs.n_r), 4.0), # Induced Velocity Field guess
-        c_scale = c_scale,
-        beta_scale = beta_scale,
-        error_log = jnp.array([1.0]),
-        time_log = jnp.array([0]),
-
-        # Cost Weights
+        V_x=inputs.V_x, 
+        V_yz=inputs.V_yz,
+        omega=inputs.omega,
+        omega_max=343.0 / inputs.R_tip,
+        V_ia_0=jnp.full((inputs.n_r,), 4.0), 
+        c_scale=c_scale,
+        beta_scale=beta_scale,
+        error_log=jnp.array([1.0]),
+        time_log=jnp.array([0.0]),
         objective_thrust=jnp.array([50.0]),
         objective_MIL=jnp.array([1.0]),
         objective_power=jnp.array([0.0]),
-        objective_weight=Inputs.objective_weight,
-        thrust_target=Inputs.thrust_target,
+        objective_weight=inputs.objective_weight,
+        thrust_target=inputs.thrust_target,
     )
 
-    print(f"Initialised Airfoil Fit with airfoil {params_init.airfoil}")
+if __name__ == "__main__":
+    from datetime import datetime
+    import threading
+    import queue
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
+
+    # Internal Imports
+    import proptimiser
+    import results
+    import geometry
+
+    base_params = build_default_propeller(inputs = Inputs)
+    
+    # Swap anything from default propeller params here
+    new_omega = jnp.array([480.0])
+    params_init = eqx.tree_at(lambda p: p.omega, base_params, new_omega)
+
+    print(f"Initialised airfoil interpolation with airfoil {params_init.airfoil}")
+
+    # Live Plotting Setup
+    print("Setting up live visualization canvas...")
+    gui_queue = queue.Queue()
+    plotter = results.LivePropPlotter(params_init)
 
     if Inputs.jax_tracing:
         print("Starting Profiler...")
-        # This will create a directory called /tmp/jax_trace (or a folder of your choice)
         jax.profiler.start_trace("/tmp/jax_trace")
-        
-    # Run Optimiser
-    params_opt_hover = proptimiser.run_optimization(params_init)
+
+    thread_results = {}
     
+    def optimization_worker():
+        # Run optimization on background thread and pass the queue
+        optimized_state = proptimiser.run_optimization(params_init, update_queue=gui_queue)
+        thread_results['params_opt'] = optimized_state
+
+    # Run Optimisation in Background Thread
+    opt_thread = threading.Thread(target=optimization_worker, daemon=True)
+    opt_thread.start()
+    
+    # This automatically polls the queue and refreshes the canvas
+    ani = FuncAnimation(
+        plotter.fig, 
+        plotter.update, 
+        fargs=(gui_queue,), 
+        interval=200, 
+        cache_frame_data=False
+    )
+    
+    # Hands control to the GUI until the window is closed
+    plt.show()
+
+    # Re-join thread to ensure clean closure 
+    opt_thread.join()
+    params_opt_hover = thread_results.get('params_opt', params_init)
+
     if Inputs.jax_tracing:
-        # Block until all asynchronous JAX operations finish
         jax.block_until_ready(params_opt_hover) 
-        
         jax.profiler.stop_trace()
         print("Profiler stopped. Trace saved to /tmp/jax_trace")
 
@@ -257,8 +265,6 @@ if __name__ == "__main__":
         paramsfile = "prop_params_" + timestamp
         inputsfile = "prop_inputs_" + timestamp
         print(f'Saving Propeller Inputs/Parameters to {paramsfile} and {inputsfile}')
-
-        # Use the instantiated object references (params_opt and an Inputs instance)
         params_opt_hover.save_state(paramsfile)
         Inputs().save_state(inputsfile)
     
@@ -270,6 +276,3 @@ if __name__ == "__main__":
         print(f'Saving Propeller Geometry to {exportname}.pts')
 
     print('Proptimisation Complete')
-
-    # Plot Info
-    results.propinfoplot(params_opt_hover)

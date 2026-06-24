@@ -12,3 +12,6 @@ scipy
 equinox
 interpax
 slsqp-jax
+
+neuralfoil
+aerosandbox

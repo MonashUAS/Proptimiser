@@ -16,25 +16,8 @@ from init import Params, Inputs
 from airfoil import load_airfoil_data
 import airflow
 import propmodel
-from results import propinfoplot
 from jax.scipy.special import gammaln
 
-# Bezier Curve Function for Smoothing
-
-def jax_comb(n, k):
-    """Continuous binomial coefficient for JAX differentiability."""
-    return jnp.exp(gammaln(n + 1) - gammaln(k + 1) - gammaln(n - k + 1))
-
-def get_bezier_basis_matrix(r, R_hub, R_tip, n_cp):
-    t = (r - R_hub) / (R_tip - R_hub)
-    n = n_cp - 1
-    i = jnp.arange(n + 1)
-    t_expand = t[:, None]
-    binom = jax_comb(n, i)
-    basis = binom * (t_expand ** i) * ((1 - t_expand) ** (n - i))
-    return basis # Shape: (n_r, n_cp)
-
-import airflow  # Ensure airflow is imported at the top of proptimiser.py
 
 def minimumInducedLossCost(V_ia, params):
     """
@@ -129,7 +112,7 @@ def cost_fn(params):
     weighted_cost = cost * params.objective_weight
     return weighted_cost, V_ia_0
 
-def objectives_fn(opt_vars_scaled, params_list, spline_matrix): 
+def objectives_fn(opt_vars_scaled, params_list): 
     '''
     Vectorized objective function mapping over an ensemble of single-condition Params
     '''
@@ -139,17 +122,14 @@ def objectives_fn(opt_vars_scaled, params_list, spline_matrix):
     # Direct pointwise variable assignment
     c = params_list.c_scale[:, None] * c_scaled[None, :]
     beta = params_list.beta_scale[:, None] * beta_scaled[None, :]
-    # Keep PyTree structure identical
-    c_cp = params_list.c_cp
-    beta_cp = params_list.beta_cp
 
     omega = lax.switch(Inputs.solve_omega, [lambda _: params_list.omega, lambda _: params_list.omega_max * omega_scaled], None)
 
     # Update parameters list with new geometry and control points
     params_list = eqx.tree_at(
-        lambda p: (p.c, p.beta, p.c_cp, p.beta_cp, p.omega), 
+        lambda p: (p.c, p.beta, p.omega), 
         params_list, 
-        (c, beta, c_cp, beta_cp, omega)
+        (c, beta, omega)
     )
 
     # vmap cost function over parameters list
@@ -159,7 +139,7 @@ def objectives_fn(opt_vars_scaled, params_list, spline_matrix):
     aux = (V_ia_0)
     return jnp.sum(costs), aux
 
-def apply_vars_to_struct(vars_scaled, params_struct, spline_matrix):
+def apply_vars_to_struct(vars_scaled, params_struct):
     """
     Helper function to apply scaled variables to the batched parameter structure.
     """
@@ -168,15 +148,13 @@ def apply_vars_to_struct(vars_scaled, params_struct, spline_matrix):
     # Direct pointwise variable assignment
     c = params_struct.c_scale[:, None] * c_scaled[None, :]
     beta = params_struct.beta_scale[:, None] * beta_scaled[None, :]
-    c_cp = params_struct.c_cp
-    beta_cp = params_struct.beta_cp
 
     omega = omega_scaled * params_struct.omega_max
 
     # Update parameters list with new geometry and control points
-    return replace(params_struct, c=c, beta=beta, c_cp=c_cp, beta_cp=beta_cp, omega=omega)
+    return replace(params_struct, c=c, beta=beta, omega=omega)
 
-def slsqp_objective(vars_scaled, params_struct, spline_matrix):
+def slsqp_objective(vars_scaled, params_struct):
     '''
     Pure performance cost function (Power & MIL) for the slsqp solver.
     '''
@@ -185,7 +163,7 @@ def slsqp_objective(vars_scaled, params_struct, spline_matrix):
                     x=jax.tree_util.tree_map(jnp.shape, vars_scaled))
 
     # Pass PyTree directly to the struct applier
-    params_updated = apply_vars_to_struct(vars_scaled, params_struct, spline_matrix)
+    params_updated = apply_vars_to_struct(vars_scaled, params_struct)
     
     # Evaluate objectives across all conditions
     motor_power, _, rms_MIL_err, _ = evaluate_all_conditions(params_updated)
@@ -212,7 +190,7 @@ def slsqp_objective(vars_scaled, params_struct, spline_matrix):
     
     return total_cost
 
-def slsqp_eq_constraints(vars_scaled, params_struct, spline_matrix):
+def slsqp_eq_constraints(vars_scaled, params_struct):
     '''
     Equality constraints for slsqp-jax. Returns an array of relative thrust errors.
     '''
@@ -220,7 +198,7 @@ def slsqp_eq_constraints(vars_scaled, params_struct, spline_matrix):
     jax.debug.print("Constraint - vars_scaled shapes: {x}", 
                     x=jax.tree_util.tree_map(jnp.shape, vars_scaled))
 
-    params_updated = apply_vars_to_struct(vars_scaled, params_struct, spline_matrix)
+    params_updated = apply_vars_to_struct(vars_scaled, params_struct)
     
     # We only need thrust for the constraint
     _, thrust, _, _ = evaluate_all_conditions(params_updated)
@@ -262,7 +240,7 @@ def get_manual_unflatten(c_shape, b_shape, o_shape):
     
     return manual_unflatten
 
-def run_optimization(params_base):
+def run_optimization(params_base, update_queue=None):
     '''
     The Meat and Bones of the Optimisation Algorithm.
     Iterate until solution is stable or criteria are met.
@@ -288,21 +266,11 @@ def run_optimization(params_base):
     # Convert list into a stacked PyTree object that JAX natively unrolls via vmap
     params_struct = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *conditions_list)
 
-    # Define optimisation variables and bounds
-    if Inputs.opt_smoothing == "bezier":
-        vars_scaled = (
-            params_base.c_cp / params_base.c_scale,
-            params_base.beta_cp / params_base.beta_scale,
-            params_struct.omega / params_base.omega_max # Shape (2,)
-        )
-    elif Inputs.opt_smoothing == "pointwise":
-        vars_scaled = (
-            params_base.c / params_base.c_scale,
-            params_base.beta / params_base.beta_scale,
-            params_struct.omega / params_base.omega_max # Shape (2,)
-        )
-    else:
-        raise ValueError("Inputs.opt_smoothing must be 'bezier' or 'pointwise'")
+    vars_scaled = (
+        params_base.c / params_base.c_scale,
+        params_base.beta / params_base.beta_scale,
+        params_struct.omega / params_base.omega_max # Shape (2,)
+    )
 
     lower_bounds = (
         jnp.full_like(vars_scaled[0], 1e-4),
@@ -317,9 +285,6 @@ def run_optimization(params_base):
     )
     
     bounds = (lower_bounds, upper_bounds)
-
-    # Set up control point to spline matrix
-    spline_matrix = get_bezier_basis_matrix(params_struct.r[0], Inputs.R_hub, Inputs.R_tip, Inputs.n_cp)
 
     # Start the clock
     start_time = time.time()
@@ -358,7 +323,7 @@ def run_optimization(params_base):
         def compute_obj_val_and_grad(flat_x, current_params):
             def f(x):
                 vars_scl = unflatten_fn(x)
-                params_updated = apply_vars_to_struct(vars_scl, current_params, spline_matrix)
+                params_updated = apply_vars_to_struct(vars_scl, current_params)
                 motor_power, _, rms_MIL_err, final_V_ia_0 = evaluate_all_conditions(params_updated)
                 
                 actuator_disk_power = jax.vmap(propmodel.actuator_disk_power)(params_updated.thrust_target, params_updated)
@@ -379,7 +344,7 @@ def run_optimization(params_base):
         def compute_con_val_and_jac(flat_x, current_params):
             def c_fn(x):
                 vars_scl = unflatten_fn(x)
-                params_updated = apply_vars_to_struct(vars_scl, current_params, spline_matrix)
+                params_updated = apply_vars_to_struct(vars_scl, current_params)
                 _, thrust, _, final_V_ia_0 = evaluate_all_conditions(params_updated)
                 thrust_err_rel = (thrust - params_updated.thrust_target) / params_updated.thrust_target
                 return thrust_err_rel, final_V_ia_0
@@ -427,7 +392,7 @@ def run_optimization(params_base):
             flat_x = jnp.array(xk, dtype=jnp.float64)
             current_params = state_container["params_struct"]
             vars_scl = unflatten_fn(flat_x)
-            params_updated = apply_vars_to_struct(vars_scl, current_params, spline_matrix)
+            params_updated = apply_vars_to_struct(vars_scl, current_params)
             
             powers, thrusts, rms_MIL_errs, _ = evaluate_all_conditions(params_updated)
             
@@ -438,7 +403,22 @@ def run_optimization(params_base):
                 timing = f"{time.time() - start_time:<4.1f}s" if idx == 0 else ""
                 print(f"{iter_str} | C{idx:<3} | {omega_cond:<10.2f} | {pwr:<12.4f} | {thr:<12.4f} | {t_err:<12.4f} | {mil:<10.4f} | {timing}")
             print("-" * 90)
-
+            if update_queue is not None:
+                c_np = np.array(params_updated.c[0]) * 1000
+                beta_np = np.degrees(np.array(params_updated.beta[0]))
+                
+                # Pass current error log structure
+                current_errors = np.array(error_log) 
+                
+                V_ia_0_curr = params_updated.V_ia_0[0]
+                V_ia_curr = np.array(propmodel.inflow_model(V_ia_0_curr, params_base))
+                
+                update_queue.put({
+                    'c': c_np,
+                    'beta': beta_np,
+                    'error_log': current_errors,
+                    'V_ia': V_ia_curr
+                })
         # 6. EXECUTE SCIPY MINIMIZATION
         constraints = [
             {
@@ -464,7 +444,7 @@ def run_optimization(params_base):
         vars_scaled_opt = unflatten_fn(final_flat_vars)
         
         params_struct = state_container["params_struct"]
-        params_struct = apply_vars_to_struct(vars_scaled_opt, params_struct, spline_matrix)
+        params_struct = apply_vars_to_struct(vars_scaled_opt, params_struct)
         
         powers, thrusts, rms_MIL_errs, final_V_ia_0 = evaluate_all_conditions(params_struct)
         params_struct = eqx.tree_at(lambda p: p.V_ia_0, params_struct, final_V_ia_0)
@@ -473,6 +453,7 @@ def run_optimization(params_base):
         time_log = jnp.append(time_log, time.time() - start_time)
 
     elif Inputs.opt_solver == "L-BFGS-B":
+        import numpy as np
         solver = jaxopt.LBFGSB(
             fun=objectives_fn, 
             has_aux=True,
@@ -480,7 +461,7 @@ def run_optimization(params_base):
             jit=True
         )
         print("Initialising Solver...")
-        state = solver.init_state(init_params=vars_scaled, bounds=bounds, params_list=params_struct, spline_matrix=spline_matrix)
+        state = solver.init_state(init_params=vars_scaled, bounds=bounds, params_list=params_struct)
         print(f"{'Iter':<6} | {'Cond':<5} | {'Omega':<10} | {'Power':<12} | {'Thrust':<12} | {'T-Err':<12} | {'MIL':<10} | {'OptErr':<11} | {'Time'}")
         print("-" * 103)
         try:
@@ -488,8 +469,7 @@ def run_optimization(params_base):
                 vars_scaled, state = solver.update(vars_scaled, 
                                                 state=state, 
                                                 bounds=bounds, 
-                                                params_list=params_struct,
-                                                spline_matrix=spline_matrix
+                                                params_list=params_struct
                                                 )
                 # state.aux captures the updated tracking profiles (shape: [2, n_r])
                 # We assign them directly back to keep Newton warm-starts efficient
@@ -497,24 +477,15 @@ def run_optimization(params_base):
                 c_scaled, beta_scaled, omega_scaled = vars_scaled
                 # toggle for omega
                 omega = lax.switch(Inputs.solve_omega, [lambda _: params_struct.omega, lambda _: params_struct.omega_max * omega_scaled], None)
-                
-                if Inputs.opt_smoothing == "bezier":
-                    c_cp = params_struct.c_scale[:, None] * c_scaled[None, :]
-                    beta_cp = params_struct.beta_scale[:, None] * beta_scaled[None, :]
-                    c = jnp.dot(c_cp, spline_matrix.T)
-                    beta = jnp.dot(beta_cp, spline_matrix.T)
-                else: # pointwise
-                    c = params_struct.c_scale[:, None] * c_scaled[None, :]
-                    beta = params_struct.beta_scale[:, None] * beta_scaled[None, :]
-                    c_cp = params_struct.c_cp # Pass through dummy CPs to keep eqx.tree_at happy
-                    beta_cp = params_struct.beta_cp
+                c = params_struct.c_scale[:, None] * c_scaled[None, :]
+                beta = params_struct.beta_scale[:, None] * beta_scaled[None, :]
 
                 # Extract the updated V_ia_0 from state.aux and update params_struct
                 V_ia_0 = state.aux
                 params_struct = eqx.tree_at(
-                    lambda p: (p.c, p.beta, p.c_cp, p.beta_cp, p.omega, p.V_ia_0), 
+                    lambda p: (p.c, p.beta, p.omega, p.V_ia_0), 
                     params_struct, 
-                    (c, beta, c_cp, beta_cp, omega, V_ia_0)
+                    (c, beta, omega, V_ia_0)
                 )
 
                 # Print Statements for this Iteration
@@ -523,7 +494,6 @@ def run_optimization(params_base):
 
                 if is_terminal or is_checkpoint:
                     powers, thrusts, rms_MIL_errs, _ = evaluate_all_conditions(params_struct)
-                    
                     for idx, (pwr, thr, mil) in enumerate(zip(powers, thrusts, rms_MIL_errs)):
                         t_err = thr - params_struct.thrust_target[idx]
                         omega_cond = omega[idx]
@@ -543,6 +513,22 @@ def run_optimization(params_base):
                         # Cast explicitly to float to safely clear any tracer or singleton array wrappers for printing
                         print(f"Cond {idx} Internal Costs -> Thrust: {float(cost_T):.4e} | Power: {float(cost_P):.4e}")
                     print_time = time.time()
+                    if update_queue is not None:
+                        c_np = jnp.array(params_struct.c[0]) * 1000
+                        beta_np = jnp.degrees(jnp.array(params_struct.beta[0]))
+                        
+                        # Ensure error_log includes the current step
+                        current_errors = jnp.append(jnp.array(error_log), float(state.error))
+                        
+                        V_ia_0_curr = params_struct.V_ia_0[0]
+                        V_ia_curr = jnp.array(propmodel.inflow_model(V_ia_0_curr, params_base))
+                        
+                        update_queue.put({
+                            'c': c_np,
+                            'beta': beta_np,
+                            'error_log': current_errors,
+                            'V_ia': V_ia_curr
+                        })
                     
                     if is_terminal:
                         print(f"\nStopping: Convergence reached at step {i}")
@@ -570,16 +556,12 @@ def run_optimization(params_base):
     # return optimised variables
     final_c = params_struct.c[0]
     final_beta = params_struct.beta[0]
-    final_c_cp = params_struct.c_cp[0]          
-    final_beta_cp = params_struct.beta_cp[0]   
     final_omega = params_struct.omega[0]
     final_V_ia_0 = params_struct.V_ia_0[0]
 
     return replace(params_base, 
                 c=final_c, 
-                beta=final_beta, 
-                c_cp=final_c_cp,               
-                beta_cp=final_beta_cp,          
+                beta=final_beta,   
                 omega=final_omega,
                 V_ia_0=final_V_ia_0,
                 error_log=error_log, 

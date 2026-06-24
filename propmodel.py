@@ -3,37 +3,17 @@
 # External Libraries
 import jax
 import jax.numpy as jnp
-
+import equinox as eqx
 import jaxopt
+from dataclasses import replace
 
 import numpy as np
 import matplotlib.pyplot as plt
 
 # Internal Libraries
-from init import Inputs, Params
+from init import build_default_propeller, Inputs, Params
 from airfoil import aero_coeffs
-from airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskEfficiency, resultantVelocityComponents
-
-
-### Integrand Functions
-def radial_stops(R, r_hub, n_r):
-    '''
-    Return radial node centers and dr for integration.
-    '''
-    r = jnp.linspace(r_hub + (R - r_hub) / (2 * n_r), R - (R - r_hub) / (2 * n_r), n_r)
-    # Simple Homogeneous radial spacing
-    dr = jnp.ones_like(r)*(R - r_hub) / n_r
-    return r, dr
-
-
-def angular_stops(n_psi):
-    '''
-    Return angular node centers and dpsi for integration
-    '''
-    psi = jnp.linspace(0, (2 * jnp.pi), n_psi)
-    dpsi = jnp.ones_like(psi)*(2 * jnp.pi) / n_psi
-    return psi, dpsi
-
+from airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskEfficiency, resultantVelocityComponents, high_induction_correction
 
 ### Calculate thrust, hub and torque elements
 def dT_blade(V_ia: jnp.ndarray, params: Params, debug: bool=False):
@@ -226,38 +206,34 @@ def dT_momentum(V_ia, params, debug=False):
 
     Uses formulation from (M. Nahon et al., 2015) equation 9
     """
-    # Unpack parameters
+    # Momentum theory about annular element
     r, psi = params.r, params.psi
     V_x, V_yz = params.V_x, params.V_yz
     rho = params.rho
 
-    # total velocity through each differential segment
-    V_prime = jnp.sqrt((V_x + V_ia) ** 2 + V_yz ** 2)
-
     # Tip and Root Loss Factors
     tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
-
-    # Calculate the total prandtl loss correction factor
     F = jnp.multiply(tip_loss, root_loss) 
+    F = jnp.clip(F, min=0.05, max=1.0)
 
-    # Momentum theory about annular element
-    dT_momentum = 2 * rho * r * jnp.trapezoid(V_ia * V_prime * F, x=psi, axis=1) #* dr
+    # Compute baseline classical momentum element locally
+    V_prime = jnp.sqrt((V_x + V_ia) ** 2 + V_yz ** 2)
+    dT_element_classical = 2 * rho * r[:, None] * V_ia * V_prime * F
+
+    # Route through lax.switch inside airflow.py for conditional modifications
+    dT_element_corrected = high_induction_correction(dT_element_classical, V_ia, F, params)
+
+    # Integrate over psi to get the average thrust per annulus
+    dT_momentum_ave = jnp.trapezoid(dT_element_corrected, x=psi, axis=1)
 
     if debug:
         print("------dT_momentum DEBUG------")
-
-        print("dT Shapes (ave.):")
-        print(jnp.shape(dT_momentum))
-
-        print("V_ia shape:")
-        print(jnp.shape(V_ia))
-
-        print("F shape:")
-        print(jnp.shape(F))
-        
+        print("dT Shapes (ave.):", jnp.shape(dT_momentum_ave))
+        print("V_ia shape:", jnp.shape(V_ia))
+        print("F shape:", jnp.shape(F))
         print("------dT_momentum DEBUG------")
 
-    return dT_momentum
+    return dT_momentum_ave
 
 def thrust_residual(V_ia_0_guess, params):
     """
@@ -415,98 +391,51 @@ def actuator_disk_power(T, params):
     P_act = T*(V_x+v_induced) # Ideal actuator disk power
     return jnp.squeeze(P_act)
 
-def single(R, c, beta, N, plot=False):
-        '''
-        Single Annulus Solve
+def single(c, beta, N, plot=False):
+    '''
+    Single Annulus Solve
+    '''
+    inputs = Inputs(
+        n_r=1
+    )
+    # Build the default propeller profile
+    beta_deg = float(jnp.degrees(beta))
+    params = build_default_propeller(c=c, beta=beta_deg, inputs=inputs)
 
-        TODO: Bug-Fix so it works again
-        '''
-        psi,dpsi = angular_stops(Inputs.n_psi)
-        jax.config.update("jax_enable_x64", True)
-        jax.config.update("jax_debug_nans", False)
+    # Match the specific geometry overrides from your original test case
+    params = eqx.tree_at(
+        lambda p: (p.r, p.dr, p.N, p.V_ia_0),
+        params,
+        (jnp.array([0.3]), jnp.array([0.05]), jnp.array([N]), jnp.full((1,), 1.0))
+    )
 
+    # Solve Induced Velocity
+    V_ia, _ = induced_velocity(params)
 
-        #Update Parameters Class
-        from airfoil import load_airfoil_data
-
-        airfoil_interp = load_airfoil_data("arad10")
-
-        params = Params(
-                    N = N,
-                    c = jnp.array([c]),
-                    beta = jnp.array([jnp.radians(beta)]),
-
-                    r = jnp.array([0.3]),
-                    dr = jnp.array([0.05]),
-
-                    psi = psi,
-                    dpsi = dpsi,
-
-                    V_x = jnp.array([10.0]),
-                    V_yz = jnp.array([3.0]),
-                    omega = jnp.array([60]),
-
-                    V_ia_0 = jnp.full((Inputs.n_r,), jnp.array([1.0])),
-                    airfoil_interp = airfoil_interp,
-                    airfoil = "arad10"
-                )
-
-        # Solve
-        V_ia, _ = induced_velocity(params)
-
-        # Plot Induced Velocity Distribution about singular annulus
-        plt.plot(jnp.degrees(params.psi), V_ia[1])
+    if plot:
+        # FIX: Changed V_ia[1] to V_ia[0] since there is only 1 radial node
+        plt.plot(jnp.degrees(params.psi), V_ia[0])
         plt.title("Induced Velocity Distribution around Propeller Annulus")
         plt.xlabel("Angle (degrees)")
         plt.ylabel("Induced Velocity (m/s)")
         plt.show()
 
-def flatblade(R, c, beta, N, plot=False):
+
+def flatblade(c, beta, N, plot=False):
     '''
     Flat Blade Demo Model. Inputs a blade of fixed chord and radial distribution 
     and solves+plots induced velocity.
-
-    TODO Fix function (chord and beta not declared properly)
     '''
-    from airfoil import load_airfoil_data
-    # 
-    # Debug NAN's and enable 64 bit precision
-    jax.config.update("jax_enable_x64", True)
-    jax.config.update("jax_debug_nans", False)
-    # Populate radial/azimuthal stops and initial guess
-    psi, dpsi = angular_stops(Inputs.n_psi)
-    r, dr = radial_stops(R, 0.05, Inputs.n_r)
-    V_ia_0 = jnp.full_like(r, jnp.array([10.0]))
 
-    # fit airfoil model
-    airfoil_interp = load_airfoil_data("arad10")
-    print(airfoil_interp(0,100000))
+    # Utilize your factory function to build the base configuration
+    params = build_default_propeller(c=c, beta=beta)
 
-    c = jnp.full((Inputs.n_r,), c)
-    beta = jnp.full((Inputs.n_r,), beta)
-
-    params = Params(
-                N = N,
-                c = c,
-                beta = beta,
-
-                c_scale=0.1,
-                beta_scale=jnp.radians(50),
-
-                r = r,
-                dr = dr,
-
-                psi = psi,
-                dpsi = dpsi,
-
-                V_x = jnp.array([1.0]),
-                V_yz = jnp.array([10.0]),
-                omega = jnp.array([500]),
-
-                V_ia_0 = V_ia_0,
-                airfoil_interp = airfoil_interp,
-                airfoil = "arad10"
-            )
+    # Override remaining parameter states cleanly for JAX
+    params = eqx.tree_at(
+        lambda p: (p.N, p.V_ia_0),
+        params,
+        (jnp.array([N]), jnp.full((Inputs.n_r,), 1.0))
+    )
     
     # Solve Induced Velocity
     V_ia, _ = induced_velocity(params)  # shape (Nr, Npsi)
@@ -517,12 +446,12 @@ def flatblade(R, c, beta, N, plot=False):
     print("Total Thrust:", T)
 
     actuatorEffiency = equivelantActuatorDiskEfficiency(T, params)
-    print("Actuator effiency:", actuatorEffiency)
+    print("Actuator efficiency:", actuatorEffiency)
 
-    if plot==True:
-        # Plot heatmap
+    if plot == True:
+        # Plot heatmap using structured params properties
         fig, ax = plt.subplots(subplot_kw={"projection": "polar"})
-        plt.contourf(psi, r, V_ia, cmap='viridis')
+        plt.contourf(params.psi, params.r, V_ia, cmap='viridis')
         plt.colorbar(label='Induced Velocity [m/s]')
         plt.xlabel('X [m]')
         plt.ylabel('Y [m]')
@@ -531,16 +460,17 @@ def flatblade(R, c, beta, N, plot=False):
 
     return params, V_ia, T
 
-
 if __name__ == "__main__":
     ## Demo Cases of BEMT
     # single is single annulus solver
     # flat is simple flat blade solver
     # input allows importing of a json file 
     demo_solve = "flat"
-
     # Single Annulus Solver
     if demo_solve == "single":
-        single(0.5, 0.03, np.pi/15, 2, plot=True)
+        single(0.01, 10.0, 2, plot=True)
     elif demo_solve == "flat":
-        flatblade(0.5, 0.03, np.pi/15, 2, plot=True)
+        params, V_ia, T = flatblade(0.02, 10.0, 2, plot=True)
+        print("T:", T) 
+        V_ia_0 = jnp.mean(V_ia, axis=1)
+        print("V_ia_0:", V_ia_0)

@@ -1,9 +1,27 @@
 ## Propeller Geometry Tools and Functions
 
 import numpy as np
-from datetime import datetime
-import scipy.optimize as opt
+import jax.numpy as jnp
 
+### Integrand Functions
+def radial_stops(R, r_hub, n_r):
+    '''
+    Return radial node centers and dr for integration.
+    '''
+    r = jnp.linspace(r_hub + (R - r_hub) / (2 * n_r), R - (R - r_hub) / (2 * n_r), n_r)
+    # Simple Homogeneous radial spacing
+    dr = jnp.ones_like(r)*(R - r_hub) / n_r
+    return r, dr
+
+def angular_stops(n_psi):
+    '''
+    Return angular node centers and dpsi for integration
+    '''
+    psi = jnp.linspace(0, (2 * jnp.pi), n_psi)
+    dpsi = jnp.ones_like(psi)*(2 * jnp.pi) / n_psi
+    return psi, dpsi
+
+### Geometry Transformation functions
 def params_to_le_te(r, c, beta):
     """
     Calculates 3D coordinates for LE and TE lines.
