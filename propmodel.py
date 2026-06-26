@@ -47,12 +47,6 @@ def dT_blade(V_ia: jnp.ndarray, params: Params, debug: bool=False):
     # Get Aerodynamic Coefficients
     C_L, C_D, _ = aero_coeffs(V_ia, params)
 
-    # Tip and Root Loss Factors
-    tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
-
-    # Calculate the total prandtl loss correction factor
-    F = jnp.multiply(tip_loss, root_loss)
-
     # Blade Element Theory instantaneous thrust element
     dT_blade_instantaneous = 0.5 * rho * c[:, None] * (V_R**2) * (C_L*jnp.cos(phi) - C_D*jnp.sin(phi))
     # Average thrust in each annulus over one rotation (using formulation from the text prior to statement of eqn. 6)
@@ -331,7 +325,7 @@ def thrust(V_ia, params):
     Calculate total thrust from solved induced velocity
     '''
     r = params.r
-    dT = dT_blade(V_ia,params)[0]
+    dT = dT_momentum(V_ia, params)
 
     # Numerically Compute Double Integral to Solve for Thrust
     T = jnp.trapezoid(dT, x=r)
@@ -460,17 +454,137 @@ def flatblade(c, beta, N, plot=False):
 
     return params, V_ia, T
 
+def apc_model(filepath, plot=True):
+    '''
+    Loads an APC propeller geometry from a .PE0 file, interpolates it onto the 
+    solver's computational grid, solves the induced velocity, and plots the results.
+    '''
+    import queue
+    import results
+    import apcpropanalysis
+    from matplotlib.animation import FuncAnimation
+
+    print(f"Loading APC Propeller geometry from: {filepath}")
+    
+    # Load raw APC Data dictionary
+    apc_geom = apcpropanalysis.parse_apc_pe0(filepath)
+    
+    # Unpack the specific geometry fields needed
+    r_apc_in = apc_geom["r"]
+    c_apc_in = apc_geom["chord"]
+    beta_apc_deg = apc_geom["twist_deg"]
+    airfoil_apc = "clarky"
+    
+    # Convert inches to meters and degrees to radians to match JAX solver SI units
+    r_apc_m = jnp.array(r_apc_in) * 0.0254
+    c_apc_m = jnp.array(c_apc_in) * 0.0254
+    beta_apc_rad = jnp.radians(jnp.array(beta_apc_deg))
+
+    # Configure default inputs to match the physical boundaries of the APC prop
+    inputs = Inputs()
+    inputs = eqx.tree_at(
+        lambda i: (i.R_hub, i.R_tip), 
+        inputs, 
+        (r_apc_m.min(), r_apc_m.max())
+    )
+    
+    # Build baseline structure
+    params = build_default_propeller(inputs=inputs, airfoil_name=airfoil_apc)
+
+    # Interpolate APC geometry onto the solver's discretized radial array
+    c_interp = jnp.interp(params.r, r_apc_m, c_apc_m)
+    beta_interp = jnp.interp(params.r, r_apc_m, beta_apc_rad)
+
+    # Inject the mapped geometry into the Params tree
+    params = eqx.tree_at(
+        lambda p: (p.c, p.beta),
+        params,
+        (c_interp, beta_interp)
+    )
+    
+    print("Solving Induced Velocity Field...")
+    # Solve Induced Velocity
+    V_ia, V_ia_0 = induced_velocity(params)
+    
+    # Update params with solved state
+    params = eqx.tree_at(lambda p: p.V_ia_0, params, V_ia_0)
+
+    # Calculate overall performance metrics
+    T = thrust(V_ia, params)
+    P_mech = mechanicalPower(V_ia, params)
+    print(f"--- Solve Complete ---")
+    print(f"Thrust: {T:.4f} N | Mechanical Power: {P_mech:.4f} W")
+
+    # Plotting via LivePropPlotter
+    if plot:
+        print("Launching LivePropPlotter canvas...")
+        gui_queue = queue.Queue()
+        plotter = results.LivePropPlotter(params)
+        tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
+        F_curr = jnp.multiply(tip_loss, root_loss) 
+        # Build the frame data dictionary expected by LivePropPlotter.update()
+        frame_data = {
+            'c': params.c * 1000,
+            'beta': jnp.degrees(params.beta),
+            'error_log': params.error_log,
+            'V_ia': V_ia,
+            'F_loss': F_curr  # Map this key to your Prandtl tip/root total loss array
+        }
+        gui_queue.put(frame_data)
+        
+        ani = FuncAnimation(
+            plotter.fig, 
+            plotter.update, 
+            fargs=(gui_queue,), 
+            interval=200, 
+            cache_frame_data=False,
+            blit=False
+
+        )
+        plt.show()
+
+        fig = results.debug_diagnostics_plot(params, 0)
+
+        dummy = input("Done with plots?")
+
+    return params, V_ia, T
+
 if __name__ == "__main__":
-    ## Demo Cases of BEMT
-    # single is single annulus solver
-    # flat is simple flat blade solver
-    # input allows importing of a json file 
-    demo_solve = "flat"
-    # Single Annulus Solver
-    if demo_solve == "single":
-        single(0.01, 10.0, 2, plot=True)
-    elif demo_solve == "flat":
-        params, V_ia, T = flatblade(0.02, 10.0, 2, plot=True)
-        print("T:", T) 
-        V_ia_0 = jnp.mean(V_ia, axis=1)
-        print("V_ia_0:", V_ia_0)
+    import apcpropanalysis
+    apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0")
+    rpm_data = apcpropanalysis.parse_apc_dat("apc_prop_data/performance_data/PER3_20x8.dat")
+    # Extract as raw scalar floats instead of numpy arrays
+    target_rpm = float(np.squeeze(Inputs.omega / 0.1047))
+    target_V = float(np.squeeze(Inputs.V_x))
+
+    if rpm_data:
+        # Find the closest RPM block (broadcasting works flawlessly with scalar targets)
+        available_rpms = np.array(list(rpm_data.keys()))
+        closest_rpm = available_rpms[np.argmin(np.abs(available_rpms - target_rpm))]
+        
+        # Extract the data matrix for the closest RPM
+        matrix = rpm_data[closest_rpm]
+        
+        # Convert the file's velocity column (mph) to m/s
+        V_ms = matrix[:, 0] * 0.44704
+        
+        # Find the closest velocity row within this specific RPM block
+        closest_v_idx = np.argmin(np.abs(V_ms - target_V))
+        
+        # Extract performance metrics
+        matched_V = V_ms[closest_v_idx]
+        extracted_thrust = matrix[closest_v_idx, 10]  
+        extracted_eff = matrix[closest_v_idx, 2]      
+        extracted_power = matrix[closest_v_idx, 8]    
+
+        # --- 4. Print Summary Cleanly ---
+        print("\n" + "="*45)
+        print("      APC PERFORMANCE DATA EXTRACTION")
+        print("="*45)
+        print(f"Target Conditions:  {target_rpm:.2f} RPM  |  {target_V:.2f} m/s")
+        print(f"Closest APC Match:  {closest_rpm} RPM  |  {matched_V:.2f} m/s")
+        print("-"*45)
+        print(f"Extracted Thrust:   {extracted_thrust:.4f} N")
+        print(f"Extracted Efficiency: {extracted_eff * 100:.2f}% (Pe)")
+        print(f"Extracted Power:    {extracted_power:.2f} W")
+        print("="*45)

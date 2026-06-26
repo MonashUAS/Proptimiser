@@ -19,33 +19,32 @@ import propmodel
 from jax.scipy.special import gammaln
 
 
+
 def minimumInducedLossCost(V_ia, params):
     """
-    Returns the cost function of minimum induced loss, using an azimuthally
-    averaged Prandtl root loss factor to weight the radial variance.
-    
+    Returns a DIMENSIONLESS cost measuring deviation from the Betz uniform-inflow
+    condition (coefficient of variation, weighted toward the tip).
+
     V_ia shape: (Nr, Npsi)
     """
-    # 1. Compute the global mean across the entire disk (scalar)
+    # Global mean over disk (scalar)
     mean_V_ia = jnp.mean(V_ia)
 
-    # 2. Compute the local variance matrix (Nr, Npsi)
-    squared_err = (mean_V_ia - V_ia)**2
+    # Safe denominator: avoid divide-by-zero for near-unloaded blades
+    mean_V_ia_safe = jnp.maximum(jnp.abs(mean_V_ia), 1e-3)
 
-    # 3. Collapse the azimuthal variation of the squared error to a 1D radial profile (Nr,)
-    radial_squared_err = jnp.mean(squared_err, axis=1)
+    # Normalised squared error at every (r, psi) station — dimensionless
+    sq_err_normalised = ((V_ia - mean_V_ia) / mean_V_ia_safe) ** 2
 
-    # 4. Compute the 2D Prandtl root loss factor matrix (Nr, Npsi)
-    root_loss_2d = airflow.prandtl_root_loss(V_ia, params)
+    # Collapse azimuthal axis → radial profile (Nr,)
+    radial_sq_err = jnp.mean(sq_err_normalised, axis=1)
 
-    # 5. Take the average of the root loss factor across azimuthal stations (Nr,)
-    mean_root_loss_radial = jnp.mean(root_loss_2d, axis=1)
+    # Tip-weight: outer annuli carry more of the wake energy
+    r_norm = params.r / jnp.max(params.r)
+    weighted_sq_err = radial_sq_err * r_norm
 
-    # 6. Apply the averaged radial root loss penalty element-wise to the radial error
-    weighted_radial_err = radial_squared_err # mean_root_loss_radial
-
-    # 7. Compute the final RMS error over the radial stations
-    rms_err = jnp.sqrt(jnp.sum(weighted_radial_err))
+    # RMS over radial stations — O(0.1–0.5) for a realistic propeller in forward flight
+    rms_err = jnp.sqrt(jnp.mean(weighted_sq_err))
 
     return rms_err
 
@@ -494,41 +493,47 @@ def run_optimization(params_base, update_queue=None):
 
                 if is_terminal or is_checkpoint:
                     powers, thrusts, rms_MIL_errs, _ = evaluate_all_conditions(params_struct)
+                    
+                    # Ensure we zip through the captured states as well
                     for idx, (pwr, thr, mil) in enumerate(zip(powers, thrusts, rms_MIL_errs)):
                         t_err = thr - params_struct.thrust_target[idx]
                         omega_cond = omega[idx]
+                        
                         # Only print iteration metadata on the first condition row
                         iter_info = f"{i:<6} |" if idx == 0 else f"{'':<6} |"
                         opt_err = f"{state.error:<11.3f}" if idx == 0 else f"{'':<11}"
                         timing = f"{time.time() - iter_time:<4.1f}s" if idx == 0 else ""
                         
                         print(f"{iter_info} C{idx:<3} | {omega_cond:<5.2f} | {pwr:<12.4f} | {thr:<12.4f} | {t_err:<12.4f} | {mil:<10.4f} | {opt_err} | {timing}")
-                        # Inside the print loop
+                        
+                        # Calculate Costs
                         cost_T = jnp.squeeze(params_struct.objective_thrust[idx] * (t_err / params_struct.thrust_target[idx])**2)
                         
                         # Use params_base here to avoid extracting multi-condition batched shapes for rho and R
                         actuator_pwr_ref = propmodel.actuator_disk_power(params_struct.thrust_target[idx], params_base)
                         cost_P = jnp.squeeze(params_struct.objective_power[idx] * (pwr / actuator_pwr_ref)**2)
-
-                        # Cast explicitly to float to safely clear any tracer or singleton array wrappers for printing
-                        print(f"Cond {idx} Internal Costs -> Thrust: {float(cost_T):.4e} | Power: {float(cost_P):.4e}")
+                        
+                        # FIX 3: Added cost_induced to the debug print
+                        print(f"Cond {idx} Internal Costs -> Thrust: {float(cost_T):.4e} | Power: {float(cost_P):.4e} | Induced: {float(mil):.4e}")
+                        
                     print_time = time.time()
+                    
                     if update_queue is not None:
-                        c_np = jnp.array(params_struct.c[0]) * 1000
-                        beta_np = jnp.degrees(jnp.array(params_struct.beta[0]))
+                        # Extract Condition 0 (params_hover) from the batched PyTree
+                        params_hover = jax.tree_util.tree_map(
+                            lambda leaf: leaf[0] if hasattr(leaf, 'ndim') and leaf.ndim > 0 else leaf,
+                            params_struct
+                        )
                         
-                        # Ensure error_log includes the current step
-                        current_errors = jnp.append(jnp.array(error_log), float(state.error))
+                        # Inject the current error log into the params object
+                        params_hover = eqx.tree_at(
+                            lambda p: p.error_log, 
+                            params_hover, 
+                            error_log
+                        )
                         
-                        V_ia_0_curr = params_struct.V_ia_0[0]
-                        V_ia_curr = jnp.array(propmodel.inflow_model(V_ia_0_curr, params_base))
-                        
-                        update_queue.put({
-                            'c': c_np,
-                            'beta': beta_np,
-                            'error_log': current_errors,
-                            'V_ia': V_ia_curr
-                        })
+                        # params object to queue
+                        update_queue.put(params_hover)
                     
                     if is_terminal:
                         print(f"\nStopping: Convergence reached at step {i}")
@@ -556,7 +561,7 @@ def run_optimization(params_base, update_queue=None):
     # return optimised variables
     final_c = params_struct.c[0]
     final_beta = params_struct.beta[0]
-    final_omega = params_struct.omega[0]
+    final_omega = jnp.atleast_1d(params_struct.omega[0])
     final_V_ia_0 = params_struct.V_ia_0[0]
 
     return replace(params_base, 

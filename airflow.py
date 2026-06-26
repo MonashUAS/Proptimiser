@@ -135,7 +135,7 @@ def prandtl_tip_loss(V_ia, params):
     B = params.N
     r = params.r
 
-    R_tip = Inputs.R_tip
+    R_tip = Inputs.R_tip*1.05
     phi = jnp.abs(resultantVelocityComponents(V_ia, params)[1]) # get only second output
 
     f_tip = B/2 * (R_tip - r[:, None]) / (r[:, None] * jnp.sin(phi))
@@ -151,7 +151,7 @@ def prandtl_tip_loss(V_ia, params):
 
 def prandtl_root_loss(V_ia, params):
     ''' 
-    calculates the prandtl tip loss according to "Propeler bade element momentum theory with vortex wake deflection"
+    calculates the prandtl root loss according to "Propeler bade element momentum theory with vortex wake deflection"
     M. K. Rwigema : https://www.icas.org/icas_archive/ICAS2010/PAPERS/434.PDF
 
     Notation adapted from that source, with variables reallocated for consistency with literature
@@ -159,7 +159,7 @@ def prandtl_root_loss(V_ia, params):
     eps = 1e-2
     B = params.N
     r = params.r
-    R_hub = Inputs.R_hub
+    R_hub = Inputs.R_hub/2
 
     phi = jnp.abs(resultantVelocityComponents(V_ia, params)[1]) # get only second output
 

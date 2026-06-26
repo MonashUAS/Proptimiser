@@ -125,13 +125,12 @@ def iterativesmoothing(params):
     )
     
     return params
-
 class LivePropPlotter:
     def __init__(self, params_base):
         # 1. Setup Figure
         self.fig = plt.figure(figsize=(14, 8))
-        self.r = np.array(params_base.r * 1000)
-        self.r_m = np.array(params_base.r)
+        self.r = np.array(params_base.r * 1000)  # Radius in mm
+        self.r_m = np.array(params_base.r)      # Radius in m
         self.psi = np.array(params_base.psi)
 
         # Subplot 1: Chord & Twist
@@ -139,151 +138,204 @@ class LivePropPlotter:
         self.line_c, = self.ax1.plot(self.r, np.zeros_like(self.r), 'b-o', label='Chord (mm)')
         self.ax1_twin = self.ax1.twinx()
         self.line_beta, = self.ax1_twin.plot(self.r, np.zeros_like(self.r), 'r-o', label='Beta (deg)')
-        self.ax1.set_title("Chord & Twist")
+        self.ax1.set_title("Chord and Twist Distribution")
+        self.ax1.set_xlabel("Radius (mm)")
+        self.ax1.set_ylabel("Chord (mm)", color='b')
+        self.ax1_twin.set_ylabel("Beta (deg)", color='r')
         self.ax1.legend(loc="upper left")
         self.ax1_twin.legend(loc="upper right")
+        self.ax1.grid(True, alpha=0.3)
 
         # Subplot 2: Convergence
         self.ax2 = self.fig.add_subplot(2, 2, 2)
         self.line_err, = self.ax2.plot([], [], 'orange', marker='o', label='State Error')
-        self.ax2.set_title("Convergence")
-        self.ax2.set_yscale('log') # Usually better for error tracking
+        self.ax2.set_title("Solver Convergence History")
+        self.ax2.set_xlabel("Iteration")
+        self.ax2.set_ylabel("Residual Error")
+        self.ax2.set_yscale('log') 
+        self.ax2.grid(True, which="both", alpha=0.3)
 
-        # Subplot 3: Polar Map
+        # Subplot 3: Polar Map (Induced Velocity)
         self.ax3 = self.fig.add_subplot(2, 2, 3, projection="polar")
-        self.ax3.set_title("Induced Velocity [m/s]")
+        self.ax3.set_title("Induced Velocity Map [m/s]\n", pad=15)
         dummy_V_ia = np.zeros((len(self.r), len(self.psi)))
         self.contour = self.ax3.contourf(self.psi, self.r_m, dummy_V_ia, cmap='viridis')
         self.cbar = self.fig.colorbar(self.contour, ax=self.ax3, pad=0.1)
 
+        # Subplot 4: Induced Velocity Profile & Loss Metrics
+        self.ax4 = self.fig.add_subplot(2, 2, 4)
+        self.line_via_avg, = self.ax4.plot(self.r, np.zeros_like(self.r), 'g-', linewidth=2, label=r'Avg $V_{ia}$ [m/s]')
+        self.ax4_twin = self.ax4.twinx()
+        self.line_loss, = self.ax4_twin.plot(self.r, np.zeros_like(self.r), 'm--', linewidth=1.5, label='Loss Factor ($F$)')
+        
+        self.ax4.set_title("Induced Velocity Profile and Prandtl Loss Metrics")
+        self.ax4.set_xlabel("Radius (mm)")
+        self.ax4.set_ylabel(r"Induced Velocity $V_{ia}$ (m/s)", color='g')
+        self.ax4_twin.set_ylabel("Prandtl Factor ($F$)", color='m')
+        self.ax4_twin.set_ylim(-0.05, 1.05) # Bound the loss factor naturally between 0 and 1
+        
+        # Combine legends cleanly for twin axis
+        lines = [self.line_via_avg, self.line_loss]
+        labels = [l.get_label() for l in lines]
+        self.ax4.legend(lines, labels, loc='upper right')
+        self.ax4.grid(True, alpha=0.3)
+
         plt.tight_layout()
 
-    def update(self, frame_data, q):
+    def update(self, frame, q):
         """
-        FuncAnimation calls this repeatedly. We drain the queue to get the newest data.
+        FuncAnimation calls this repeatedly. We drain the queue to get the newest params data.
         """
-        latest_data = None
-        # Drain the queue to only plot the absolute latest state (prevents UI lag)
+        latest_params = None
         while not q.empty():
             try:
-                latest_data = q.get_nowait()
+                latest_params = q.get_nowait()
             except queue.Empty:
                 break
         
-        if latest_data is None:
-            return # Nothing new to plot
+        if latest_params is None:
+            return self.line_c, self.line_beta, self.line_err, self.line_via_avg, self.line_loss
 
-        # 1. Update Lines
-        self.line_c.set_ydata(latest_data['c'])
-        self.line_beta.set_ydata(latest_data['beta'])
+        # --- Compute aerodynamic flow states internally ---
+        # This keeps the main execution loop entirely free of plotting logic
+        V_ia = propmodel.inflow_model(latest_params.V_ia_0, latest_params)
+        tip_loss, root_loss = airflow.tip_root_loss_factors(V_ia, latest_params)
+        F_curr = jnp.multiply(tip_loss, root_loss) 
+
+        # Update Subplot 1 Lines (Geometry)
+        self.line_c.set_ydata(latest_params.c * 1000)
+        self.line_beta.set_ydata(jnp.degrees(latest_params.beta))
         
-        iters = np.arange(len(latest_data['error_log']))
-        self.line_err.set_data(iters, latest_data['error_log'])
+        # Update Subplot 2 Line (Convergence)
+        error_log = latest_params.error_log
+        iters = np.arange(len(error_log))
+        self.line_err.set_data(iters, error_log)
 
-        # 2. Re-scale Axes dynamically
-        self.ax1.relim(); self.ax1.autoscale_view()
-        self.ax1_twin.relim(); self.ax1_twin.autoscale_view()
-        self.ax2.relim(); self.ax2.autoscale_view()
+        # Update Subplot 4 Lines (Induced Velocity Profile & Losses)
+        via_avg_profile = np.mean(np.array(V_ia), axis=1) # Average over azimuthal stations (psi)
+        self.line_via_avg.set_ydata(via_avg_profile)
+        
+        F_factors = np.mean(np.array(F_curr), axis=1) # Average over azimuthal stations (psi)
+        self.line_loss.set_ydata(F_factors)
 
-        # 3. Update Polar Contour (Requires clearing old collections)
+        # Dynamically Re-scale XY Cartesian Axes limits
+        self.ax4.set_autoscaley_on(True)
+        
+        for ax in [self.ax1, self.ax1_twin, self.ax2, self.ax4]:
+            ax.relim()
+            ax.autoscale_view()
+            
+        # Update Polar Contour and Colorbar Dynamically
         for coll in self.ax3.collections:
             coll.remove()
-        self.contour = self.ax3.contourf(self.psi, self.r_m, latest_data['V_ia'], cmap='viridis')
+            
+        # Determine dynamic scales for colorbar bounding
+        vmax = max(1e-3, np.max(V_ia))
+        vmin = max(0.0, np.min(V_ia))
+        levels = np.linspace(vmin, vmax, 15)
 
-        return self.line_c, self.line_beta, self.line_err
+        # Draw new contour
+        self.contour = self.ax3.contourf(self.psi, self.r_m, V_ia, levels=levels, cmap='viridis', extend='both')
+
+        # Clear the colorbar axis and redraw inside it cleanly
+        self.cbar.ax.clear()
+        self.cbar = self.fig.colorbar(self.contour, cax=self.cbar.ax)
+        self.cbar.set_label("Induced Velocity [m/s]")
+
+        return self.line_c, self.line_beta, self.line_err, self.line_via_avg, self.line_loss
 
 def debug_diagnostics_plot(params, cond_idx, show=True):
     '''
     Generates a 2x2 diagnostic plot window for a specific flight condition.
     Displays Twist/Inflow, Lift/Drag Coefficients, Sectional Forces, and Reynolds Number.
     '''
-    plt.rcParams.update({
+    with plt.rc_context({
         "text.usetex": True,
         "font.family": "serif",
         "axes.labelsize": 12,
         "axes.titlesize": 14
-    })
-    
-    # Extract Geometry
-    r = params.r * 1000               # Radius in mm
-    beta_deg = np.degrees(params.beta)
-    
-    # Resolve Flow Kinematics
-    V_ia = propmodel.inflow_model(params.V_ia_0, params)
-    V_R, phi = airflow.resultantVelocityComponents(V_ia, params)
-    
-    # Average across the azimuthal axis for 1D plotting
-    phi_mean_deg = np.degrees(jnp.mean(phi, axis=1))
-    VR_mean = jnp.mean(V_R, axis=1)
-    
-    # Extract Aerodynamic Coefficients
-    C_L, C_D, _ = airfoil.aero_coeffs(V_ia, params)
-    CL_mean = jnp.mean(C_L, axis=1)
-    CD_mean = jnp.mean(C_D, axis=1)
-    
-    # Extract Sectional Forces
-    dT_ave, _ = propmodel.dT_blade(V_ia, params)
-    dQ_ave = propmodel.dQ_blade(V_ia, params)
-    
-    # Extract Flow Regime (Reynolds Number)
-    Re = airflow.calc_reynolds(params.rho, jnp.maximum(VR_mean, 1e-6), params.c, params.mu)
-    
-    # Create the Figure
-    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle(rf"\textbf{{Diagnostic Diagnostics: Flight Condition {cond_idx}}}", fontsize=16)
+    }):
+        
+        # Extract Geometry
+        r = params.r * 1000               # Radius in mm
+        beta_deg = np.degrees(params.beta)
+        
+        # Resolve Flow Kinematics
+        V_ia = propmodel.inflow_model(params.V_ia_0, params)
+        V_R, phi = airflow.resultantVelocityComponents(V_ia, params)
+        
+        # Average across the azimuthal axis for 1D plotting
+        phi_mean_deg = np.degrees(jnp.mean(phi, axis=1))
+        VR_mean = jnp.mean(V_R, axis=1)
+        
+        # Extract Aerodynamic Coefficients
+        C_L, C_D, _ = airfoil.aero_coeffs(V_ia, params)
+        CL_mean = jnp.mean(C_L, axis=1)
+        CD_mean = jnp.mean(C_D, axis=1)
+        
+        # Extract Sectional Forces
+        dT_ave, _ = propmodel.dT_blade(V_ia, params)
+        dQ_ave = propmodel.dQ_blade(V_ia, params)
+        
+        # Extract Flow Regime (Reynolds Number)
+        Re = airflow.calc_reynolds(params.rho, jnp.maximum(VR_mean, 1e-6), params.c, params.mu)
+        
+        # Create the Figure
+        fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle(rf"\textbf{{Diagnostics: Flight Condition {cond_idx}}}", fontsize=16)
 
-    # Plot 1: Angles (Twist and Inflow)
-    axs[0, 0].plot(r, beta_deg, 'o-', color="tab:red", label=r"Twist ($\beta$)")
-    axs[0, 0].plot(r, phi_mean_deg, 's-', color="tab:cyan", label=r"Inflow Angle ($\phi$)")
-    axs[0, 0].fill_between(r, beta_deg, phi_mean_deg, color='gray', alpha=0.2, label=r"Approx AoA ($\alpha$)")
-    axs[0, 0].set_title(r"Angle Distribution")
-    axs[0, 0].set_ylabel(r"Angle ($^\circ$)")
-    axs[0, 0].grid(True, linestyle='--', alpha=0.6)
-    axs[0, 0].legend()
+        # Plot 1: Angles (Twist and Inflow)
+        axs[0, 0].plot(r, beta_deg, 'o-', color="tab:red", label=r"Twist ($\beta$)")
+        axs[0, 0].plot(r, phi_mean_deg, 's-', color="tab:cyan", label=r"Inflow Angle ($\phi$)")
+        axs[0, 0].fill_between(r, beta_deg, phi_mean_deg, color='gray', alpha=0.2, label=r"Approx AoA ($\alpha$)")
+        axs[0, 0].set_title(r"Angle Distribution")
+        axs[0, 0].set_ylabel(r"Angle ($^\circ$)")
+        axs[0, 0].grid(True, linestyle='--', alpha=0.6)
+        axs[0, 0].legend()
 
-    # Plot 2: Aerodynamic Coefficients
-    axs[0, 1].plot(r, CL_mean, 'o-', color="tab:blue", label=r"$C_L$")
-    axs[0, 1].set_title(r"Sectional Aerodynamic Coefficients")
-    axs[0, 1].set_ylabel(r"$C_L$", color="tab:blue")
-    axs[0, 1].tick_params(axis='y', labelcolor="tab:blue")
-    axs[0, 1].grid(True, linestyle='--', alpha=0.6)
-    
-    ax01_twin = axs[0, 1].twinx()
-    ax01_twin.plot(r, CD_mean, 's-', color="tab:orange", label=r"$C_D$")
-    ax01_twin.set_ylabel(r"$C_D$", color="tab:orange")
-    ax01_twin.tick_params(axis='y', labelcolor="tab:orange")
-    
-    lines_coeff = axs[0, 1].get_lines() + ax01_twin.get_lines()
-    axs[0, 1].legend(lines_coeff, [l.get_label() for l in lines_coeff], loc="center right")
+        # Plot 2: Aerodynamic Coefficients
+        axs[0, 1].plot(r, CL_mean, 'o-', color="tab:blue", label=r"$C_L$")
+        axs[0, 1].set_title(r"Sectional Aerodynamic Coefficients")
+        axs[0, 1].set_ylabel(r"$C_L$", color="tab:blue")
+        axs[0, 1].tick_params(axis='y', labelcolor="tab:blue")
+        axs[0, 1].grid(True, linestyle='--', alpha=0.6)
+        
+        ax01_twin = axs[0, 1].twinx()
+        ax01_twin.plot(r, CD_mean, 's-', color="tab:orange", label=r"$C_D$")
+        ax01_twin.set_ylabel(r"$C_D$", color="tab:orange")
+        ax01_twin.tick_params(axis='y', labelcolor="tab:orange")
+        
+        lines_coeff = axs[0, 1].get_lines() + ax01_twin.get_lines()
+        axs[0, 1].legend(lines_coeff, [l.get_label() for l in lines_coeff], loc="center right")
 
-    # Plot 3: Sectional Forces (Thrust & Torque)
-    axs[1, 0].plot(r, dT_ave, 'o-', color="tab:green", label=r"Thrust ($dT$)")
-    axs[1, 0].set_title(r"Sectional Load Distribution")
-    axs[1, 0].set_ylabel(r"Thrust (N/m)", color="tab:green")
-    axs[1, 0].set_xlabel(r"Radius ($r$) [mm]")
-    axs[1, 0].tick_params(axis='y', labelcolor="tab:green")
-    axs[1, 0].grid(True, linestyle='--', alpha=0.6)
+        # Plot 3: Sectional Forces (Thrust & Torque)
+        axs[1, 0].plot(r, dT_ave, 'o-', color="tab:green", label=r"Thrust ($dT$)")
+        axs[1, 0].set_title(r"Sectional Load Distribution")
+        axs[1, 0].set_ylabel(r"Thrust (N/m)", color="tab:green")
+        axs[1, 0].set_xlabel(r"Radius ($r$) [mm]")
+        axs[1, 0].tick_params(axis='y', labelcolor="tab:green")
+        axs[1, 0].grid(True, linestyle='--', alpha=0.6)
 
-    ax10_twin = axs[1, 0].twinx()
-    ax10_twin.plot(r, dQ_ave, 's-', color="purple", label=r"Torque ($dQ$)")
-    ax10_twin.set_ylabel(r"Torque (Nm/m)", color="purple")
-    ax10_twin.tick_params(axis='y', labelcolor="purple")
-    
-    lines_forces = axs[1, 0].get_lines() + ax10_twin.get_lines()
-    axs[1, 0].legend(lines_forces, [l.get_label() for l in lines_forces], loc="center right")
+        ax10_twin = axs[1, 0].twinx()
+        ax10_twin.plot(r, dQ_ave, 's-', color="purple", label=r"Torque ($dQ$)")
+        ax10_twin.set_ylabel(r"Torque (Nm/m)", color="purple")
+        ax10_twin.tick_params(axis='y', labelcolor="purple")
+        
+        lines_forces = axs[1, 0].get_lines() + ax10_twin.get_lines()
+        axs[1, 0].legend(lines_forces, [l.get_label() for l in lines_forces], loc="center right")
 
-    # Plot 4: Reynolds Number
-    axs[1, 1].plot(r, Re, 'o-', color="black", label=r"Reynolds Number")
-    axs[1, 1].set_title(r"Local Flow Regime")
-    axs[1, 1].set_ylabel(r"$Re$")
-    axs[1, 1].set_xlabel(r"Radius ($r$) [mm]")
-    axs[1, 1].set_yscale('log') # Log scale is better for Re
-    axs[1, 1].grid(True, linestyle='--', alpha=0.6)
-    
-    plt.tight_layout()
-    if show:
-        plt.show(block=False) # Non-blocking so all windows open together
-    return fig
+        # Plot 4: Reynolds Number
+        axs[1, 1].plot(r, Re, 'o-', color="black", label=r"Reynolds Number")
+        axs[1, 1].set_title(r"Local Flow Regime")
+        axs[1, 1].set_ylabel(r"$Re$")
+        axs[1, 1].set_xlabel(r"Radius ($r$) [mm]")
+        axs[1, 1].set_yscale('log') # Log scale is better for Re
+        axs[1, 1].grid(True, linestyle='--', alpha=0.6)
+        
+        plt.tight_layout()
+        if show:
+            plt.show(block=False) # Non-blocking so all windows open together
+        return fig
 
 def is_serialisable_leaf(x):
     '''
@@ -380,7 +432,7 @@ def loadprop(prop_timestamp):
         airfoil="arad10",
         airfoil_interp=airfoil_interp,
         N=2,
-        c=dummy_scalar, beta=dummy_scalar, c_cp=dummy_scalar, beta_cp=dummy_scalar,
+        c=dummy_scalar, beta=dummy_scalar,
         r=dummy_scalar, dr=dummy_scalar, psi=dummy_scalar, dpsi=dummy_scalar,
         V_x=dummy_scalar, V_yz=dummy_scalar, omega=dummy_scalar, omega_max=0.0,
         V_ia_0=dummy_scalar, c_scale=0.0, beta_scale=0.0,
@@ -426,15 +478,16 @@ def propgeomblender(timestamps, weights):
 if __name__ == "__main__":
     import proptimiser
     import geometry
+    import matplotlib
+    from matplotlib.animation import FuncAnimation
     # pass the base name/timestamp
-    timestamps = ["redback_v1"]
-    weights = np.array([1.0])
+    timestamps = ["20260626-1234.eqx", "20260626-1247.eqx"]
+    weights = np.array([0.8,0.2])
     
     # Blending with multiple propeller geometries
     inputs, params_base = propgeomblender(timestamps, weights)
-
+    inputs = init.Inputs # comment out to use flight conditions from propeller file
     print(f"--- Evaluating {inputs.n_cond} Flight Conditions ---")
-    omega = jnp.array([480.0,451.91])
 
     # Execution & Processing Loop
     exit_input = "n"
@@ -444,9 +497,9 @@ if __name__ == "__main__":
         print("\nResolving Induced Velocity Field for all conditions...")
         for idx in range(inputs.n_cond):
             # Unpack unique operating points and batched variables
-            cond_omega = omega[idx] # manually input omega above (solver export limitations)
-            cond_Vx = 0 #inputs.V_x[idx]
-            cond_Vyz = 0 #inputs.V_yz[idx]
+            cond_omega = inputs.omega[idx] # manually input omega in init.py
+            cond_Vx = inputs.V_x[idx]
+            cond_Vyz = inputs.V_yz[idx]
 
             # Evaluate at operating conditons
             params_cond = eqx.tree_at(
@@ -476,26 +529,47 @@ if __name__ == "__main__":
         user_input = input("\nWould you like to plot solver outputs? (y/n): ")
         if user_input.lower() == "y":
             print("Plotting General Info for Condition 0...")
-            propinfoplot(evaluated_conditions[0], show=False) 
+                    
+            # Pull the first flight condition specifically to feed the live plotter
+            p_cond_0 = evaluated_conditions[0]
+            
+            # Plotting via LivePropPlotter
+            print("Launching LivePropPlotter canvas...")
+            gui_queue = queue.Queue()
+            plotter = LivePropPlotter(p_cond_0)
+            
+            # Pass the entire params object into the queue elegantly
+            gui_queue.put(p_cond_0)
+            
+            ani = FuncAnimation(
+                plotter.fig, 
+                plotter.update, 
+                fargs=(gui_queue,), 
+                interval=200, 
+                cache_frame_data=False,
+                blit=False
+            )
             
             print("Plotting Detailed Diagnostics for all conditions...")
             for idx, p_cond in enumerate(evaluated_conditions):
                 debug_diagnostics_plot(p_cond, idx, show=False)
             
-            plt.show()  # Blocks until all window instances are closed by the user
+            plt.show()  # Blocks until all window instances (LivePlotter & Diagnostics) are closed
 
         user_input = input("\nDoes your propeller need control-point based smoothing? (y/n): ")
         if user_input.lower() == 'y':
             # Smoothing modifies the global underlying geometry skeleton
             params_base = iterativesmoothing(params_base)
             print("Geometry updated. Induced velocity fields will automatically refresh on the next loop pass.")
-
-        user_input = input('\nExport Propeller Geometry to .pts files? (y/n): ')
+        
+            # Save Results/Export Geometry if Required
+        user_input = input('Save Propeller? (y/n): ')
+        timestamp = input('Input Prop Name: ')
         if user_input.lower() == 'y':
-            propname = input('Enter Propeller Name: ')
-            exportname = f"prop_pts_{propname}"
-            foilpoints = geometry.upperlowerairfoil(params_base.airfoil)
-            geometry.ptsfilegenerator(params_base.r, params_base.c, params_base.beta, foilpoints, exportname)
-            print(f'Saving Propeller Geometry to {exportname}.pts')
-            
+            paramsfile = "prop_params_" + timestamp
+            inputsfile = "prop_inputs_" + timestamp
+            print(f'Saving Propeller Inputs/Parameters to {paramsfile} and {inputsfile}')
+            params_base.save_state(paramsfile)
+            inputs.save_state(inputsfile)
+
         exit_input = input('\nExit configuration loop completely? (y/n): ')

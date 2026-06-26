@@ -17,34 +17,34 @@ class Inputs(eqx.Module):
     # Outer-loop Optimisation (Currently only L-BFGS-B works)
     opt_solver: str = "L-BFGS-B"
     opt_max_iter: int = 1000
-    opt_tol: float = 1e-3   
+    opt_tol: float = 1e-2 
 
     # Induced Velocity Settings
-    V_ia_0_max_iter: int = 500
-    V_ia_0_eps: float = 1e-4
+    V_ia_0_max_iter: int = 300
+    V_ia_0_eps: float = 5e-3
 
     # Solver Type
     solvertype: str = "T"
-    solve_omega: int = 1
+    solve_omega: int = 0 # 0: No. 1: Objective
 
     # Discretisation settings
-    n_r: int = 50
-    n_psi: int = 16
+    n_r: int = 15
+    n_psi: int = 9
 
     # Diagnostics
     verbose: bool = False
     jax_tracing: bool = False
 
     # Geometry Setup
-    R_tip = 0.25
-    R_hub = 0.025
+    R_tip: float = 0.25
+    R_hub: float = 0.025
 
     # Flight Conditions
     n_cond: int = 1
-    thrust_target = jnp.array([22.5])
-    V_x = jnp.array([8.60])
-    V_yz = jnp.array([12.29])
-    omega = jnp.array([480.0])
+    thrust_target = jnp.array([22.5, 29.6])
+    V_x = jnp.array([0.0, 8.60])
+    V_yz = jnp.array([0.0, 12.29])
+    omega = jnp.array([420.0, 535.0])
     objective_weight = jnp.array([1.0])
 
     # Motor Information
@@ -58,7 +58,7 @@ class Inputs(eqx.Module):
     tip_loss_model: int = 1 # 0: No Loss 1: Prandtl
     root_loss_model: int = 1
     rot_corr_model: int = 1 # 3D inflow correction model
-    high_induction_model: int = 1 # (0: Classical Momentum, 1: Buhl Correction)
+    high_induction_model: int = 0 # (0: Classical Momentum, 1: Buhl Correction) NOT USEFUL FOR REGULAR FLIGHT
 
     def save_state(self, filename: str = "inputs_state.eqx"):
         """Saves the Inputs configuration to an Equinox file."""
@@ -185,14 +185,14 @@ def build_default_propeller(c: float = 0.02, beta: float = 10.0, inputs: Inputs 
         V_yz=inputs.V_yz,
         omega=inputs.omega,
         omega_max=343.0 / inputs.R_tip,
-        V_ia_0=jnp.full((inputs.n_r,), 4.0), 
+        V_ia_0=jnp.full((inputs.n_r,), 8.0), 
         c_scale=c_scale,
         beta_scale=beta_scale,
         error_log=jnp.array([1.0]),
         time_log=jnp.array([0.0]),
-        objective_thrust=jnp.array([50.0]),
-        objective_MIL=jnp.array([1.0]),
-        objective_power=jnp.array([0.0]),
+        objective_thrust=jnp.array([10.0]),
+        objective_MIL=jnp.array([0.0]),
+        objective_power=jnp.array([0.5]),
         objective_weight=inputs.objective_weight,
         thrust_target=inputs.thrust_target,
     )
@@ -209,11 +209,45 @@ if __name__ == "__main__":
     import results
     import geometry
 
-    base_params = build_default_propeller(inputs = Inputs)
+    ## Import APC propeller for initial geom
+    import apcpropanalysis
+    geom = apcpropanalysis.parse_apc_pe0
     
-    # Swap anything from default propeller params here
-    new_omega = jnp.array([480.0])
-    params_init = eqx.tree_at(lambda p: p.omega, base_params, new_omega)
+    apc_geom = apcpropanalysis.parse_apc_pe0("apc_prop_data/propgeom_data/20x8-PERF.PE0")
+    
+    # Unpack the specific geometry fields needed
+    r_apc_in = apc_geom["r"]
+    c_apc_in = apc_geom["chord"]
+    beta_apc_deg = apc_geom["twist_deg"]
+    airfoil_apc = "clarky"
+
+    
+    # Convert inches to meters and degrees to radians to match JAX solver SI units
+    r_apc_m = jnp.array(r_apc_in) * 0.0254
+    c_apc_m = jnp.array(c_apc_in) * 0.0254
+    beta_apc_rad = jnp.radians(jnp.array(beta_apc_deg))
+
+    # Configure default inputs to match the physical boundaries of the APC prop
+    inputs = Inputs()
+    inputs = eqx.tree_at(
+        lambda i: (i.R_hub, i.R_tip), 
+        inputs, 
+        (r_apc_m.min(), r_apc_m.max())
+    )
+    
+    # Build baseline structure
+    params = build_default_propeller(inputs=inputs, airfoil_name=airfoil_apc)
+
+    # Interpolate APC geometry onto the solver's discretized radial array
+    c_interp = jnp.interp(params.r, r_apc_m, c_apc_m)
+    beta_interp = jnp.interp(params.r, r_apc_m, beta_apc_rad)
+
+    # Inject the mapped geometry into the Params tree
+    params_init = eqx.tree_at(
+        lambda p: (p.c, p.beta),
+        params,
+        (c_interp, beta_interp)
+    )
 
     print(f"Initialised airfoil interpolation with airfoil {params_init.airfoil}")
 
@@ -243,7 +277,8 @@ if __name__ == "__main__":
         plotter.update, 
         fargs=(gui_queue,), 
         interval=200, 
-        cache_frame_data=False
+        cache_frame_data=False,
+        blit=False
     )
     
     # Hands control to the GUI until the window is closed
@@ -267,12 +302,5 @@ if __name__ == "__main__":
         print(f'Saving Propeller Inputs/Parameters to {paramsfile} and {inputsfile}')
         params_opt_hover.save_state(paramsfile)
         Inputs().save_state(inputsfile)
-    
-    user_input = input('Export Propeller Geometry to .pts files? (y/n): ')
-    if user_input.lower() == 'y':
-        exportname = f"prop_pts_{timestamp}"
-        foilpoints = geometry.upperlowerairfoil(params_opt_hover.airfoil)
-        geometry.ptsfilegenerator(params_opt_hover.r, params_opt_hover.c, params_opt_hover.beta, foilpoints, exportname)
-        print(f'Saving Propeller Geometry to {exportname}.pts')
 
     print('Proptimisation Complete')

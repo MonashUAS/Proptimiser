@@ -656,7 +656,7 @@ def du_selig_correction(operands):
     # Extract geometry and prevent division by zero at the exact root
     c = params.c[:, None]
     r = params.r[:, None]
-    R = Inputs.R_tip
+    R = Inputs.R_tip*1.05
     
     r_safe = jnp.maximum(r, 1e-6)
     c_over_r = c / r_safe

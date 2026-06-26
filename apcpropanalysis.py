@@ -1,31 +1,41 @@
 import jax.numpy as jnp
 import numpy as np
-
 def parse_apc_pe0(filepath):
     with open(filepath, 'r') as f:
         lines = f.readlines()
 
     data_lines = []
     in_data_block = False
+    airfoil_name = "Unknown"
 
     for line in lines:
-        # The data block predictably starts with the 0.0000 station
-        if line.strip().startswith("0.0000"):
+        cleaned_line = line.strip()
+
+        # 1. Look for the airfoil name anywhere in the file
+        if "AIRFOIL1:" in cleaned_line:
+            parts = cleaned_line.split(',')
+            if len(parts) > 1:
+                airfoil_name = parts[1].strip().split()[0]
+
+        # 2. Track when we enter the main data table
+        if cleaned_line.startswith("0.0000"):
             in_data_block = True
             
         if in_data_block:
-            # An empty line signals the end of the geometry table
-            if line.strip() == "": 
-                break
+            # An empty line signals the end of the geometry table,
+            # but we switch the flag instead of breaking out of the loop completely
+            if cleaned_line == "": 
+                in_data_block = False
+                continue
             
             # Split the whitespace-delimited row into floats
-            row_data = [float(val) for val in line.split()]
+            row_data = [float(val) for val in cleaned_line.split()]
             if len(row_data) == 14:
                 data_lines.append(row_data)
 
     raw_data = np.array(data_lines)
     
-    # Map to JAX arrays for BEMT and spatial transformations
+    # Map to JAX arrays
     geometry = {
         "r": jnp.array(raw_data[:, 0]),             # Radial Station (in)
         "chord": jnp.array(raw_data[:, 1]),         # Chord length (in)
@@ -33,10 +43,119 @@ def parse_apc_pe0(filepath):
         "sweep": jnp.array(raw_data[:, 5]),         # Sweep Y (in)
         "rake": jnp.array(raw_data[:, 6]),          # Rake Z (in)
         "twist_deg": jnp.array(raw_data[:, 8]),     # Twist defined with LE/TE datums (deg)
-        "thickness_ratio": jnp.array(raw_data[:, 7])# Scaling factor for the Clark-Y sections
+        "thickness_ratio": jnp.array(raw_data[:, 7]),# Scaling factor for the sections
+        "airfoil": airfoil_name                     # Extracted airfoil string identifier
     }
     
     return geometry
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+def parse_apc_dat(filepath):
+    '''
+    Loads the data from an APC .dat file and plots flight performance.
+    '''
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+
+    rpm_data = {}
+    current_rpm = None
+    current_block_lines = []
+
+    for line in lines:
+        cleaned = line.strip()
+        
+        if not cleaned:
+            continue
+
+        # Detect the start of an RPM performance block
+        if "PROP RPM =" in cleaned:
+            # Save the previous block before starting a new one
+            if current_rpm is not None and current_block_lines:
+                rpm_data[current_rpm] = np.array(current_block_lines)
+                current_block_lines = []
+            
+            # Extract the RPM value
+            try:
+                current_rpm = int(float(cleaned.split('=')[1].strip().split()[0]))
+            except (IndexError, ValueError):
+                current_rpm = None
+            continue
+
+        # Parse data rows directly based on numeric conversion
+        if current_rpm is not None:
+            parts = cleaned.split()
+            # APC tables typically have at least 6-8 columns of data
+            if len(parts) >= 6:
+                try:
+                    # If this succeeds, it's a data row. If it hits a text header, it throws a ValueError
+                    row_data = [float(x) for x in parts]
+                    current_block_lines.append(row_data)
+                except ValueError:
+                    pass # Skip text headers seamlessly
+
+    # Catch the final block remaining at the end of the file loop
+    if current_rpm is not None and current_block_lines:
+        rpm_data[current_rpm] = np.array(current_block_lines)
+
+    # --- Plotting the Performance Sweeps ---
+    if not rpm_data:
+        print("No performance data blocks found in file.")
+        return rpm_data
+
+    # Create a figure with 2 subplots: Thrust and Power vs Velocity
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle(f"APC Propeller Flight Performance ({filepath.split('/')[-1]})", fontsize=14, fontweight='bold')
+
+    available_rpms = sorted(list(rpm_data.keys()))
+
+    for rpm in available_rpms:
+        matrix = rpm_data[rpm]
+        
+        # Standard APC PER3 Column Map:
+        # col 0: V (mph)
+        # col 1: J (Advance Ratio)
+        # col 2: Pe (Efficiency)
+        # col 3: Ct (Thrust Coeff)
+        # col 4: Cp (Power Coeff)
+        # col 9: PWR (w)
+        # col 10: Torque (N/m)
+        # col 11: Thrust (N)
+        
+        # Ensure matrix has enough columns before unpacking
+        if matrix.shape[1] >= 8:
+            V = matrix[:, 0]*0.44704 # convert to m/s
+            Power = matrix[:, 8]
+            Thrust = matrix[:, 10]
+        else:
+            print(f"Skipping plot for {rpm} RPM: Unexpected table dimensions.")
+            continue
+
+        # Plot Thrust vs V
+        axes[0].plot(V, Thrust, label=f"{rpm} RPM", linewidth=1.5)
+        # Plot Power vs V
+        axes[1].plot(V, Power, label=f"{rpm} RPM", linewidth=1.5)
+
+    # Format Subplot 1: Thrust
+    axes[0].set_title("Thrust vs. Inflow Velocity")
+    axes[0].set_xlabel("Velocity (m/s)")
+    axes[0].set_ylabel("Thrust (N)")
+    axes[0].grid(True, linestyle='--', alpha=0.6)
+    axes[0].legend(fontsize='small', loc='upper right', ncol=2)
+
+    # Format Subplot 2: Power
+    axes[1].set_title("Power vs. Inflow Velocity")
+    axes[1].set_xlabel("Velocity (m/s)")
+    axes[1].set_ylabel("Power (W)")
+    axes[1].grid(True, linestyle='--', alpha=0.6)
+    axes[1].legend(fontsize='small', loc='upper right', ncol=2)
+
+    plt.tight_layout()
+    plt.show()
+
+    return rpm_data
+
 
 # Example usage:
 if __name__ == "__main__":
@@ -52,68 +171,5 @@ if __name__ == "__main__":
     ### Import Blade Geometry
     
     blade_geom = parse_apc_pe0('apc_prop_data/propgeom_data/20x8-PERF.PE0')
+    rpm_data = parse_apc_dat("apc_prop_data/performance_data/PER3_20x8.dat")
 
-    # (propeller used clark-y airfoil btw)
-    
-    '''
-    The below is copied from init.py; the goal is to modify the
-    below parameters/code so it uses the imported geom and tests
-    with the clark-y airfoil.
-
-    '''
-    airfoil = "arad10"
-
-    c_scale = 0.2                   # Max chord (m)
-    beta_scale = jnp.radians(50)    # Max twist (rad)
-
-    # Initial Geometry setup
-    psi, dpsi = propmodel.angular_stops(Inputs.n_psi)
-    
-    r, dr = propmodel.radial_stops(Inputs.R_tip, Inputs.R_hub, Inputs.n_r)
-
-    # Twist distribution starting guess (in degrees): 
-    init_beta_cp = jnp.radians(jnp.array([18.0,16.0,16.0,16.0,14.0,7.0,7.0,4.0,4.0,4.0,4.0,4.0]))
-
-    # Chord distribution (in meters): 
-    init_c_cp = jnp.array([0.05,0.05,0.05,0.05,0.05,0.05,0.04,0.03,0.03,0.03,0.03,0.03])
-
-    # Interpolate airfoil data
-    airfoil_interp = load_airfoil_data("arad10")
-
-    spline_matrix_init = proptimiser.get_bezier_basis_matrix(r, Inputs.R_hub, Inputs.R_tip, Inputs.n_cp)
-    init_c = jnp.dot(init_c_cp, spline_matrix_init.T)
-    init_beta = jnp.dot(init_beta_cp, spline_matrix_init.T)
-
-    # Initialise Params Class (will be duplicated for inputs in run_optimisation)
-
-    params_init = Params(
-        airfoil = airfoil,
-        airfoil_interp=airfoil_interp,
-        N=2,
-        c=init_c,      
-        beta=init_beta,
-        c_cp=init_c_cp,
-        beta_cp=init_beta_cp,
-        r=r, dr=dr,    
-        psi=psi, dpsi=dpsi, 
-        V_x=jnp.array([Inputs.V_x[0]]), V_yz=jnp.array([Inputs.V_yz[0]]),
-        omega=jnp.array([Inputs.omega[0]]),
-        omega_max = Params.a / Inputs.R_tip,
-        V_ia_0=jnp.full((Inputs.n_r), 4.0), # Induced Velocity Field guess
-        c_scale = c_scale,
-        beta_scale = beta_scale,
-        error_log = jnp.array([1.0]),
-        time_log = jnp.array([0]),
-
-        # Cost Weights
-        objective_thrust=jnp.array([50.0]),
-        objective_MIL=jnp.array([1.0]),
-        objective_power=jnp.array([0.0]),
-        objective_weight=Inputs.objective_weight,
-        thrust_target=Inputs.thrust_target,
-    )
-
-    print(f"Initialised Airfoil Fit with airfoil {params_init.airfoil}")
-
-
-    # Find Blade Data

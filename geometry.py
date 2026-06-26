@@ -2,6 +2,8 @@
 
 import numpy as np
 import jax.numpy as jnp
+import aerosandbox as asb
+from aerosandbox.geometry.airfoil.airfoil_families import get_kulfan_coordinates
 
 ### Integrand Functions
 def radial_stops(R, r_hub, n_r):
@@ -44,75 +46,87 @@ def params_to_le_te(r, c, beta):
 
     return le_points, te_points
 
-def upperlowerairfoil(airfoil):
-    '''
-    Takes airfoil geometry .dat file (contained in airfoils) and returns arrays of the upper 
-    and lower points.
-    '''
-    airfoil_path = "airfoils/"+airfoil+"/"+airfoil+".dat"
-    # Load data using numpy, skipping the header rows
-    foil_data = np.loadtxt(airfoil_path, skiprows=1)
+def get_cst_weights_from_names(airfoil_names):
+    """
+    Converts a list of airfoil strings into a (N_foils, N_CST_weights) array.
+    Outputs a stacked numpy array containing [lower_weights, upper_weights, LE_weight, TE_thickness]
+    for each airfoil, which can be fed directly to JAX.
+    """
+    weights_list = []
     
-    # Find index where x-coordinates drop back to 0.0 
-    # (indicating the transition from upper surface TE to lower surface LE)
-    split_idx = np.where(np.diff(foil_data[:, 0]) < 0)[0]
+    for name in airfoil_names:
+        # KulfanAirfoil calculates the CST parameterization on instantiation
+        kf = asb.KulfanAirfoil(name)
+        p = kf.kulfan_parameters
+        
+        # Flatten the dictionary into a single 1D array
+        flat_weights = np.concatenate([
+            p['lower_weights'],
+            p['upper_weights'],
+            [p['leading_edge_weight']],
+            [p['TE_thickness']]
+        ])
+        weights_list.append(flat_weights)
+        
+    return np.array(weights_list)
+
+def generate_blade_coordinates(r, r_foils, cst_weights, ellipse_thickness=1.0, n_points_per_side=100):
+    """
+    Transforms the optimized CST weights into a full (n_r, N_points, 2) coordinate array.
+    Linearly interpolates CST weights along the aerodynamic span, and coordinate-blends 
+    the root region to an ellipse.
+    """
+    n_foils, n_cst = cst_weights.shape
     
-    if len(split_idx) > 0:
-        split_point = split_idx[0] + 1
-        upper_points = foil_data[:split_point]
-        lower_points = foil_data[split_point:]
-    else:
-        # Fallback to value-filtering only if index split fails
-        upper_points = foil_data[foil_data[:, 1] >= 0]
-        lower_points = foil_data[foil_data[:, 1] <= 0]
-
-    return upper_points, lower_points
-
-
-def ptsfilegenerator(r, c, beta, foilpoints, exportname, polyorder=6):
-    '''
-    Creates geometry files which defines the propellers shape
-    '''
-    # Unpack the tuple of upper and lower points
-    upper_points, lower_points = foilpoints
+    # Kulfan parameters usually pack 2 singular weights at the end (LE and TE)
+    n_weights_per_side = (n_cst - 2) // 2
     
-    # Reverse upper points (Trailing Edge -> Leading Edge) before stacking 
-    # with lower points (Leading Edge -> Trailing Edge) for a continuous perimeter loop
-    foil_data = np.vstack([upper_points[::-1], lower_points])
-    if polyorder>0:
-        # Fit high order polynomial to data, then establish leading and trailing edge using fit.
-        c_coeffs = np.polyfit(r, c, polyorder)
-        c_p = np.poly1d(c_coeffs)
-        c_poly = c_p(r)
-
-        beta_coeffs = np.polyfit(r, beta, polyorder)
-        beta_p = np.poly1d(beta_coeffs)
-        beta_poly = beta_p(r)
-
-        le_points, te_points = params_to_le_te(r, c_poly, beta_poly)
-    else:
-        le_points, te_points = params_to_le_te(r, c, beta)
-
-    # Extract x and y coordinates from the unpacked NumPy arrays (Column 0 and 1)
-    foil_x = foil_data[:, 0]
-    foil_y = foil_data[:, 1]
-    m = foil_x.shape[0]
-
-    propgeom_airfoil_coords = np.stack([
-        -foil_x, 
-        foil_y,
-        np.zeros(m)
-    ])
-
-    # Convert from m to mm for LE and TE points
-    propgeom_LE_coords      = le_points * 1000
-    propgeom_TE_coords      = te_points * 1000
-    propgeom_airfoil_coords = propgeom_airfoil_coords.T
-
-    # Write files with the timestamp appended
-    np.savetxt(f"{exportname}_LE.pts",  propgeom_LE_coords,      delimiter=" ", fmt="%.7f")
-    np.savetxt(f"{exportname}_TE.pts",  propgeom_TE_coords,      delimiter=" ", fmt="%.7f")
-    np.savetxt(f"{exportname}_airfoil.pts",   propgeom_airfoil_coords, delimiter=" ", fmt="%.7f")
+    # 1. Generate the Root Airfoil to determine exact coordinate array dimensions
+    root_cst = cst_weights[0]
+    root_coords = get_kulfan_coordinates(
+        lower_weights=root_cst[:n_weights_per_side],
+        upper_weights=root_cst[n_weights_per_side:2*n_weights_per_side],
+        leading_edge_weight=root_cst[-2],
+        TE_thickness=root_cst[-1],
+        n_points_per_side=n_points_per_side
+    )
+    
+    n_actual_points = root_coords.shape[0]
+    root_foil = asb.Airfoil(coordinates=root_coords)
+    
+    # 2. Generate the mounting ellipse matching the exact point count
+    theta = np.linspace(0, 2*np.pi, n_actual_points)
+    ellipse_x = 0.5 * (1 - np.cos(theta))
+    ellipse_y = (ellipse_thickness / 2) * np.sin(theta)
+    ellipse_foil = asb.Airfoil(coordinates=np.column_stack((ellipse_x, ellipse_y)))
+    
+    # 3. Initialize the output tensor
+    blade_coords = np.zeros((len(r), n_actual_points, 2))
+    
+    # 4. Interpolate and Generate
+    for i, r_i in enumerate(r):
+        if r_i < r_foils[0]:
+            # Structural Root: Coordinate blend between Ellipse and Root Airfoil
+            fraction = np.clip(r_i / r_foils[0], 0, 1) if r_foils[0] > 0 else 1.0
+            blended = ellipse_foil.blend_with(root_foil, fraction)
+            blade_coords[i] = blended.coordinates
+            
+        else:
+            # Aerodynamic Span: Interpolate the CST weights directly
+            interp_weights = np.zeros(n_cst)
+            for j in range(n_cst):
+                interp_weights[j] = np.interp(r_i, r_foils, cst_weights[:, j])
+                
+            coords = get_kulfan_coordinates(
+                lower_weights=interp_weights[:n_weights_per_side],
+                upper_weights=interp_weights[n_weights_per_side:2*n_weights_per_side],
+                leading_edge_weight=interp_weights[-2],
+                TE_thickness=interp_weights[-1],
+                n_points_per_side=n_points_per_side
+            )
+            blade_coords[i] = coords
+            
+    return blade_coords
 
 def offset_airfoil_profile(foil_x, foil_y, chord, skin_thickness):
     """
@@ -179,62 +193,87 @@ def offset_airfoil_profile(foil_x, foil_y, chord, skin_thickness):
         clean_core_x, clean_core_y = off_x, off_y
 
     return clean_core_x, clean_core_y
-def export_to_creo_ibl(r, c, beta, foilpoints, exportname, scale_to_mm=True, skin_thickness=0.0):
-    """
-    Combines all radial stations and airfoil profiles into a single unified .ibl 
-    file for direct multi-curve import into Creo Parametric.
-    
-    If skin_thickness > 0, the internal profile is offset inward to create core geometry.
-    """
-    import numpy as np
 
-    # Unpack normalized airfoil coordinates
-    upper_points, lower_points = foilpoints
-    foil_data = np.vstack([upper_points[::-1], lower_points])
-    base_foil_x = foil_data[:, 0]
-    base_foil_y = foil_data[:, 1]
+def get_cst_weights_from_names(airfoil_names):
+    """
+    Converts a list of airfoil strings into a (N_foils, N_CST_weights) array.
+    Outputs a stacked numpy array containing [lower_weights, upper_weights, LE_weight, TE_thickness]
+    for each airfoil, which can be fed directly to JAX.
+    """
+    weights_list = []
     
-    # Calculate absolute 3D LE and TE locations
-    le_points, te_points = params_to_le_te(r, c, beta)
-    
-    chord_vectors = te_points - le_points  # Shape: (n_r, 3)
-    chords = np.linalg.norm(chord_vectors, axis=1, keepdims=True)  # Shape: (n_r, 1)
-    
-    u_span = np.array([1.0, 0.0, 0.0])
-    u_chord = chord_vectors / chords
-    u_thick = np.cross(u_span, u_chord)  # Normal thickness vector (n_r, 3)
-    
-    n_r = len(r)
-    scale = 1000.0 if scale_to_mm else 1.0  # Convert meters to mm if true
-
-    # Write out the structural text file
-    with open(f"{exportname}.ibl", "w") as f:
-        # Creo File Headers
-        f.write("Open\n")
-        f.write("Arclength\n")
+    for name in airfoil_names:
+        # KulfanAirfoil calculates the CST parameterization on instantiation
+        kf = asb.KulfanAirfoil(name)
+        p = kf.kulfan_parameters
         
-        # Loop through every radial station
-        for i in range(n_r):
-            # Creo section comment markers
-            f.write(f"Begin section ! Station {i+1}: r = {r[i]:.4f} m\n")
+        # Flatten the dictionary into a single 1D array
+        flat_weights = np.concatenate([
+            p['lower_weights'],
+            p['upper_weights'],
+            [p['leading_edge_weight']],
+            [p['TE_thickness']]
+        ])
+        weights_list.append(flat_weights)
+        
+    return np.array(weights_list)
+
+# Example usage:
+# r_foils = np.array([R_hub, R_mid, R_tip])
+# cst_weights = get_cst_weights_from_names(["naca4412", "naca2412", "naca0012"])
+
+def export_to_creo_ibl(r, c, beta, blade_coords, exportname, 
+                       pitch_axis=0.25, scale_to_mm=True, skin_thickness=0.0):
+    """
+    Generates a Creo .ibl file from a pre-computed (n_r, N_points, 2) blade coordinate array,
+    using AeroSandbox's native 2D geometry manipulation for elegant 3D positioning.
+    
+    Parameters:
+    * pitch_axis: Non-dimensional chord fraction to rotate around (0.25 = quarter chord).
+    """
+    n_r, n_foil, _ = blade_coords.shape
+    scale = 1000.0 if scale_to_mm else 1.0
+
+    with open(f"{exportname}.ibl", "w") as f:
+        f.write("Open\nArclength\n")
+        
+        for i, r_i in enumerate(r):
+            f.write(f"Begin section ! Station {i+1}: r = {r_i:.4f} m\n")
             f.write("Begin curve\n")
             
-            # Determine if we are building the skin or the core
-            if skin_thickness > 0.0:
-                core_x, core_y = offset_airfoil_profile(base_foil_x, base_foil_y, chords[i][0], skin_thickness)
-            else:
-                core_x, core_y = base_foil_x, base_foil_y
-                
-            n_foil = len(core_x)
+            # 1. Instantiate the ASB Airfoil from the JAX-optimized coordinates
+            foil = asb.Airfoil(coordinates=blade_coords[i])
             
-            # Generate and write out the 3D coordinates for this profile loop
-            for j in range(n_foil):
-                # 3D transformation logic
-                pt = le_points[i] + (core_x[j] * chord_vectors[i]) + (core_y[j] * chords[i] * u_thick[i])
-                pt_scaled = pt * scale
+            # 2. ELEGANT TRANSFORMS: Rotate and Scale natively in 2D
+            # Rotate around the pitch axis (beta is in radians). 
+            # Note: adjust the sign on beta[i] depending on your CAD coordinate handedness.
+            foil = foil.rotate(angle=-beta[i], x_center=pitch_axis, y_center=0.0)
+            
+            # Scale the airfoil by the local chord
+            foil = foil.scale(c[i], c[i])
+            
+            # Extract the transformed coordinates
+            base_coords = foil.coordinates
+            
+            # 3. Handle Core/Skin Normal Offsets
+            # (Note: ASB does not have a native inward boundary offset for core generation, 
+            # so you still rely on standard normal-offset logic here if skin_thickness > 0)
+            if skin_thickness > 0.0:
+                core_x, core_y = offset_airfoil_profile(base_coords[:, 0], base_coords[:, 1], 
+                                                        c[i], skin_thickness)
+            else:
+                core_x, core_y = base_coords[:, 0], base_coords[:, 1]
                 
-                # Creo requires: [Index (1-based)] [X] [Y] [Z]
-                f.write(f"{j+1}  {pt_scaled[0]:.6f}  {pt_scaled[1]:.6f}  {pt_scaled[2]:.6f}\n")
+            # 4. Direct 3D Mapping and Translation
+            for j in range(len(core_x)):
+                # Map 2D to 3D standard aerospace axes: X=Chord, Y=Span, Z=Thickness
+                # We subtract (pitch_axis * c[i]) to ensure the pitch axis aligns perfectly 
+                # on the CAD Y-axis (X=0, Z=0) across all radial stations.
+                pt_x = (core_x[j] - (pitch_axis * c[i])) * scale
+                pt_y = r_i * scale  
+                pt_z = core_y[j] * scale
+                
+                f.write(f"{j+1}  {pt_x:.6f}  {pt_y:.6f}  {pt_z:.6f}\n")
                 
     part_type = "Core Insert" if skin_thickness > 0 else "Aerodynamic Skin"
     print(f"Successfully generated Creo geometry: {exportname}.ibl ({n_r} sections) - {part_type}")
