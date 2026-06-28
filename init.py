@@ -28,8 +28,8 @@ class Inputs(eqx.Module):
     solve_omega: int = 0 # 0: No. 1: Objective
 
     # Discretisation settings
-    n_r: int = 15
-    n_psi: int = 9
+    n_r: int = 25
+    n_psi: int = 13
 
     # Diagnostics
     verbose: bool = False
@@ -40,12 +40,12 @@ class Inputs(eqx.Module):
     R_hub: float = 0.025
 
     # Flight Conditions
-    n_cond: int = 1
+    n_cond: int = 2
     thrust_target = jnp.array([22.5, 29.6])
     V_x = jnp.array([0.0, 8.60])
     V_yz = jnp.array([0.0, 12.29])
     omega = jnp.array([420.0, 535.0])
-    objective_weight = jnp.array([1.0])
+    objective_weight = jnp.array([0.2,0.8])
 
     # Motor Information
     I_0: float = 0.7           
@@ -181,20 +181,20 @@ def build_default_propeller(c: float = 0.02, beta: float = 10.0, inputs: Inputs 
         beta=init_beta,
         r=r, dr=dr,    
         psi=psi, dpsi=dpsi, 
-        V_x=inputs.V_x, 
-        V_yz=inputs.V_yz,
-        omega=inputs.omega,
+        V_x=inputs.V_x[0], 
+        V_yz=inputs.V_yz[0],
+        omega=inputs.omega[0],
         omega_max=343.0 / inputs.R_tip,
         V_ia_0=jnp.full((inputs.n_r,), 8.0), 
         c_scale=c_scale,
         beta_scale=beta_scale,
         error_log=jnp.array([1.0]),
         time_log=jnp.array([0.0]),
-        objective_thrust=jnp.array([10.0]),
-        objective_MIL=jnp.array([0.0]),
-        objective_power=jnp.array([0.5]),
-        objective_weight=inputs.objective_weight,
-        thrust_target=inputs.thrust_target,
+        objective_thrust=10.0,
+        objective_MIL=0.0,
+        objective_power=0.5,
+        objective_weight=inputs.objective_weight[0],
+        thrust_target=inputs.thrust_target[0],
     )
 
 if __name__ == "__main__":
@@ -221,7 +221,6 @@ if __name__ == "__main__":
     beta_apc_deg = apc_geom["twist_deg"]
     airfoil_apc = "clarky"
 
-    
     # Convert inches to meters and degrees to radians to match JAX solver SI units
     r_apc_m = jnp.array(r_apc_in) * 0.0254
     c_apc_m = jnp.array(c_apc_in) * 0.0254

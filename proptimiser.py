@@ -39,7 +39,7 @@ def minimumInducedLossCost(V_ia, params):
     # Collapse azimuthal axis → radial profile (Nr,)
     radial_sq_err = jnp.mean(sq_err_normalised, axis=1)
 
-    # Tip-weight: outer annuli carry more of the wake energy
+    # Outer annuli carry more of the wake energy
     r_norm = params.r / jnp.max(params.r)
     weighted_sq_err = radial_sq_err * r_norm
 
@@ -249,6 +249,7 @@ def run_optimization(params_base, update_queue=None):
         res_check = propmodel.thrust_residual(params_base.V_ia_0, params_base)
         jax.debug.print("Initial Residuals Check: {dT_res}", dT_res=res_check)
 
+    ## Construct params_struct for all flight conditions
     conditions_list = [
     replace(
             params_base,
@@ -459,10 +460,12 @@ def run_optimization(params_base, update_queue=None):
             implicit_diff=True, 
             jit=True
         )
+        ## Initialisation Prints
         print("Initialising Solver...")
         state = solver.init_state(init_params=vars_scaled, bounds=bounds, params_list=params_struct)
         print(f"{'Iter':<6} | {'Cond':<5} | {'Omega':<10} | {'Power':<12} | {'Thrust':<12} | {'T-Err':<12} | {'MIL':<10} | {'OptErr':<11} | {'Time'}")
         print("-" * 103)
+        ## Solver Loop
         try:
             for i in range(Inputs.opt_max_iter): 
                 vars_scaled, state = solver.update(vars_scaled, 
@@ -473,14 +476,17 @@ def run_optimization(params_base, update_queue=None):
                 # state.aux captures the updated tracking profiles (shape: [2, n_r])
                 # We assign them directly back to keep Newton warm-starts efficient
 
+                ## Unpack and Rescale Variables
                 c_scaled, beta_scaled, omega_scaled = vars_scaled
-                # toggle for omega
+                # toggle for omega solving
                 omega = lax.switch(Inputs.solve_omega, [lambda _: params_struct.omega, lambda _: params_struct.omega_max * omega_scaled], None)
                 c = params_struct.c_scale[:, None] * c_scaled[None, :]
                 beta = params_struct.beta_scale[:, None] * beta_scaled[None, :]
 
-                # Extract the updated V_ia_0 from state.aux and update params_struct
+                # Extract and unpack induced velocity
                 V_ia_0 = state.aux
+
+                ## Insert all new Guesses into params_struct
                 params_struct = eqx.tree_at(
                     lambda p: (p.c, p.beta, p.omega, p.V_ia_0), 
                     params_struct, 
@@ -492,32 +498,32 @@ def run_optimization(params_base, update_queue=None):
                 is_checkpoint = (time.time() - print_time > 5) or (i % 5 == 0)
 
                 if is_terminal or is_checkpoint:
+                    # Calculate State for Printing
                     powers, thrusts, rms_MIL_errs, _ = evaluate_all_conditions(params_struct)
-                    
-                    # Ensure we zip through the captured states as well
-                    for idx, (pwr, thr, mil) in enumerate(zip(powers, thrusts, rms_MIL_errs)):
-                        t_err = thr - params_struct.thrust_target[idx]
-                        omega_cond = omega[idx]
-                        
+
+                    # Vectorized array math for errors and costs
+                    t_errs = thrusts - params_struct.thrust_target
+
+                    # vmap the reference power calculation over the batched thrust_targets
+                    vmapped_actuator_pwr = jax.vmap(propmodel.actuator_disk_power, in_axes=(0, None))
+                    actuator_pwr_refs = vmapped_actuator_pwr(params_struct.thrust_target, params_base)
+                    cost_Ts = params_struct.objective_thrust * (t_errs / params_struct.thrust_target)**2
+                    cost_Ps = params_struct.objective_power * (powers / actuator_pwr_refs)**2
+
+                    # Clean zip over the pre-calculated batched arrays
+                    for idx, (pwr, thr, t_err, mil, om, c_T, c_P) in enumerate(zip(
+                        powers, thrusts, t_errs, rms_MIL_errs, omega, cost_Ts, cost_Ps
+                    )):
                         # Only print iteration metadata on the first condition row
                         iter_info = f"{i:<6} |" if idx == 0 else f"{'':<6} |"
                         opt_err = f"{state.error:<11.3f}" if idx == 0 else f"{'':<11}"
                         timing = f"{time.time() - iter_time:<4.1f}s" if idx == 0 else ""
                         
-                        print(f"{iter_info} C{idx:<3} | {omega_cond:<5.2f} | {pwr:<12.4f} | {thr:<12.4f} | {t_err:<12.4f} | {mil:<10.4f} | {opt_err} | {timing}")
-                        
-                        # Calculate Costs
-                        cost_T = jnp.squeeze(params_struct.objective_thrust[idx] * (t_err / params_struct.thrust_target[idx])**2)
-                        
-                        # Use params_base here to avoid extracting multi-condition batched shapes for rho and R
-                        actuator_pwr_ref = propmodel.actuator_disk_power(params_struct.thrust_target[idx], params_base)
-                        cost_P = jnp.squeeze(params_struct.objective_power[idx] * (pwr / actuator_pwr_ref)**2)
-                        
-                        # FIX 3: Added cost_induced to the debug print
-                        print(f"Cond {idx} Internal Costs -> Thrust: {float(cost_T):.4e} | Power: {float(cost_P):.4e} | Induced: {float(mil):.4e}")
-                        
+                        print(f"{iter_info} C{idx:<3} | {om:<5.2f} | {pwr:<12.4f} | {thr:<12.4f} | {t_err:<12.4f} | {mil:<10.4f} | {opt_err} | {timing}")
+                        print(f"Cond {idx} Internal Costs -> Thrust: {float(c_T):.4e} | Power: {float(c_P):.4e} | Induced: {float(mil):.4e}")
                     print_time = time.time()
                     
+                    ## Plotting Thread Update
                     if update_queue is not None:
                         # Extract Condition 0 (params_hover) from the batched PyTree
                         params_hover = jax.tree_util.tree_map(

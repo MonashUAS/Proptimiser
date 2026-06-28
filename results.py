@@ -481,9 +481,8 @@ if __name__ == "__main__":
     import matplotlib
     from matplotlib.animation import FuncAnimation
     # pass the base name/timestamp
-    timestamps = ["20260626-1234.eqx", "20260626-1247.eqx"]
-    weights = np.array([0.8,0.2])
-    
+    timestamps = ["20260629-0117.eqx"]
+    weights = np.array([1.0])
     # Blending with multiple propeller geometries
     inputs, params_base = propgeomblender(timestamps, weights)
     inputs = init.Inputs # comment out to use flight conditions from propeller file
@@ -564,10 +563,10 @@ if __name__ == "__main__":
         
             # Save Results/Export Geometry if Required
         user_input = input('Save Propeller? (y/n): ')
-        timestamp = input('Input Prop Name: ')
         if user_input.lower() == 'y':
-            paramsfile = "prop_params_" + timestamp
-            inputsfile = "prop_inputs_" + timestamp
+            propname = input('Input Prop Name: ')
+            paramsfile = "prop_params_" + propname
+            inputsfile = "prop_inputs_" + propname
             print(f'Saving Propeller Inputs/Parameters to {paramsfile} and {inputsfile}')
             params_base.save_state(paramsfile)
             inputs.save_state(inputsfile)

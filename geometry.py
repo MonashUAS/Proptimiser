@@ -7,20 +7,23 @@ from aerosandbox.geometry.airfoil.airfoil_families import get_kulfan_coordinates
 
 ### Integrand Functions
 def radial_stops(R, r_hub, n_r):
-    '''
-    Return radial node centers and dr for integration.
-    '''
-    r = jnp.linspace(r_hub + (R - r_hub) / (2 * n_r), R - (R - r_hub) / (2 * n_r), n_r)
-    # Simple Homogeneous radial spacing
-    dr = jnp.ones_like(r)*(R - r_hub) / n_r
+    """
+    Return radial node centers and dr for integration, including the endpoints.
+    """
+    # Includes both r_hub and R as nodes
+    r = jnp.linspace(r_hub, R, n_r)
+    
+    # Grid spacing (distance between inclusive nodes)
+    dr = jnp.ones_like(r) * (R - r_hub) / (n_r - 1)
     return r, dr
 
 def angular_stops(n_psi):
-    '''
-    Return angular node centers and dpsi for integration
-    '''
-    psi = jnp.linspace(0, (2 * jnp.pi), n_psi)
-    dpsi = jnp.ones_like(psi)*(2 * jnp.pi) / n_psi
+    """
+    Return angular node boundaries and dpsi for integration with the endpoint excluded.
+    """
+    # Divides 2*pi into n_psi segments, returning the start of each boundary (drops 2*pi)
+    psi = jnp.linspace(0, 2 * jnp.pi, n_psi, endpoint=False)
+    dpsi = jnp.ones_like(psi) * (2 * jnp.pi) / n_psi
     return psi, dpsi
 
 ### Geometry Transformation functions

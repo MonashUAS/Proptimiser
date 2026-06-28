@@ -263,7 +263,7 @@ def induced_velocity(params):
     the propeller. 
     
     Refer to figure 3 of "A propeller model for general forward flight conditions"
-    [Waqas Khan and Meyer Nolan 2015] for insight into variables. 
+    [Waqas Khan and Meyer Nahon 2015] for insight into variables. 
     
     Same paper used for equations
 
@@ -381,7 +381,7 @@ def actuator_disk_power(T, params):
     V_x = params.V_x # freestream velocity
 
     A = jnp.pi*R**2 # disc area
-    v_induced = jnp.sqrt(T/(2*rho*A) + V_x**2/4) - V_x/2  #  induced velocity through actuator disc
+    v_induced = jnp.sqrt(T/(2*rho*A) + V_x**2/4) - V_x/2  # induced velocity through actuator disc
     P_act = T*(V_x+v_induced) # Ideal actuator disk power
     return jnp.squeeze(P_act)
 
