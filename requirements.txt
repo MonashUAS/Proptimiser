@@ -1,8 +1,4 @@
 pyvista
-trame
-trame-vtk
-trame-vuetify
-trame-matplotlib
 matplotlib
 numpy
 jax
@@ -11,7 +7,5 @@ optax
 scipy
 equinox
 interpax
-slsqp-jax
-
 neuralfoil
 aerosandbox

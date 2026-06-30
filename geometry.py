@@ -317,7 +317,7 @@ def export_to_creo_ibl(r, c, beta, blade_coords, exportname,
     if np.isscalar(pitch_axis):
         pitch_axis = np.full(n_r, pitch_axis)
 
-    with open(f"{exportname}.ibl", "w") as f:
+    with open(f"exports/{exportname}.ibl", "w") as f:
         # Note: 'Open' here refers to the loft trajectory (spanwise), not the cross-sections
         f.write("Open\nArclength\n") 
         
@@ -470,8 +470,8 @@ def export_parting_surface_ibl(r, c, beta, blade_coords, r_foils, exportname,
     y_tip_ext = station_data[-1]['y'] + y_margin
     sections.append(build_zoned_section(y_tip_ext, station_data[-1]))
 
-    # 2. Write out the multi-curve IBL file
-    with open(f"{exportname}.ibl", "w") as f:
+    # Write out the multi-curve IBL file
+    with open(f"exports/{exportname}.ibl", "w") as f:
         f.write("Open\n")
         f.write("Arclength\n") 
         

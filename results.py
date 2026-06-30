@@ -481,7 +481,7 @@ if __name__ == "__main__":
     import matplotlib
     from matplotlib.animation import FuncAnimation
     # pass the base name/timestamp
-    timestamps = ["20260629-0117.eqx"]
+    timestamps = ["Redback V2.eqx"]
     weights = np.array([1.0])
     # Blending with multiple propeller geometries
     inputs, params_base = propgeomblender(timestamps, weights)
@@ -581,4 +581,4 @@ if __name__ == "__main__":
             params_base.save_state(paramsfile)
             inputs.save_state(inputsfile)
 
-        exit_input = input('\nExit configuration loop completely? (y/n): ')
+        exit_input = input('\nExit post-processing loop completely? (y/n): ')
