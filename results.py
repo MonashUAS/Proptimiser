@@ -4,6 +4,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import jax
+jax.config.update("jax_debug_nans", True)
 import jax.numpy as jnp
 import equinox as eqx
 from scipy.interpolate import make_interp_spline
@@ -405,7 +406,6 @@ def load_perfect_skeleton(filename, base_skeleton):
     perfect_skeleton = jax.tree_util.tree_unflatten(treedef, perfect_leaves)
     return perfect_skeleton
 
-
 def loadprop(prop_timestamp):
     '''
     Load and plot a propeller from saved files using just the timestamp.
@@ -424,12 +424,12 @@ def loadprop(prop_timestamp):
     print(f"Loading {params_filename}.eqx...")
     
     # Define a fast dummy airfoil interpolator to bypass slow loading & NaN errors
-    airfoil_interp = airfoil.load_airfoil_data("arad10")
+    airfoil_interp = airfoil.load_airfoil_data("clarky")
 
     # Initialize a baseline structure using generic 0D scalar arrays
     dummy_scalar = jnp.array(0.0)
     base_params = init.Params(
-        airfoil="arad10",
+        airfoil="clarky",
         airfoil_interp=airfoil_interp,
         N=2,
         c=dummy_scalar, beta=dummy_scalar,
@@ -485,7 +485,7 @@ if __name__ == "__main__":
     weights = np.array([1.0])
     # Blending with multiple propeller geometries
     inputs, params_base = propgeomblender(timestamps, weights)
-    inputs = init.Inputs # comment out to use flight conditions from propeller file
+    inputs = init.Inputs() # comment out to use flight conditions from propeller file
     print(f"--- Evaluating {inputs.n_cond} Flight Conditions ---")
 
     # Execution & Processing Loop
@@ -560,6 +560,16 @@ if __name__ == "__main__":
             # Smoothing modifies the global underlying geometry skeleton
             params_base = iterativesmoothing(params_base)
             print("Geometry updated. Induced velocity fields will automatically refresh on the next loop pass.")
+
+            V_ia_0_avg = jnp.average(V_ia_0_solved)
+
+            V_ia_0_guess = V_ia_0_avg*jnp.ones_like(V_ia_0_solved)
+
+            params_cond = eqx.tree_at(
+                lambda p: p.V_ia_0, 
+                params_cond, 
+                V_ia_0_guess
+            )
         
             # Save Results/Export Geometry if Required
         user_input = input('Save Propeller? (y/n): ')

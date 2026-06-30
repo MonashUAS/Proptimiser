@@ -131,7 +131,6 @@ class Params(eqx.Module):
     a: float = 343.0            # speed of sound (m/s)      
 
     def save_state(self, filename: str = "params_state.eqx"):
-        
         """Saves the array parameters to an Equinox file."""
         if not filename.endswith(".eqx"): filename += ".eqx"
         filename = "propellers/" + filename
@@ -169,6 +168,7 @@ def build_default_propeller(c: float = 0.02, beta: float = 10.0, inputs: Inputs 
     init_c = jnp.full((Inputs.n_r,), c) 
     # Constant twist across the whole blade
     init_beta = jnp.full((Inputs.n_r,), jnp.radians(beta))
+
 
     # Airfoil Data
     airfoil_interp = load_airfoil_data(airfoil_name)
