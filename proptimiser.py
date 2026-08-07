@@ -458,7 +458,8 @@ def run_optimization(params_base, update_queue=None):
             fun=objectives_fn, 
             has_aux=True,
             implicit_diff=True, 
-            jit=True
+            jit=True,
+            verbose=2
         )
         ## Initialisation Prints
         print("Initialising Solver...")

@@ -20,16 +20,16 @@ class Inputs(eqx.Module):
     opt_tol: float = 1e-2 
 
     # Induced Velocity Settings
-    V_ia_0_max_iter: int = 300
-    V_ia_0_eps: float = 5e-3
+    V_i_0_max_iter: int = 300
+    V_i_0_eps: float = 5e-3
 
     # Solver Type
-    solvertype: str = "T"
+    bemt_type: int = 1 # 0: Thrust (axial), 1: Thrust+Torque (axial+tangential)
     solve_omega: int = 0 # 0: No. 1: Objective
 
     # Discretisation settings
-    n_r: int = 25
-    n_psi: int = 13
+    n_r: int = 50
+    n_psi: int = 12
 
     # Diagnostics
     verbose: bool = False
@@ -46,6 +46,9 @@ class Inputs(eqx.Module):
     V_yz = jnp.array([0.0, 12.29])
     omega = jnp.array([420.0, 535.0])
     objective_weight = jnp.array([0.2,0.8])
+
+    # Flight Condition Inflow Array
+
 
     # Motor Information
     I_0: float = 0.7           
@@ -115,7 +118,7 @@ class Params(eqx.Module):
     # Target objective
     thrust_target: jnp.ndarray
 
-    V_ia_0: jnp.ndarray     # initial guess/storage for V_ia_0 (ms^{-1})
+    V_i_0: jnp.ndarray     # initial guess/storage for V_i_0 (ms^{-1}), [3, n_r]
 
     # Solver Logging Info
     error_log: jnp.ndarray
@@ -170,6 +173,30 @@ def build_default_propeller(c: float = 0.02, beta: float = 10.0, inputs: Inputs 
     # Constant twist across the whole blade
     init_beta = jnp.full((Inputs.n_r,), jnp.radians(beta))
 
+    # Aerodynamic Initial Guesses
+    A = jnp.pi * (inputs.R_tip ** 2)
+
+    # Axial Inflow Guess (Glauert Momentum Theory)
+    # v_h is the ideal induced velocity in hover
+    v_h = jnp.sqrt(inputs.thrust_target[0] / (2.0 * Params.rho * A))
+    # General axial induced velocity including forward flight velocity
+    V_ia_mean = -inputs.V_x[0] / 2.0 + jnp.sqrt((inputs.V_x[0] / 2.0)**2 + v_h**2)
+    V_ia_0 = jnp.full((inputs.n_r,), V_ia_mean)
+
+    # Tangential Inflow Guess (Ideal Angular Momentum)
+    # Estimate ideal power and torque to find mean swirl velocity
+    P_ideal = inputs.thrust_target[0] * (inputs.V_x[0] + V_ia_mean)
+    Q_ideal = P_ideal / inputs.omega[0]
+    # Q = mass_flux * V_it * R_effective -> V_it ≈ Q / (rho * A * V_total * R_tip)
+    V_it_mean = Q_ideal / (Params.rho * A * (inputs.V_x[0] + V_ia_mean) * inputs.R_tip)
+    V_it_0 = jnp.full((inputs.n_r,), V_it_mean)
+
+    # Radial Inflow Guess
+    V_ir_0 = jnp.zeros((inputs.n_r,))
+
+    # Stack into expected shape [3, n_r]
+    V_i_0_init = jnp.stack([V_ia_0, V_it_0, V_ir_0], axis=0)
+
     # Airfoil Data
     airfoil_interp = load_airfoil_data(airfoil_name)
     # Construct Params
@@ -185,7 +212,7 @@ def build_default_propeller(c: float = 0.02, beta: float = 10.0, inputs: Inputs 
         V_yz=inputs.V_yz[0],
         omega=inputs.omega[0],
         omega_max=343.0 / inputs.R_tip,
-        V_ia_0=jnp.full((inputs.n_r,), 8.0), 
+        V_i_0=V_i_0_init, 
         c_scale=c_scale,
         beta_scale=beta_scale,
         error_log=jnp.array([1.0]),

@@ -7,6 +7,8 @@ import equinox as eqx
 import jaxopt
 from dataclasses import replace
 
+import time
+
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -15,20 +17,20 @@ from init import build_default_propeller, Inputs, Params
 from airfoil import aero_coeffs
 from airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskEfficiency, resultantVelocityComponents, high_induction_correction
 
-### Calculate thrust, hub and torque elements
-def dT_blade(V_ia: jnp.ndarray, params: Params, debug: bool=False):
+## Blade Element Theory 
+def dT_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
     """
     Calculates instantaneous thrust at each radial and azimuthal station, 
-    and calculate the average thrust in each annulus over a rotation
+    and calculates the average thrust in each annulus over a rotation.
 
     Inputs:
-        V_ia        <- Induced velocity at each radial and azimuthal station
+        V_i         <- 3D Induced velocity grid of shape (3, Nr, Npsi) [axial, tangential, radial]
         params      <- Params object used in the optimisation loop, remains unmodified by function execution
         debug       <- Boolean to select whether or not to print debug information when function is called
 
     Outputs:
-        dT_blade_ave w/ size (Nr, 1)                        <- Thrust per annulus 
-        dT_blade_instantaneous w/ size (Nr, Npsi)       <- Thrust per differential element
+        dT_blade_ave w/ size (Nr, )                        <- Thrust per annulus 
+        dT_blade_instantaneous w/ size (Nr, Npsi)          <- Thrust per differential element
 
     Assumes: 
         |V_yz| < |V_x + V_ia|   <- Assumption that the annuli do not interact with each other 
@@ -36,56 +38,46 @@ def dT_blade(V_ia: jnp.ndarray, params: Params, debug: bool=False):
     Uses formulation from (M. Nahon et al., 2015) equations 5 and 6 modified with 
     the inclusion of the prandtl loss parameter 'F'
     """
-    
     # Unpack parameters
     N, c, psi = params.N, params.c, params.psi # geometric and positional values
     rho = params.rho # air density
 
     # Calculate Local Flow Properties
-    V_R, phi = resultantVelocityComponents(V_ia, params)
+    V_R, phi = resultantVelocityComponents(V_i, params)
 
     # Get Aerodynamic Coefficients
-    C_L, C_D, _ = aero_coeffs(V_ia, params)
+    C_L, C_D, _ = aero_coeffs(V_i, params)
 
     # Blade Element Theory instantaneous thrust element
-    dT_blade_instantaneous = 0.5 * rho * c[:, None] * (V_R**2) * (C_L*jnp.cos(phi) - C_D*jnp.sin(phi))
-    # Average thrust in each annulus over one rotation (using formulation from the text prior to statement of eqn. 6)
-    # Average thrust per annulus is the integral of the instantaneous thrust element divided by 2*pi
-    dT_blade_ave = N/(2*jnp.pi) * jnp.trapezoid(dT_blade_instantaneous, x=psi, axis=1)
+    dT_blade_instantaneous = 0.5 * rho * c[:, None] * (V_R**2) * (C_L * jnp.cos(phi) - C_D * jnp.sin(phi))
+    
+    # Average thrust in each annulus over one rotation
+    dT_blade_ave = N / (2 * jnp.pi) * jnp.trapezoid(dT_blade_instantaneous, x=psi, axis=1)
 
     if debug:
         print("------dT_blade DEBUG------")
-
-        print("dT Shapes (inst., ave.):")
-        print((jnp.shape(dT_blade_instantaneous), jnp.shape(dT_blade_ave)))
-
-        print("V_ia shape:")
-        print(jnp.shape(V_ia))
-
-        print("F shape:")
-        print(jnp.shape(F))
-        
+        print("dT Shapes (inst., ave.):", (jnp.shape(dT_blade_instantaneous), jnp.shape(dT_blade_ave)))
+        print("V_i shape:", jnp.shape(V_i))
         print("------dT_blade DEBUG------")
 
-    return dT_blade_ave, dT_blade_instantaneous
+    return dT_blade_ave
 
 
-def dH_blade(V_ia, params, debug=False):
+def dH_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
     """
     Calculates instantaneous hub force at each radial and azimuthal station, 
-    and calculate the average hub force in each annulus over a rotation
+    and calculates the average hub force in each annulus over a rotation.
 
     The hub forces are defined as the force element coplanar with the rotor disk 
-    and normal to the radial direction
+    and normal to the radial direction.
 
     Inputs:
-        V_ia        <- Induced velocity at each radial and azimuthal station
+        V_i         <- 3D Induced velocity grid of shape (3, Nr, Npsi) [axial, tangential, radial]
         params      <- Params object used in the optimisation loop, remains unmodified by function execution
         debug       <- Boolean to select whether or not to print debug information when function is called
 
     Outputs:
-        dH_blade_ave w/ size (Nr, 1)                        <- Force per annulus 
-        dH_blade_instantaneous w/ size (Nr, Npsi)       <- Force per differential element
+        dH_blade_ave w/ size (Nr, )                        <- Force per annulus 
 
     Assumes: 
         |V_yz| < |V_x + V_ia|   <- Assumption that the annuli do not interact with each other 
@@ -93,122 +85,111 @@ def dH_blade(V_ia, params, debug=False):
     Uses formulation from (M. Nahon et al., 2015) equation 11 modified with 
     the inclusion of the prandtl loss parameter 'F'
     """
-    
     # Unpack parameters
     N, c, psi = params.N, params.c, params.psi # geometric and positional values
     rho = params.rho # air density
 
     # Calculate Local Flow Properties
-    V_R, phi = resultantVelocityComponents(V_ia, params)
+    V_R, phi = resultantVelocityComponents(V_i, params)
     
     # Get Aerodynamic Coefficients
-    C_L, C_D, _ = aero_coeffs(V_ia, params)
+    C_L, C_D, _ = aero_coeffs(V_i, params)
 
     # Tip and Root Loss Factors
-    tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
-
+    tip_loss, root_loss = tip_root_loss_factors(phi, params)
+    
     # Calculate the total prandtl loss correction factor
     F = jnp.multiply(tip_loss, root_loss)
+    F = jnp.clip(F, min=0.05, max=1.0) # clip to prevent div by zero
 
     # Inner integral term
-    inner = (V_R**2) * (C_L*jnp.sin(phi) + C_D*jnp.cos(phi))
+    inner = (V_R**2) * (C_L * jnp.sin(phi) + C_D * jnp.cos(phi))
 
-    # Average thrust in each annulus over one rotation (using formulation from the text prior to statement of eqn. 6)
-    # Average thrust per annulus is the integral of the instantaneous thrust element divided by 2*pi
-    dH_blade_ave = N/(4*jnp.pi) * rho * c * jnp.trapezoid(inner, x=psi, axis=1) #* dr
+    # Average hub force per annulus over one rotation
+    dH_blade_ave = N / (4 * jnp.pi) * rho * c * jnp.trapezoid(inner, x=psi, axis=1)
 
     if debug:
         print("------dH_blade DEBUG------")
-
-        print("dH Shapes (ave.):")
-        print((jnp.shape(dH_blade_ave)))
-
-        print("V_ia shape:")
-        print(jnp.shape(V_ia))
-
-        print("F shape:")
-        print(jnp.shape(F))
-        
+        print("dH Shapes (ave.):", jnp.shape(dH_blade_ave))
+        print("V_i shape:", jnp.shape(V_i))
+        print("F shape:", jnp.shape(F))
         print("------dH_blade DEBUG------")
 
     return dH_blade_ave
 
 
-def dQ_blade(V_ia, params, debug=False):
+def dQ_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
     """
     Calculates instantaneous torque at each radial and azimuthal station, 
-    and calculate the average torque in each annulus over a rotation
+    and calculates the average torque in each annulus over a rotation.
 
     Inputs:
-        V_ia        <- Induced velocity at each radial and azimuthal station
+        V_i         <- 3D Induced velocity grid of shape (3, Nr, Npsi) [axial, tangential, radial]
         params      <- Params object used in the optimisation loop, remains unmodified by function execution
         debug       <- Boolean to select whether or not to print debug information when function is called
 
     Outputs:
-        dQ_blade w/ size (Nr, 1)                        <- Torque per annulus 
-        dQ_blade_instantaneous w/ size (Nr, Npsi)       <- Torque per differential element
+        dQ_blade_ave w/ size (Nr, )                        <- Torque per annulus 
 
     Assumes: 
         |V_yz| < |V_x + V_ia|   <- Assumption that the annuli do not interact with each other 
 
     Uses formulation from (M. Nahon et al., 2015) equation 12
     """
-    
     r = params.r
 
     # Calculate the hub force elements dH
-    dH_blade_ave = dH_blade(V_ia, params, debug)
+    dH_blade_ave = dH_blade(V_i, params, debug)
 
     # Use equation 12 to calculate the torque elements from the hub elements
-    # Technically these should be the negative, but its easier to work with if they arent
     dQ_blade_ave = dH_blade_ave * r
 
     if debug:
         print("------dQ_blade DEBUG------")
-
-        print("dQ Shapes (inst., ave.):")
-        print((jnp.shape(dQ_blade_ave)))
-
-        print("V_ia shape:")
-        print(jnp.shape(V_ia))
-        
-        print("------dT_blade DEBUG------")
+        print("dQ Shapes (ave.):", jnp.shape(dQ_blade_ave))
+        print("V_i shape:", jnp.shape(V_i))
+        print("------dQ_blade DEBUG------")
 
     return dQ_blade_ave
 
-### Calculate thrust elements using momentum imparted to the air
-def dT_momentum(V_ia, params, debug=False):
+
+### Momentum Theory
+def dT_momentum(V_i: jnp.ndarray, params: Params, debug: bool = False):
     """
     Calculates instantaneous thrust at each radial and azimuthal station, 
-    and calculate the average thrust in each annulus over a rotation
+    and calculates the average thrust in each annulus over a rotation.
 
-    Unlike dT_blade, dT_momentum uses the momentum change in the air as it passes through the 
+    dT_momentum uses the momentum change in the air as it passes through the 
     blade element and is accelerated rather than the forces on the blade element to determine
-    thrust 
+    thrust.
 
     Inputs:
-        V_ia        <- Induced velocity at each radial and azimuthal station
+        V_i         <- 3D Induced velocity grid of shape (3, Nr, Npsi) [axial, tangential, radial]
         params      <- Params object used in the optimisation loop, remains unmodified by function execution
         debug       <- Boolean to select whether or not to print debug information when function is called
 
     Outputs:
-        dT_momentum w/ size (Nr, 1)                        <- Thrust per annulus 
-        dT_momentum_instantaneous w/ size (Nr, Npsi)       <- Thrust per differential element
+        dT_momentum_ave w/ size (Nr, )                     <- Thrust per annulus 
 
     Assumes: 
         |V_yz| < |V_x + V_ia|   <- Assumption that the annuli do not interact with each other 
 
     Uses formulation from (M. Nahon et al., 2015) equation 9
     """
+    # Unpack axial induced velocity component
+    V_ia = V_i[0]
+
     # Momentum theory about annular element
     r, psi = params.r, params.psi
     V_x, V_yz = params.V_x, params.V_yz
     rho = params.rho
 
+    V_R, phi = resultantVelocityComponents(V_i, params)
+
     # Tip and Root Loss Factors
-    tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
+    tip_loss, root_loss = tip_root_loss_factors(phi, params)
     F = jnp.multiply(tip_loss, root_loss) 
-    F = jnp.clip(F, min=0.05, max=1.0)
+    F = jnp.clip(F, min=0.05, max=1.0) # clip to prevent div by zero
 
     # Compute baseline classical momentum element locally
     V_prime = jnp.sqrt((V_x + V_ia) ** 2 + V_yz ** 2)
@@ -223,77 +204,186 @@ def dT_momentum(V_ia, params, debug=False):
     if debug:
         print("------dT_momentum DEBUG------")
         print("dT Shapes (ave.):", jnp.shape(dT_momentum_ave))
-        print("V_ia shape:", jnp.shape(V_ia))
+        print("V_i shape:", jnp.shape(V_i))
         print("F shape:", jnp.shape(F))
         print("------dT_momentum DEBUG------")
 
     return dT_momentum_ave
 
-def thrust_residual(V_ia_0_guess, params):
+def dQ_momentum(V_i, params, debug=False):
     """
-    Calculate thrust residual at radial stops (difference between blade+momentum theory)
+    Calculates instantaneous torque at each radial and azimuthal station, 
+    and calculate the average torque in each annulus over a rotation
 
-    Takes the difference at each azimuthal stop, then integrates in the azimuthal direction
+    Inputs:
+        V_i         <- Induced velocity grid (3, n_r, n_psi) [axial, tangential, radial]
+        params      <- Params object used in the optimisation loop, remains unmodified by function execution
+        debug       <- Boolean to select whether or not to print debug information when function is called
 
-    (may extrapolate to radial+azimuthal stops later, 
-    but for now skew rotor inflow is most complex and 
-    dimensionality of problem is reduced)
+    Outputs:
+        dQ_momentum_ave w/ size (Nr, )                        <- Torque per annulus 
+
+    Assumes: 
+        |V_yz| < |V_x + V_ia|   <- Assumption that the annuli do not interact with each other 
+
+    Uses formulation from (M. Nahon et al., 2015) adapted for angular momentum
     """
+    # Extract velocity components from 3D grid
+    V_ia = V_i[0]  # shape (n_r, n_psi)
+    V_it = V_i[1]  # shape (n_r, n_psi)
+
+    # Momentum theory about annular element
+    r, psi = params.r, params.psi
+    V_x, V_yz = params.V_x, params.V_yz
+    rho = params.rho
+
+    V_R, phi = resultantVelocityComponents(V_i, params)
+
+    # Tip and Root Loss Factors
+    tip_loss, root_loss = tip_root_loss_factors(phi, params)
+    F = jnp.multiply(tip_loss, root_loss) 
+    F = jnp.clip(F, min=0.05, max=1.0) # clip to prevent div by zero
+
+    # Compute baseline classical momentum element locally
+    # Uses V_prime to account for skewed wake mass flux (Nahon 2015)
+    V_prime = jnp.sqrt((V_x + V_ia) ** 2 + V_yz ** 2)
     
-    # Establish induced velocity from inflow model
-    V_ia = inflow_model(V_ia_0_guess, params)
+    # dQ element per radian (omitting dr to match dT_momentum format)
+    dQ_element_classical = 2 * rho * (r[:, None] ** 2) * V_it * V_prime * F
 
-    # Calculate the instantaneous blade element and momentum theory thrust elements:
+    # Integrate over psi to get the average torque per annulus
+    dQ_momentum_ave = jnp.trapezoid(dQ_element_classical, x=psi, axis=1)
 
-    dT_BEMT_average, _ = dT_blade(V_ia, params, debug=False) # get the average elements (1st output) only
+    if debug:
+        print("------dQ_momentum DEBUG------")
+        print("dQ Shapes (ave.):", jnp.shape(dQ_momentum_ave))
+        print("V_ia shape:", jnp.shape(V_ia))
+        print("V_it shape:", jnp.shape(V_it))
+        print("F shape:", jnp.shape(F))
+        print("------dQ_momentum DEBUG------")
 
-    dT_MMNT_average = dT_momentum(V_ia, params, debug=False) # get the average elements (1st output) only
+    return dQ_momentum_ave
 
-    dT_residual = dT_BEMT_average - dT_MMNT_average
+def thrust_residual(V_i, params):
+    """
+    Calculates the 1D thrust residual (BEMT vs Momentum) across radial stops.
+    Returns array of shape (n_r,)
+    """
+    dT_BEMT_avg = dT_blade(V_i, params, debug=False)
+    dT_MMNT_avg = dT_momentum(V_i, params, debug=False)
+    
+    return dT_BEMT_avg - dT_MMNT_avg
 
-    #print("iterated!")
-    #jax.debug.print("Thrust Residual {dT_res}", dT_res=dT_residual) 
+def torque_residual(V_i, params):
+    """
+    Calculates the 1D torque residual (BEMT vs Momentum) across radial stops.
+    Returns array of shape (n_r,)
+    """
+    dQ_BEMT_avg  = dQ_blade(V_i, params, debug=False)
+    dQ_MMNT_avg = dQ_momentum(V_i, params, debug=False)
+    
+    return dQ_BEMT_avg - dQ_MMNT_avg
 
-    return dT_residual
+def bemt_residuals(lambda_i_0_guess, params):
+    """
+    Evaluates the coupled BEMT residuals.
+    lambda_i_0_guess: non-dimensional inflow ratios of shape (3, n_r)
+    """
+    # Retrieve scales and Re-dimensionalise
+    V_scale = get_velocity_scales(params)
+    V_i_0_guess_dim = lambda_i_0_guess * V_scale
 
+    # Expand to 3D grid
+    V_i = inflow_model(V_i_0_guess_dim, params)
+
+    # Axial Residual (Scale by Thrust Target)
+    dT_res_physical = thrust_residual(V_i, params)
+    dT_res = dT_res_physical / params.thrust_target
+    
+    # Radial Residual (Already O(1))
+    dR_res = lambda_i_0_guess[2] - 0.0
+
+    # Tangential Residual Branches
+    def a_dQ_res(V_i, params):
+        return lambda_i_0_guess[1] - 0.0
+
+    def at_dQ_res(V_i, params):
+        dQ_res_physical = torque_residual(V_i, params)
+        # Scale by an approximate ideal torque to make O(1)
+        Q_ref = params.thrust_target * Inputs.R_tip 
+        return dQ_res_physical / Q_ref
+
+    dQ_res = jax.lax.switch(
+        Inputs.bemt_type, 
+        [a_dQ_res, at_dQ_res], 
+        *(V_i, params)
+    )
+
+    return jnp.stack([dT_res, dQ_res, dR_res], axis=0)
+
+def get_velocity_scales(params):
+    """
+    Computes characteristic velocity scales for the 3 inflow components
+    to act as a diagonal preconditioner for the Broyden solver.
+    Returns: V_scale -> shape (3, 1) for broadcasting against (3, n_r) arrays.
+    """
+    A_disk = jnp.pi * (Inputs.R_tip ** 2)
+    
+    # Axial Scale: Mean Momentum Inflow
+    v_h = jnp.sqrt(params.thrust_target / (2.0 * params.rho * A_disk))
+    V_ia_mean = -params.V_x / 2.0 + jnp.sqrt((params.V_x / 2.0)**2 + v_h**2)
+    
+    # Tangential Scale: Ideal Mean Swirl
+    P_ideal = params.thrust_target * (params.V_x + V_ia_mean)
+    Q_ideal = P_ideal / params.omega
+    V_it_mean = Q_ideal / (params.rho * A_disk * (params.V_x + V_ia_mean) * Inputs.R_tip)
+    
+    # Radial Scale: Tip Speed (Centrifugal reference)
+    V_tip = params.omega * Inputs.R_tip
+
+    # Protect against zero-torque states (e.g., if thrust target is 0)
+    V_it_mean = jnp.maximum(V_it_mean, 1e-4)
+
+    # Stack and reshape to (3, 1) so it broadcasts perfectly with (3, n_r)
+    return jnp.array([V_ia_mean, V_it_mean, V_tip])[:, None]
 @jax.jit
 def induced_velocity(params):
     '''
-    Calculates the axial induced velocity (neglects the radial and tangential induced velocity) for
-    the propeller. 
-    
-    Refer to figure 3 of "A propeller model for general forward flight conditions"
-    [Waqas Khan and Meyer Nahon 2015] for insight into variables. 
-    
-    Same paper used for equations
-
-    Returns:
-        V_ia: Induced velocity at each azimuthal and radial point (size[n_r, n_psi])
-        V_ia_0: Velocity induced by each annulus at the center of the propeller (size[n_r, ])
+    Calculates the coupled 3D induced velocity field using BEMT.
     '''
+    V_i_0_guess_physical = params.V_i_0
 
-    # Debug Check Initial Residuals
+    # Non-Dimensionalise Initial Guess Component-Wise
+    V_scale = get_velocity_scales(params)
+    initial_guess_lambda = V_i_0_guess_physical / V_scale
+
     if Inputs.verbose:
-        res_check = thrust_residual(params.V_ia_0, params)
-        print(res_check)
+        res_check = bemt_residuals(initial_guess_lambda, params)
+        jax.debug.print("Initial Residual Shape {s}", s=jnp.shape(res_check))
 
-        print("Residual Shape", jnp.shape(res_check))
-        print("Residual min/max:", res_check.min(), res_check.max())
+    # Broyden Solver Call
+    solver = jaxopt.Broyden(
+        fun=bemt_residuals, 
+        maxiter=Inputs.V_i_0_max_iter, 
+        tol=Inputs.V_i_0_eps, 
+        implicit_diff=True,
+        verbose = Inputs.verbose
+    )
+    
+    (lambda_i_0, info) = solver.run(initial_guess_lambda, params)
 
-    # Newton-Like Solver for Induced Velocity
-    solver = jaxopt.Broyden(fun=thrust_residual, maxiter=Inputs.V_ia_0_max_iter, tol=Inputs.V_ia_0_eps, implicit_diff=True, implicit_diff_solve=jaxopt.linear_solve.solve_gmres)
-    # Input initial guess for induced velocity and solve. (Induced velocity is parametrised per radial stop)
-    (V_ia_0, info) = solver.run(params.V_ia_0, params)
-
-    # # Debug Check Final Residuals
     if Inputs.verbose:
-        res_check = thrust_residual(V_ia_0, params)
-        jax.debug.print("Residuals Check: {dT_res}", dT_res=res_check)
-    V_ia = inflow_model(V_ia_0, params)
+        final_res = bemt_residuals(lambda_i_0, params)
+        jax.debug.print("Final Residuals: {res}", res=final_res)
 
-    return V_ia, V_ia_0
+    # Re-dimensionalise the converged solution
+    V_i_0 = lambda_i_0 * V_scale
 
-def torque(V_ia, params, debug=False):
+    V_i = inflow_model(V_i_0, params)
+
+    return V_i, V_i_0
+
+def torque(V_i, params, debug=False):
     """
     Calculates the total torque on the propeller by integrating the average torque per annulus per rotation
     along the radial direction
@@ -313,45 +403,24 @@ def torque(V_ia, params, debug=False):
     r = params.r
 
     # Get the average torque per rotation in each annulus using the dQ_blade function
-    dQ_blade_ave = dQ_blade(V_ia, params, debug)
+    dQ_blade_ave = dQ_blade(V_i, params, debug)
 
     # Use trapezoidal integration in the radial direction to compute the total torque
     Q = jnp.trapezoid(dQ_blade_ave, x=r)
 
     return Q
 
-def thrust(V_ia, params):
+def thrust(V_i, params):
     '''
     Calculate total thrust from solved induced velocity
     '''
     r = params.r
-    dT = dT_momentum(V_ia, params)
+    dT = dT_momentum(V_i, params)
 
     # Numerically Compute Double Integral to Solve for Thrust
     T = jnp.trapezoid(dT, x=r)
 
     return T
-
-def power(V_ia, params):
-    '''
-    Calculates the aerodynamic Power of Propeller (W) using Momentum Theory.
-
-    DO NOT USE THIS FUNCTION FOR DETERMINING THE POWER INPUT FOR THE PROPELLER
-    '''
-
-    # Unpack Params
-    r, psi = params.r, params.psi
-    # Calculate Local Axial Flow Velocity
-    V_x = params.V_x
-    V = V_ia+V_x 
-
-    # Elemental torque
-    dT = dT_momentum(V_ia, params)
-
-    dP = dT[:,None]*V
-
-    P = jnp.trapezoid(jnp.trapezoid(dP,x=r,axis=0),x=psi)
-    return P
 
 def mechanicalPower(V_ia, params):
     '''
@@ -419,6 +488,10 @@ def flatblade(c, beta, N, plot=False):
     '''
     Flat Blade Demo Model. Inputs a blade of fixed chord and radial distribution 
     and solves+plots induced velocity.
+
+    Used for benchmarking the induced velocity solver
+
+    TODO: Fix plotting
     '''
 
     # Utilize your factory function to build the base configuration
@@ -426,17 +499,30 @@ def flatblade(c, beta, N, plot=False):
 
     # Override remaining parameter states cleanly for JAX
     params = eqx.tree_at(
-        lambda p: (p.N, p.V_ia_0),
+        lambda p: (p.N),
         params,
-        (jnp.array([N]), jnp.full((Inputs.n_r,), 1.0))
+        (jnp.array([N]))
     )
     
-    # Solve Induced Velocity
-    V_ia, _ = induced_velocity(params)  # shape (Nr, Npsi)
+    import os
+    import jax.profiler
+
+    # Create a cross-platform path to ./logs/tensorboard
+    log_dir = os.path.join(".", "logs", "tensorboard")
+
+    # Warm up
+    _ = induced_velocity(params)
+    V_i, _ = induced_velocity(params)
+    V_i.block_until_ready() # Ensure warm-up is totally finished
+
+    # Profile
+    jax.profiler.start_trace(log_dir)
+    V_i, _ = induced_velocity(params)
+    V_i.block_until_ready()
+    jax.profiler.stop_trace()
 
     # Calculate total thrust
-    T = thrust(V_ia, params)
-    
+    T = thrust(V_i, params)
     print("Total Thrust:", T)
 
     actuatorEffiency = equivelantActuatorDiskEfficiency(T, params)
@@ -452,7 +538,7 @@ def flatblade(c, beta, N, plot=False):
         plt.title('Induced Velocity over Propeller Disk')
         plt.show()
 
-    return params, V_ia, T
+    return params, V_i, T
 
 def apc_model(filepath, plot=True):
     '''
@@ -521,7 +607,7 @@ def apc_model(filepath, plot=True):
         gui_queue = queue.Queue()
         plotter = results.LivePropPlotter(params)
         tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
-        F_curr = jnp.multiply(tip_loss, root_loss) 
+        F_curr = jnp.multiply(tip_loss, root_loss)
         # Build the frame data dictionary expected by LivePropPlotter.update()
         frame_data = {
             'c': params.c * 1000,
@@ -550,41 +636,43 @@ def apc_model(filepath, plot=True):
     return params, V_ia, T
 
 if __name__ == "__main__":
-    import apcpropanalysis
-    apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0")
-    rpm_data = apcpropanalysis.parse_apc_dat("apc_prop_data/performance_data/PER3_20x8.dat")
-    # Extract as raw scalar floats instead of numpy arrays
-    target_rpm = float(np.squeeze(Inputs.omega / 0.1047))
-    target_V = float(np.squeeze(Inputs.V_x))
 
-    if rpm_data:
-        # Find the closest RPM block (broadcasting works flawlessly with scalar targets)
-        available_rpms = np.array(list(rpm_data.keys()))
-        closest_rpm = available_rpms[np.argmin(np.abs(available_rpms - target_rpm))]
-        
-        # Extract the data matrix for the closest RPM
-        matrix = rpm_data[closest_rpm]
-        
-        # Convert the file's velocity column (mph) to m/s
-        V_ms = matrix[:, 0] * 0.44704
-        
-        # Find the closest velocity row within this specific RPM block
-        closest_v_idx = np.argmin(np.abs(V_ms - target_V))
-        
-        # Extract performance metrics
-        matched_V = V_ms[closest_v_idx]
-        extracted_thrust = matrix[closest_v_idx, 10]  
-        extracted_eff = matrix[closest_v_idx, 2]      
-        extracted_power = matrix[closest_v_idx, 8]    
+    flatblade(0.05, 0.1, 2)
+#     import apcpropanalysis
+#     apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0")
+#     rpm_data = apcpropanalysis.parse_apc_dat("apc_prop_data/performance_data/PER3_20x8.dat")
+#     # Extract as raw scalar floats instead of numpy arrays
+#     target_rpm = float(np.squeeze(Inputs.omega / 0.1047))
+#     target_V = float(np.squeeze(Inputs.V_x))
 
-        # --- 4. Print Summary Cleanly ---
-        print("\n" + "="*45)
-        print("      APC PERFORMANCE DATA EXTRACTION")
-        print("="*45)
-        print(f"Target Conditions:  {target_rpm:.2f} RPM  |  {target_V:.2f} m/s")
-        print(f"Closest APC Match:  {closest_rpm} RPM  |  {matched_V:.2f} m/s")
-        print("-"*45)
-        print(f"Extracted Thrust:   {extracted_thrust:.4f} N")
-        print(f"Extracted Efficiency: {extracted_eff * 100:.2f}% (Pe)")
-        print(f"Extracted Power:    {extracted_power:.2f} W")
-        print("="*45)
+#     if rpm_data:
+#         # Find the closest RPM block (broadcasting works flawlessly with scalar targets)
+#         available_rpms = np.array(list(rpm_data.keys()))
+#         closest_rpm = available_rpms[np.argmin(np.abs(available_rpms - target_rpm))]
+        
+#         # Extract the data matrix for the closest RPM
+#         matrix = rpm_data[closest_rpm]
+        
+#         # Convert the file's velocity column (mph) to m/s
+#         V_ms = matrix[:, 0] * 0.44704
+        
+#         # Find the closest velocity row within this specific RPM block
+#         closest_v_idx = np.argmin(np.abs(V_ms - target_V))
+        
+#         # Extract performance metrics
+#         matched_V = V_ms[closest_v_idx]
+#         extracted_thrust = matrix[closest_v_idx, 10]  
+#         extracted_eff = matrix[closest_v_idx, 2]      
+#         extracted_power = matrix[closest_v_idx, 8]    
+
+#         # --- 4. Print Summary Cleanly ---
+#         print("\n" + "="*45)
+#         print("      APC PERFORMANCE DATA EXTRACTION")
+#         print("="*45)
+#         print(f"Target Conditions:  {target_rpm:.2f} RPM  |  {target_V:.2f} m/s")
+#         print(f"Closest APC Match:  {closest_rpm} RPM  |  {matched_V:.2f} m/s")
+#         print("-"*45)
+#         print(f"Extracted Thrust:   {extracted_thrust:.4f} N")
+#         print(f"Extracted Efficiency: {extracted_eff * 100:.2f}% (Pe)")
+#         print(f"Extracted Power:    {extracted_power:.2f} W")
+#         print("="*45)

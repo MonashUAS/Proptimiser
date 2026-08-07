@@ -628,9 +628,7 @@ def interpolated_coeffs(V_ia, params):
     
     Re = calc_reynolds(params.rho, jnp.maximum(V_R, 1e-6), params.c[:, None], params.mu)
     
-    # Calculate Mach number (Assume speed of sound is present in params, fallback to 343.0 m/s)
-    speed_of_sound = getattr(params, 'a', 343.0) 
-    Mach = V_R / speed_of_sound
+    Mach = V_R / params.a
 
     airfoil_interp = params.airfoil_interp
     C_L, C_D, C_M = airfoil_interp(AoA_eff, Re, Mach)
