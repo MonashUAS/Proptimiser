@@ -3,7 +3,6 @@
 import numpy as np
 import jax.numpy as jnp
 import aerosandbox as asb
-from aerosandbox.geometry.airfoil.airfoil_families import get_kulfan_coordinates
 
 ### Integrand Functions
 def radial_stops(R, r_hub, n_r):
@@ -73,18 +72,34 @@ def get_cst_weights_from_names(airfoil_names):
         
     return np.array(weights_list)
 
-def generate_blade_coordinates(r, r_foils, cst_weights, ellipse_thickness=1.0, n_points_per_side=100):
+def generate_blade_coordinates(r, r_foils, cst_weights, hub_thickness_ratio=0.1, n_points_per_side=100):
     """
-    Transforms the optimized CST weights into a full (n_r, N_points, 2) coordinate array.
-    Linearly interpolates CST weights along the aerodynamic span, and coordinate-blends 
-    the root region to an ellipse.
-    """
-    n_foils, n_cst = cst_weights.shape
+    Generates blade coordinates across 3 distinct zones using a unified r_foils array.
+    r_foils format: [r_start, r_hub, r_aero, ... aerodynamic stations ...]
     
-    # Kulfan parameters usually pack 2 singular weights at the end (LE and TE)
+    1. r <= r_hub: 100% Flat rounded rectangle (Stadium).
+    2. r_hub < r < r_aero: Linear coordinate blend from Stadium to the first CST profile.
+    3. r >= r_aero: 100% Aerodynamic CST interpolation.
+    """
+    import numpy as np
+    import aerosandbox as asb
+    from aerosandbox.geometry.airfoil.airfoil_families import get_kulfan_coordinates
+
+    # Extract structural boundaries from unified array
+    r_hub = r_foils[1]
+    r_aero = r_foils[2]
+    
+    # Extract aerodynamic stations (everything from index 2 onwards)
+    r_aero_stations = r_foils[2:]
+    
+    # Validate the inputs match
+    if len(cst_weights) != len(r_aero_stations):
+        raise ValueError(f"Expected {len(r_aero_stations)} sets of CST weights to match the aero stations in r_foils, but got {len(cst_weights)}.")
+
+    n_foils, n_cst = cst_weights.shape
     n_weights_per_side = (n_cst - 2) // 2
     
-    # 1. Generate the Root Airfoil to determine exact coordinate array dimensions
+    # 1. Generate the Root Airfoil (used at r_aero)
     root_cst = cst_weights[0]
     root_coords = get_kulfan_coordinates(
         lower_weights=root_cst[:n_weights_per_side],
@@ -95,30 +110,56 @@ def generate_blade_coordinates(r, r_foils, cst_weights, ellipse_thickness=1.0, n
     )
     
     n_actual_points = root_coords.shape[0]
-    root_foil = asb.Airfoil(coordinates=root_coords)
+    root_foil = asb.Airfoil(name="Root Aero Airfoil", coordinates=root_coords)
     
-    # 2. Generate the mounting ellipse matching the exact point count
-    theta = np.linspace(0, 2*np.pi, n_actual_points)
-    ellipse_x = 0.5 * (1 - np.cos(theta))
-    ellipse_y = (ellipse_thickness / 2) * np.sin(theta)
-    ellipse_foil = asb.Airfoil(coordinates=np.column_stack((ellipse_x, ellipse_y)))
+    # 2. Generate the Normalized Rounded Rectangle (Stadium) Hub
+    hub_coords = np.zeros_like(root_coords)
+    hub_coords[:, 0] = root_coords[:, 0] # Lock X-coordinates to root foil to prevent twist
     
-    # 3. Initialize the output tensor
+    le_idx = np.argmin(root_coords[:, 0]) 
+    rad = hub_thickness_ratio / 2.0
+    
+    for j, x in enumerate(hub_coords[:, 0]):
+        sign = 1.0 if j <= le_idx else -1.0
+        
+        if x < rad:
+            y_val = np.sqrt(max(0, rad**2 - (rad - x)**2))
+        elif x > 1.0 - rad:
+            y_val = np.sqrt(max(0, rad**2 - (x - (1.0 - rad))**2))
+        else:
+            y_val = rad
+            
+        hub_coords[j, 1] = sign * y_val
+        
+    hub_foil = asb.Airfoil(name="Hub Section", coordinates=hub_coords)
+    
+    # 3. Initialize output tensor
     blade_coords = np.zeros((len(r), n_actual_points, 2))
     
-    # 4. Interpolate and Generate
+    # 4. Process all radial stations
     for i, r_i in enumerate(r):
-        if r_i < r_foils[0]:
-            # Structural Root: Coordinate blend between Ellipse and Root Airfoil
-            fraction = np.clip(r_i / r_foils[0], 0, 1) if r_foils[0] > 0 else 1.0
-            blended = ellipse_foil.blend_with(root_foil, fraction)
+        if r_i <= r_hub:
+            # Zone 1: Pure Hub
+            blade_coords[i] = hub_foil.coordinates
+            
+        elif r_i < r_aero:
+            # Zone 2: Blend Region
+            fraction = (r_i - r_hub) / (r_aero - r_hub)
+            
+            # --- FIX APPLIED HERE ---
+            blended = hub_foil.blend_with_another_airfoil(
+                airfoil=root_foil, 
+                blend_fraction=fraction,
+                n_points_per_side=n_points_per_side
+            )
             blade_coords[i] = blended.coordinates
             
         else:
-            # Aerodynamic Span: Interpolate the CST weights directly
+            # Zone 3: Aerodynamic Span
             interp_weights = np.zeros(n_cst)
             for j in range(n_cst):
-                interp_weights[j] = np.interp(r_i, r_foils, cst_weights[:, j])
+                # Interpolate CST weights based on the slice of aerodynamic stations
+                interp_weights[j] = np.interp(r_i, r_aero_stations, cst_weights[:, j])
                 
             coords = get_kulfan_coordinates(
                 lower_weights=interp_weights[:n_weights_per_side],
@@ -221,58 +262,89 @@ def get_cst_weights_from_names(airfoil_names):
         
     return np.array(weights_list)
 
-# Example usage:
-# r_foils = np.array([R_hub, R_mid, R_tip])
-# cst_weights = get_cst_weights_from_names(["naca4412", "naca2412", "naca0012"])
+def overwrite_hub_planform(r, c, beta, r_foils, hub_chord=None, hub_twist=0.0, aero_pitch_axis=0.25):
+    """
+    Overwrites the chord and twist arrays in the structural root region to 
+    ensure a flat, untwisted hub that smoothly blends into the aerodynamic planform.
+    Also returns a dynamic pitch_axis array that shifts from 0.5 (hub) to the aero axis.
+    """
+    import numpy as np
+    
+    r_hub = r_foils[1]
+    r_aero = r_foils[2]
+    
+    c_new = np.copy(c)
+    beta_new = np.copy(beta)
+    pitch_axis = np.full_like(r, aero_pitch_axis, dtype=float)
+    
+    if hub_chord is None:
+        hub_chord = c[0]
+    
+    c_aero = np.interp(r_aero, r, c)
+    beta_aero = np.interp(r_aero, r, beta)
+    
+    for i, r_i in enumerate(r):
+        if r_i <= r_hub:
+            # Zone 1: Pure Hub
+            c_new[i] = hub_chord
+            beta_new[i] = hub_twist
+            pitch_axis[i] = 0.5  # Centered structurally
+            
+        elif r_i < r_aero:
+            # Zone 2: Blend Region (Cosine interpolation)
+            linear_fraction = (r_i - r_hub) / (r_aero - r_hub)
+            blend_fraction = 0.5 * (1 - np.cos(np.pi * linear_fraction))
+            
+            c_new[i] = hub_chord + blend_fraction * (c_aero - hub_chord)
+            beta_new[i] = hub_twist + blend_fraction * (beta_aero - hub_twist)
+            pitch_axis[i] = 0.5 + blend_fraction * (aero_pitch_axis - 0.5)
+            
+    return c_new, beta_new, pitch_axis
 
 def export_to_creo_ibl(r, c, beta, blade_coords, exportname, 
                        pitch_axis=0.25, scale_to_mm=True, skin_thickness=0.0):
     """
-    Generates a Creo .ibl file from a pre-computed (n_r, N_points, 2) blade coordinate array,
-    using AeroSandbox's native 2D geometry manipulation for elegant 3D positioning.
-    
-    Parameters:
-    * pitch_axis: Non-dimensional chord fraction to rotate around (0.25 = quarter chord).
+    Generates a Creo .ibl file with support for a dynamic pitch_axis array.
+    Forces coordinate loops to close at the trailing edge for solid CAD imports.
     """
+    import numpy as np
+    import aerosandbox as asb
+    
     n_r, n_foil, _ = blade_coords.shape
     scale = 1000.0 if scale_to_mm else 1.0
 
+    if np.isscalar(pitch_axis):
+        pitch_axis = np.full(n_r, pitch_axis)
+
     with open(f"exports/{exportname}.ibl", "w") as f:
-        f.write("Open\nArclength\n")
+        # Note: 'Open' here refers to the loft trajectory (spanwise), not the cross-sections
+        f.write("Open\nArclength\n") 
         
         for i, r_i in enumerate(r):
+            pa = pitch_axis[i]
             f.write(f"Begin section ! Station {i+1}: r = {r_i:.4f} m\n")
             f.write("Begin curve\n")
             
-            # 1. Instantiate the ASB Airfoil from the JAX-optimized coordinates
             foil = asb.Airfoil(coordinates=blade_coords[i])
             
-            # 2. ELEGANT TRANSFORMS: Rotate and Scale natively in 2D
-            # Rotate around the pitch axis (beta is in radians). 
-            # Note: adjust the sign on beta[i] depending on your CAD coordinate handedness.
-            foil = foil.rotate(angle=-beta[i], x_center=pitch_axis, y_center=0.0)
-            
-            # Scale the airfoil by the local chord
+            foil = foil.rotate(angle=-beta[i], x_center=pa, y_center=0.0)
             foil = foil.scale(c[i], c[i])
             
-            # Extract the transformed coordinates
             base_coords = foil.coordinates
             
-            # 3. Handle Core/Skin Normal Offsets
-            # (Note: ASB does not have a native inward boundary offset for core generation, 
-            # so you still rely on standard normal-offset logic here if skin_thickness > 0)
             if skin_thickness > 0.0:
                 core_x, core_y = offset_airfoil_profile(base_coords[:, 0], base_coords[:, 1], 
                                                         c[i], skin_thickness)
             else:
                 core_x, core_y = base_coords[:, 0], base_coords[:, 1]
+            
+            if not (np.isclose(core_x[0], core_x[-1]) and np.isclose(core_y[0], core_y[-1])):
+                core_x = np.append(core_x, core_x[0])
+                core_y = np.append(core_y, core_y[0])
                 
-            # 4. Direct 3D Mapping and Translation
             for j in range(len(core_x)):
-                # Map 2D to 3D standard aerospace axes: X=Chord, Y=Span, Z=Thickness
-                # We subtract (pitch_axis * c[i]) to ensure the pitch axis aligns perfectly 
-                # on the CAD Y-axis (X=0, Z=0) across all radial stations.
-                pt_x = (core_x[j] - (pitch_axis * c[i])) * scale
+                # Apply the dynamic pitch axis translation
+                pt_x = (core_x[j] - (pa * c[i])) * scale
                 pt_y = r_i * scale  
                 pt_z = core_y[j] * scale
                 
@@ -281,50 +353,183 @@ def export_to_creo_ibl(r, c, beta, blade_coords, exportname,
     part_type = "Core Insert" if skin_thickness > 0 else "Aerodynamic Skin"
     print(f"Successfully generated Creo geometry: {exportname}.ibl ({n_r} sections) - {part_type}")
 
-def build_propeller_mesh(geompoints, foilpoints, num_blades=2):
+def export_parting_surface_ibl(r, c, beta, blade_coords, r_foils, exportname, 
+                               pitch_axis=0.25, scale_to_mm=True, 
+                               x_margin=5.0, y_margin=5.0, n_camber_points=10):
     """
-    Lofts a 3D propeller blade by interpolating between the Leading Edge (LE) 
-    and Trailing Edge (TE) lines, scaling the thickness profile dynamically.
+    Generates a 3-zone parting surface sheet exported as a single Creo .ibl file.
+    Isolates the flat extensions into distinct curve blocks to eliminate all ripples.
+    """    
+    n_r, n_foil, _ = blade_coords.shape
+    scale = 1000.0 if scale_to_mm else 1.0
+    r_hub = r_foils[1]
+
+    if np.isscalar(pitch_axis):
+        pitch_axis = np.full(n_r, pitch_axis)
+
+    station_data = []
+    global_le_x = []
+    global_te_x = []
+
+    # 1. Process each radial station and extract the internal camber path
+    for i, r_i in enumerate(r):
+        pa = pitch_axis[i]
+        foil = asb.Airfoil(coordinates=blade_coords[i])
+        foil = foil.rotate(angle=-beta[i], x_center=pa, y_center=0.0)
+        foil = foil.scale(c[i], c[i])
+        base_coords = foil.coordinates
+        
+        pt_x = (base_coords[:, 0] - (pa * c[i])) * scale
+        pt_y = r_i * scale              
+        pt_z = base_coords[:, 1] * scale 
+        
+        le_idx = np.argmin(pt_x)
+        te_idx = np.argmax(pt_x)
+        
+        x_le, z_le = pt_x[le_idx], pt_z[le_idx]
+        x_te, z_te = pt_x[te_idx], pt_z[te_idx]
+        
+        if r_i <= r_hub:
+            z_le, z_te = 0.0, 0.0
+
+        global_le_x.append(x_le)
+        global_te_x.append(x_te)
+
+        # Separate upper and lower surface paths
+        side1_x, side1_z = pt_x[:le_idx+1], pt_z[:le_idx+1]
+        side2_x, side2_z = pt_x[le_idx:], pt_z[le_idx:]
+        
+        s1_sort = np.argsort(side1_x)
+        s2_sort = np.argsort(side2_x)
+        
+        # Build strictly internal camber coordinates
+        x_internal = np.linspace(x_le, x_te, n_camber_points + 2)[1:-1]
+        z_s1_interp = np.interp(x_internal, side1_x[s1_sort], side1_z[s1_sort])
+        z_s2_interp = np.interp(x_internal, side2_x[s2_sort], side2_z[s2_sort])
+        
+        z_internal = (z_s1_interp + z_s2_interp) / 2.0
+        if r_i <= r_hub:
+            z_internal = np.zeros_like(z_internal)
+            
+        station_data.append({
+            'y': pt_y,
+            'le': [x_le, z_le],
+            'camber': list(zip(x_internal, z_internal)),
+            'te': [x_te, z_te]
+        })
+
+    # Set outer absolute block boundaries
+    x_min = np.min(global_le_x) - x_margin
+    x_max = np.max(global_te_x) + x_margin
+
+    sections = []
+
+    # Helper function to structure a single station into 3 independent curve zones
+    def build_zoned_section(y_val, target_station):
+        x_le, z_le = target_station['le']
+        x_te, z_te = target_station['te']
+        # Introduce a tiny clearance offset (e.g., 0.5 mm) to push the crease away from the skin
+        crease_offset = 0.5  
+
+        # Zone 1: Left Flat Extension (Stops just short of hitting the LE skin)
+        left_zone = [
+            [x_min, y_val, z_le],
+            [x_le - crease_offset, y_val, z_le]
+        ]
+
+        # Zone 2: Camber Line + Flat Lead-ins
+        camber_zone = [
+            [x_le - crease_offset, y_val, z_le], # Start flat in the open air
+            [x_le, y_val, z_le]                  # Cross the LE skin smoothly
+        ]
+        for cx, cz in target_station['camber']:
+            camber_zone.append([cx, y_val, cz])
+        camber_zone.append([x_te, y_val, z_te])  # Cross the TE skin smoothly
+        camber_zone.append([x_te + crease_offset, y_val, z_te]) # End flat in the open air
+
+        # Zone 3: Right Flat Extension (Starts out in the open air)
+        right_zone = [
+            [x_te + crease_offset, y_val, z_te],
+            [x_max, y_val, z_te]
+        ]
+        
+        return {
+            'left': left_zone,
+            'camber': camber_zone,
+            'right': right_zone
+        }
+
+    # Assemble the final spanwise matrix (Hub pad -> Blade Stations -> Tip pad)
+    y_hub_ext = station_data[0]['y'] - y_margin
+    sections.append(build_zoned_section(y_hub_ext, station_data[0]))
+
+    for stat in station_data:
+        sections.append(build_zoned_section(stat['y'], stat))
+
+    y_tip_ext = station_data[-1]['y'] + y_margin
+    sections.append(build_zoned_section(y_tip_ext, station_data[-1]))
+
+    # Write out the multi-curve IBL file
+    with open(f"exports/{exportname}.ibl", "w") as f:
+        f.write("Open\n")
+        f.write("Arclength\n") 
+        
+        for s_idx, sec in enumerate(sections):
+            f.write(f"Begin section ! Row {s_idx+1}\n")
+            
+            # --- Curve Block 1: Left Plane ---
+            f.write("Begin curve ! Left Extension\n")
+            for pt in sec['left']:
+                f.write(f"{pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f}\n")
+                
+            # --- Curve Block 2: Airfoil Camber ---
+            f.write("Begin curve ! Internal Camber\n")
+            for pt in sec['camber']:
+                f.write(f"{pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f}\n")
+                
+            # --- Curve Block 3: Right Plane ---
+            f.write("Begin curve ! Right Extension\n")
+            for pt in sec['right']:
+                f.write(f"{pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f}\n")
+                
+    print(f"Successfully generated 3-zone sharp parting surface: {exportname}.ibl")
+
+def build_propeller_mesh(r, c, beta, blade_coords, pitch_axis=0.25, num_blades=2):
+    """
+    Lofts a 3D propeller blade using exactly the same 2D transforms as the Creo exporter.
+    Handles dynamic pitch axes to keep the hub perfectly centered.
     """
     import pyvista as pv
-    # Unpack clean tuple signatures
-    le_points, te_points = geompoints
-    upper_points, lower_points = foilpoints
+    import numpy as np
+    import aerosandbox as asb
     
-    # Create continuous loop coordinates around the profile perimeter
-    foil_data = np.vstack([upper_points[::-1], lower_points])
-    foil_x = foil_data[:, 0]  # Normalized chord station [0 to 1]
-    foil_y = foil_data[:, 1]  # Normalized thickness station
+    n_r, n_foil, _ = blade_coords.shape
     
-    # Calculate the raw structural chord vectors and absolute lengths
-    chord_vectors = te_points - le_points  # Shape: (n_r, 3)
-    chords = np.linalg.norm(chord_vectors, axis=1, keepdims=True)  # Shape: (n_r, 1)
+    # Broadcast scalar pitch_axis to array if necessary
+    if np.isscalar(pitch_axis):
+        pitch_axis = np.full(n_r, pitch_axis)
+        
+    X_3d = np.zeros((n_r, n_foil))
+    Y_3d = np.zeros((n_r, n_foil))
+    Z_3d = np.zeros((n_r, n_foil))
     
-    # cross product captures thickness
-    u_span = np.array([1.0, 0.0, 0.0])
-    u_chord = chord_vectors / chords
-    u_thick = np.cross(u_span, u_chord)  # Shape: (n_r, 3)
-    
-    # Transform arrays to (n_r, 1, 3) to broadcast against the profile points (1, n_foil, 1)
-    LE = le_points[:, None, :]
-    CHORD_VEC = chord_vectors[:, None, :]
-    UTHICK = u_thick[:, None, :]
-    CHORDS = chords[:, None, :]
-    
-    FX = foil_x[None, :, None]
-    FY = foil_y[None, :, None]
-    
-    # Position = Start at LE + move down the chord line + project out normal thickness
-    mesh_points = LE + (FX * CHORD_VEC) + (FY * CHORDS * UTHICK)
-    
-    # Extract structural coordinate grids for PyVista
-    X_3d = mesh_points[:, :, 0]
-    Y_3d = mesh_points[:, :, 1]
-    Z_3d = mesh_points[:, :, 2]
-    
+    for i, r_i in enumerate(r):
+        pa = pitch_axis[i]
+        foil = asb.Airfoil(coordinates=blade_coords[i])
+        
+        # Rotate around the local dynamic pitch axis
+        foil = foil.rotate(angle=-beta[i], x_center=pa, y_center=0.0)
+        foil = foil.scale(c[i], c[i])
+        
+        coords = foil.coordinates
+        
+        # Map to 3D standard axes, offsetting by the exact physical distance of the pitch axis
+        X_3d[i, :] = coords[:, 0] - (pa * c[i])
+        Y_3d[i, :] = r_i  
+        Z_3d[i, :] = coords[:, 1]
+        
     base_blade = pv.StructuredGrid(X_3d, Y_3d, Z_3d)
     
-    # Duplicate and rotate across the assembly hub
     meshes = [base_blade]
     for i in range(1, int(num_blades)):
         angle = i * (360.0 / num_blades)
@@ -335,56 +540,96 @@ def build_propeller_mesh(geompoints, foilpoints, num_blades=2):
     return pv.MultiBlock(meshes).combine()
 
 if __name__ == "__main__":
-    '''
-    Create and Plot Demo Flatblade Propeller Blade Geometry
-    '''
+    import numpy as np
     import matplotlib.pyplot as plt
     import pyvista as pv
-    import results
-    # Generate Flat Blade Parameters
-    inputs, params = results.loadprop('redback_v1')
-    airfoil = "ARAD10"
+    import results 
 
-    r, c, beta = params.r, params.c, params.beta
+    # Load the saved aerodynamic propeller
+    prop_filename = "Redback V2" 
+    inputs, params = results.loadprop(prop_filename)
+    
+    r = np.array(params.r)
+    c = np.array(params.c)
+    beta = np.array(params.beta)
 
-    upper_points, lower_points = upperlowerairfoil(airfoil)
+    # Make sure r extends all the way to the origin to prevent center gaps
+    if r[0] > 0.001:
+        r = np.insert(r, 0, 0.0)
+        c = np.insert(c, 0, c[0])
+        beta = np.insert(beta, 0, beta[0])
 
-    #Trailing Edge -> Leading Edge -> Trailing Edge
-    foil_data = np.vstack([upper_points[::-1], lower_points])
+    # Define r_foils =  [r_start, r_hub, r_aero, r_mid..., r_tip]
+    R_hub = 0.015
+    R_aero = 0.05
+    r_foils = np.array([0.0, R_hub, R_aero, r[len(r)//2], r[-1]])
+    
+    # Overwrite the structural root on the 3D arrays
+    HUB_CHORD = 0.03
+    c, beta, pitch_axis_array = overwrite_hub_planform(
+        r, c, beta, r_foils, 
+        hub_chord=HUB_CHORD, hub_twist=0.0, aero_pitch_axis=0.25
+    )
 
-    le_points, te_points = params_to_le_te(r, c, beta)
+    # Generate Aerodynamic Weights (TEMP FUNCTION. WILL BE MOVED TO INIT WHEN CST OPTIMISATION IS IMPLEMENTED.)
+    # Because r_foils has 5 elements above, we provide 3 airfoil weights.
+    airfoil_names = ["clarky", "clarky", "clarky"] 
+    cst_weights = get_cst_weights_from_names(airfoil_names)
+    
+    # Generate Coordinates using the simplified function signature
+    blade_coords = generate_blade_coordinates(r, r_foils, cst_weights, hub_thickness_ratio=0.1, n_points_per_side=100)
 
-    # Extract x and y coordinates
-    foil_x = foil_data[:, 0]
-    foil_y = foil_data[:, 1]
-
-    # Plot Airfoil
-    plt.figure(figsize=(8, 4))
-    plt.plot(foil_x, foil_y, 'b-', label=f"{airfoil} Profile")
-    plt.grid(True)
+    # Plot Airfoil Geometries at the specific r_foils control stations
+    plt.figure(figsize=(11, 5))
+    
+    # Map each control station in r_foils to the nearest index in the dense radial grid r
+    for i, r_f in enumerate(r_foils):
+        idx = np.argmin(np.abs(r - r_f))
+        coords = blade_coords[idx]
+        plt.plot(coords[:, 0], coords[:, 1], label=f"r = {r[idx]:.3f} m")
+        
+    plt.grid(True, linestyle='--', alpha=0.6)
     plt.axis("equal")
     plt.xlabel("Chord Station (x/c)")
     plt.ylabel("Thickness Station (y/c)")
-    plt.title(f"Airfoil Geometry Loop Check: {airfoil}")
-    plt.legend()
+    plt.title("Airfoil Geometries at Defined Control Stations (r_foils)")
+    plt.legend(loc='center left', bbox_to_anchor=(1, 0.5)) # Moved legend outside to accommodate labels
+    plt.tight_layout()
     plt.show()
 
-    ## 3D Render of Propeller
-    geompoints = (le_points, te_points)
-    foilpoints = (upper_points, lower_points)
+    # 3D Model of Propeller
+    prop_mesh = build_propeller_mesh(
+        r, c, beta, blade_coords, 
+        pitch_axis=pitch_axis_array, num_blades=2
+    )
+    
+    # Export to Creo .ibl files
+    print("\nExporting Creo geometries...")
+    # Main mold (Aerodynamic Skin)
+    export_to_creo_ibl(
+        r, c, beta, blade_coords, "propeller_blade_mold", 
+        pitch_axis=pitch_axis_array, skin_thickness=0.0
+    )
 
-    prop_mesh = build_propeller_mesh(geompoints, foilpoints, num_blades=2)
+    # Internal Core Insert
+    laminate_thickness_m = 0.0015 # 1.5mm
+    export_to_creo_ibl(
+        r, c, beta, blade_coords, "propeller_blade_insert", 
+        pitch_axis=pitch_axis_array, skin_thickness=laminate_thickness_m
+    )
 
-    # 1. Export Full Aerodynamic Propeller (For the negative molds)
-    export_to_creo_ibl(r, c, beta, (upper_points, lower_points), "propeller_blade_mold", skin_thickness=0.0)
+    # Export Silhouette Curve as .ibl
 
-    # 2. Export Internal Core Insert (1.5mm offset for laminate skins)
-    laminate_thickness_m = 0.0015 # 1.5mm in meters
-    export_to_creo_ibl(r, c, beta, (upper_points, lower_points), "propeller_blade_insert", skin_thickness=laminate_thickness_m)
+    export_parting_surface_ibl(
+        r, c, beta, blade_coords, r_foils, "propeller_parting_surf",
+        pitch_axis=pitch_axis_array, n_camber_points=100
+    )
 
     # Fire up the local PyVista testing window
     plotter = pv.Plotter()
-    plotter.set_background("#1e1e2f") #dark mode for vibes
+    plotter.set_background("#1e1e2f")
     plotter.add_mesh(prop_mesh, color="silver", show_edges=True, edge_color="#444444", smooth_shading=True)
     plotter.add_axes()
     plotter.show()
+    plotter.close()
+    del plotter

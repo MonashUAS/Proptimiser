@@ -562,7 +562,7 @@ if __name__ == "__main__":
             # Smoothing modifies the global underlying geometry skeleton
             params_base = iterativesmoothing(params_base)
             print("Geometry updated. Induced velocity fields will automatically refresh on the next loop pass.")
-        
+            # TODO: implement induced velocity update/refresh
             # Save Results/Export Geometry if Required
         user_input = input('Save Propeller? (y/n): ')
         if user_input.lower() == 'y':
@@ -573,4 +573,4 @@ if __name__ == "__main__":
             params_base.save_state(paramsfile)
             inputs.save_state(inputsfile)
 
-        exit_input = input('\nExit configuration loop completely? (y/n): ')
+        exit_input = input('\nExit post-processing loop completely? (y/n): ')
