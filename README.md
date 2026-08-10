@@ -117,8 +117,6 @@ Cond: 1   | Omega: 400.00 | Motor Pwr: 940.15  | Thrust: 22.48 | MIL RMS: 0.0891
 ```
 ---
 
-## 👉 **[PLACE LIVE PLOTTER & DIAGNOSTIC CAPTURES HERE]** *Insert screenshots of the 2D radial distribution plots alongside the induced velocity disk contours ($V_{ia}$).*
-
 ### 4. Geometry Exports
 
 Converts propeller geometry into CAD exports and 3D solid mesh generation.
@@ -160,3 +158,5 @@ The underlying aerodynamics and solver mathematics are built upon the following 
 [11] D. M. Pitt and D. A. Peters, “THEORETICAL PREDICTION OF DYNAMIC-INFLOW DERIVATIVES.,” *Vertica*, vol. 5, no. 1, pp. 21–34, 1981.
 
 [13] B. M. Kulfan, "Universal Parametric Geometry Representation Method," *Journal of Aircraft*, vol. 45, no. 1, pp. 142–158, 2008, doi: 10.2514/1.29958. *(Used by AeroSandbox for the CST interpolation from the structural hub to aerodynamic stations).*
+
+And more! (will write up into a thesis/paper soon...)

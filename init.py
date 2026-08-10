@@ -28,8 +28,8 @@ class Inputs(eqx.Module):
     solve_omega: int = 0 # 0: No. 1: Objective
 
     # Discretisation settings
-    n_r: int = 25
-    n_psi: int = 13
+    n_r: int = 5
+    n_psi: int = 4
 
     # Diagnostics
     verbose: bool = False
