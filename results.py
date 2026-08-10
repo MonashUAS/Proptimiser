@@ -4,7 +4,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import jax
-jax.config.update("jax_debug_nans", True)
 import jax.numpy as jnp
 import equinox as eqx
 from scipy.interpolate import make_interp_spline

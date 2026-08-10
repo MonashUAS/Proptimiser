@@ -3,7 +3,6 @@
 import numpy as np
 import jax.numpy as jnp
 import aerosandbox as asb
-from aerosandbox.geometry.airfoil.airfoil_families import get_kulfan_coordinates
 
 ### Integrand Functions
 def radial_stops(R, r_hub, n_r):
