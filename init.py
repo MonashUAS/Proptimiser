@@ -1,103 +1,89 @@
+import jax
+# Set jax debugging
+jax.config.update("jax_traceback_filtering", "off")
+jax.config.update("jax_check_tracer_leaks", "on")
+jax.config.update("jax_disable_jit", False)
+jax.config.update("jax_debug_nans", False)
+jax.config.update("jax_enable_x64", True)
+
 from dataclasses import dataclass
 import equinox as eqx
 import jax.numpy as jnp
-import jax.scipy as jsp
 
-# Freeze configuration parameters at runtime
+# Internal Imports
+import geometry
+
 class Inputs(eqx.Module):
-    # Optimisation / desig  n settings which remain constant during execution
-
-    # Hover condition 
-    thrust_hover   = 21 # N
-    V_x_hover      = 0.0 # m/s
-    V_yz_hover     = 0.0 # m/s 
-
-    # Cruise condition
-    thrust_cruise  = 23.5 # N 
-    V_x_cruise     = 10.0 # m/s
-    V_yz_cruise    = 0.0 # m/s
-
-    # Multi-objective weighting, balance between achieving hover/cruise optimality 
-    w_hover  = 0.3
-    w_cruise = 0.7
-    
-    # ----- Geometric parameters -----
-    hub_diameter: float = 0.050 # DIAMETER in meters
-    tip_diameter: float = 0.50 # DIAMETER in meters
-
-    # max and min chords in meters
-    max_chord: float = 0.050
-    min_chord: float = 0.005
-    
-    # max and min twists in degrees
-    max_twist: float = 45
-    min_twist: float = -15
-
-    # ----- Solution parameters -----
-    solvertype: str = "T" # Thrust constraint (T) or torque constraint (Q)
-    #Thrust targets defined above, under each condition. 
-
-    
-    # ----- Optimiser parameters -----
-    # Newton solver settings
+    # Outer-loop Optimisation (Currently only L-BFGS-B works)
+    opt_solver: str = "L-BFGS-B"
     opt_max_iter: int = 1000
-    opt_tol: float = 1e-3
-    newton_max_iter: int = 200
-    newton_eps: float = 1e-3
+    opt_tol: float = 1e-2 
 
-    #Augmented Lagrangian params
-    eta_tol = 1e-3
+    # Induced Velocity Settings
+    V_ia_0_max_iter: int = 300
+    V_ia_0_eps: float = 5e-3
 
+    # Solver Type
+    solvertype: str = "T"
+    solve_omega: int = 0 # 0: No. 1: Objective
 
-    # ----- Discretisation parameters -----
-    # Radial discretisation
+    # Discretisation settings
     n_r: int = 25
-    # Azimuthal discretisation (for skewed inflow)
-    n_psi: int = 36
+    n_psi: int = 13
 
-
-    # ----- Airflow model selections -----
-    inflow_model: int = 1 # 0 = basic, 1 = Pitt & Peters, 2 = DTU
-    tip_loss_model: int = 1 # 0 = none, 1 = Prandtl
-    root_loss_model: int = 1 # 0 = none, 1 = Prandtl
-
-
-    # ----- Chord and twist smoothing parameters -----
-    # Set the highest power in the numerator and denominator of the chord smoothing function
-    Ord_Numerator_c = 4
-    Ord_Denominator_c = 2
-    
-    # Set the highest power in the numerator and denominator of the beta smoothing function
-    Ord_Numerator_beta = 2
-    Ord_Denominator_beta = 2
-
-
-    # ----- Lookup method parameters -----
-    P_Cl: int = 3 # Cl numerator order
-    Q_Cl: int = 2 # Cd denominator order
-    P_Cd: int = 2 # Cl numerator order
-    Q_Cd: int = 2 # Cd denominator order
-    
-    # Lookup blending steps
-    Iterations_initialising: int = 2
-    Iterations_blending: int = 6
-    Iterations_solving: int = 7
-    
-
-    # ----- Siagnostic and debugging flags -----
+    # Diagnostics
     verbose: bool = False
-    record_convergence_history: bool = False
-    interIterationDebug: bool = False
-    Smoothing_log = False # Set whether the smoothing function reports on quality of the smoothing attempt
+    jax_tracing: bool = False
 
+    # Geometry Setup
+    R_tip: float = 0.25
+    R_hub: float = 0.025
+
+    # Flight Conditions
+    n_cond: int = 1
+    thrust_target = jnp.array([29.6])
+    V_x = jnp.array([8.60])
+    V_yz = jnp.array([12.29])
+    omega = jnp.array([535.0])
+    objective_weight = jnp.array([0.8])
+
+    # Motor Information
+    I_0: float = 0.7           
+    R_m: float = 0.120         
+    k_V: float = 150
+
+    # Aerodynamic Models Selection
+    inflow_model: int = 1
+    coeff_method: int = 3 # 0: Parametric, 1: 2D Interp, 2: 3D Interp, 3: NeuralFoil
+    tip_loss_model: int = 1 # 0: No Loss 1: Prandtl
+    root_loss_model: int = 1
+    rot_corr_model: int = 1 # 3D inflow correction model
+    high_induction_model: int = 0 # (0: Classical Momentum, 1: Buhl Correction) NOT USEFUL FOR REGULAR FLIGHT
+
+    def save_state(self, filename: str = "inputs_state.eqx"):
+        """Saves the Inputs configuration to an Equinox file."""
+        if not filename.endswith(".eqx"): filename += ".eqx"
+        filename = "propellers/" + filename
+        eqx.tree_serialise_leaves(filename, self)
+        print(f"Inputs state successfully written to: {filename}")
     
+    def load_state(self, filename: str = "inputs_state.eqx"):
+        """
+        Loads and returns a new Inputs instance from an Equinox file.
+        Uses 'self' as the structural skeleton.
+        """
+        if not filename.endswith(".eqx"): filename += ".eqx"
+        filename = "propellers/" + filename
+        return eqx.tree_deserialise_leaves(filename, self)
+
 
 class Params(eqx.Module):
     '''
     Parameters for a given blade solution.
-    Ensure that all inputs have specified shape upon assignment.
-    ([None,:] for azimuthal stops, [:,None] for radial stops)
+    Ensure that all inputs are 1D arrays upon assignment.
 
+    shape(r, dr, c, beta, V_ia_0) = (N_r,)
+    shape(psi, dpsi) = (N_psi,)
     '''
     # Domain of Integration
     r: jnp.ndarray          # radial stations
@@ -107,28 +93,213 @@ class Params(eqx.Module):
 
     # Geometry & discretization
     N: jnp.ndarray          # number of blades
-    R: jnp.ndarray          # propeller radius (m)
     c: jnp.ndarray          # chord length at radial stations (m)
     beta: jnp.ndarray       # blade twist angle (rad)
+
+    c_scale: jnp.ndarray    # scale of chord
+    beta_scale: jnp.ndarray # scale of angle
 
     # Inflow / rotor state
     V_x: jnp.ndarray        # axial inflow velocity (ms^{-1})
     V_yz: jnp.ndarray       # In plane inflow velocity (ms^{-1})
+
     omega: jnp.ndarray      # rotational speed (rad/s)
-    #V_R: jnp.ndarray        # Net resultant velocity magnitude (ms^-1) at each radial and azimuthal station
+    omega_max: jnp.ndarray  # max subsonic omega
 
-    V_ia_0: float     # initial guess/storage for V_ia_0 (ms^{-1})
+    # Cost Weights
+    objective_thrust: jnp.ndarray
+    objective_MIL:  jnp.ndarray     
+    objective_power: jnp.ndarray
+    objective_weight: jnp.ndarray 
 
-    # Physical properties
-    rho: float = 1.225      # air density (kgm^{-3})
-    mu: float = 1.7965e-5    # kinematic viscosity of air at 20c (N s/m**2)
-    v_sound:float = 343           # speed of sound in air at standard atm (m/s)
+    # Target objective
+    thrust_target: jnp.ndarray
+
+    V_ia_0: jnp.ndarray     # initial guess/storage for V_ia_0 (ms^{-1})
+
+    # Solver Logging Info
+    error_log: jnp.ndarray
+    time_log: jnp.ndarray
+
+    # Airfoil Selection
+    airfoil: str = eqx.field(static=True) # Strings must be static
+    airfoil_interp: callable = eqx.field(static=True)
+
+    # Aerodynamic Constants
+    rho: float = 1.225          # air density (kgm^{-3})
+    mu: float = 1.798e-5        # air viscosity (kgm^-1s^-1)
+    a: float = 343.0            # speed of sound (m/s)      
+
+    def save_state(self, filename: str = "params_state.eqx"):
+        """Saves the array parameters to an Equinox file."""
+        if not filename.endswith(".eqx"): filename += ".eqx"
+        filename = "propellers/" + filename
+        eqx.tree_serialise_leaves(filename, self)
+
+    def load_state(self, filename: str = "params_state.eqx"):
+        """
+        Loads saved binary array weights back into a Params class instance.n
+
+        Acts on 'self' as the structural skeleton and returns a populated copy.
+        """
+        if not filename.endswith(".eqx"): filename += ".eqx"
+        filename = "propellers/" + filename
+        return eqx.tree_deserialise_leaves(filename, self)
+
+
+def build_default_propeller(c: float = 0.02, beta: float = 10.0, inputs: Inputs = None, airfoil_name: str = "arad10") -> Params:
+    """
+    Factory function to build a default Params configuration.
+    """
+    # Internal Imports
+    from airfoil import load_airfoil_data
+    if inputs is None:
+        inputs = Inputs()
+
+    # Geometry constraints
+    c_scale = 0.2                   
+    beta_scale = jnp.radians(50)    
+
+    # Build Grids
+    psi, dpsi = geometry.angular_stops(inputs.n_psi)
+    r, dr = geometry.radial_stops(inputs.R_tip, inputs.R_hub, inputs.n_r)
+
+    # Constant chord across the whole blade
+    init_c = jnp.full((Inputs.n_r,), c) 
+    # Constant twist across the whole blade
+    init_beta = jnp.full((Inputs.n_r,), jnp.radians(beta))
+
+
+    # Airfoil Data
+    airfoil_interp = load_airfoil_data(airfoil_name)
+    # Construct Params
+    return Params(
+        airfoil=airfoil_name,
+        airfoil_interp=airfoil_interp,
+        N=jnp.array([2]), # Ensure standard shape
+        c=init_c,      
+        beta=init_beta,
+        r=r, dr=dr,    
+        psi=psi, dpsi=dpsi, 
+        V_x=inputs.V_x[0], 
+        V_yz=inputs.V_yz[0],
+        omega=inputs.omega[0],
+        omega_max=343.0 / inputs.R_tip,
+        V_ia_0=jnp.full((inputs.n_r,), 8.0), 
+        c_scale=c_scale,
+        beta_scale=beta_scale,
+        error_log=jnp.array([1.0]),
+        time_log=jnp.array([0.0]),
+        objective_thrust=10.0,
+        objective_MIL=0.0,
+        objective_power=0.5,
+        objective_weight=inputs.objective_weight[0],
+        thrust_target=inputs.thrust_target[0],
+    )
+
+if __name__ == "__main__":
+    from datetime import datetime
+    import threading
+    import queue
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
+
+    # Internal Imports
+    import proptimiser
+    import results
+    import geometry
+
+    ## Import APC propeller for initial geom
+    import apcpropanalysis
+    geom = apcpropanalysis.parse_apc_pe0
     
-    # Interpolators
-    cdInterpolator: jsp.interpolate.RegularGridInterpolator = None
-    clInterpolator: jsp.interpolate.RegularGridInterpolator = None
-    blendingParam: float = 0
+    apc_geom = apcpropanalysis.parse_apc_pe0("apc_prop_data/propgeom_data/20x8-PERF.PE0")
+    
+    # Unpack the specific geometry fields needed
+    r_apc_in = apc_geom["r"]
+    c_apc_in = apc_geom["chord"]
+    beta_apc_deg = apc_geom["twist_deg"]
+    airfoil_apc = "clarky"
 
-    #Blending parameter, ranges between 0->1 (full parametric -> full lookup)
-    blend_alpha: float = 0.0
+    # Convert inches to meters and degrees to radians to match JAX solver SI units
+    r_apc_m = jnp.array(r_apc_in) * 0.0254
+    c_apc_m = jnp.array(c_apc_in) * 0.0254
+    beta_apc_rad = jnp.radians(jnp.array(beta_apc_deg))
 
+    # Configure default inputs to match the physical boundaries of the APC prop
+    inputs = Inputs()
+    inputs = eqx.tree_at(
+        lambda i: (i.R_hub, i.R_tip), 
+        inputs, 
+        (r_apc_m.min(), r_apc_m.max())
+    )
+    
+    # Build baseline structure
+    params = build_default_propeller(inputs=inputs, airfoil_name=airfoil_apc)
+
+    # Interpolate APC geometry onto the solver's discretized radial array
+    c_interp = jnp.interp(params.r, r_apc_m, c_apc_m)
+    beta_interp = jnp.interp(params.r, r_apc_m, beta_apc_rad)
+
+    # Inject the mapped geometry into the Params tree
+    params_init = eqx.tree_at(
+        lambda p: (p.c, p.beta),
+        params,
+        (c_interp, beta_interp)
+    )
+
+    print(f"Initialised airfoil interpolation with airfoil {params_init.airfoil}")
+
+    # Live Plotting Setup
+    print("Setting up live visualization canvas...")
+    gui_queue = queue.Queue()
+    plotter = results.LivePropPlotter(params_init)
+
+    if Inputs.jax_tracing:
+        print("Starting Profiler...")
+        jax.profiler.start_trace("/tmp/jax_trace")
+
+    thread_results = {}
+    
+    def optimization_worker():
+        # Run optimization on background thread and pass the queue
+        optimized_state = proptimiser.run_optimization(params_init, update_queue=gui_queue)
+        thread_results['params_opt'] = optimized_state
+
+    # Run Optimisation in Background Thread
+    opt_thread = threading.Thread(target=optimization_worker, daemon=True)
+    opt_thread.start()
+    
+    # This automatically polls the queue and refreshes the canvas
+    ani = FuncAnimation(
+        plotter.fig, 
+        plotter.update, 
+        fargs=(gui_queue,), 
+        interval=200, 
+        cache_frame_data=False,
+        blit=False
+    )
+    
+    # Hands control to the GUI until the window is closed
+    plt.show()
+
+    # Re-join thread to ensure clean closure 
+    opt_thread.join()
+    params_opt_hover = thread_results.get('params_opt', params_init)
+
+    if Inputs.jax_tracing:
+        jax.block_until_ready(params_opt_hover) 
+        jax.profiler.stop_trace()
+        print("Profiler stopped. Trace saved to /tmp/jax_trace")
+
+    # Save Results/Export Geometry if Required
+    user_input = input('Save Propeller? (y/n): ')
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M")
+    if user_input.lower() == 'y':
+        paramsfile = "prop_params_" + timestamp
+        inputsfile = "prop_inputs_" + timestamp
+        print(f'Saving Propeller Inputs/Parameters to {paramsfile} and {inputsfile}')
+        params_opt_hover.save_state(paramsfile)
+        Inputs().save_state(inputsfile)
+
+    print('Proptimisation Complete')
