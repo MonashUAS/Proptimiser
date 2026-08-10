@@ -237,7 +237,7 @@ def export_to_creo_ibl(r, c, beta, blade_coords, exportname,
     n_r, n_foil, _ = blade_coords.shape
     scale = 1000.0 if scale_to_mm else 1.0
 
-    with open(f"{exportname}.ibl", "w") as f:
+    with open(f"exports/{exportname}.ibl", "w") as f:
         f.write("Open\nArclength\n")
         
         for i, r_i in enumerate(r):

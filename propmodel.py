@@ -346,6 +346,7 @@ def get_velocity_scales(params):
 
     # Stack and reshape to (3, 1) so it broadcasts perfectly with (3, n_r)
     return jnp.array([V_ia_mean, V_it_mean, V_tip])[:, None]
+
 @jax.jit
 def induced_velocity(params):
     '''
@@ -389,7 +390,7 @@ def torque(V_i, params, debug=False):
     along the radial direction
     
     Inputs:
-        V_ia        <- Induced velocity at each radial and azimuthal station
+        V_i        <- Induced velocity at each radial and azimuthal station
         params      <- Params object used in the optimisation loop, remains unmodified by function execution
         debug       <- Boolean to select whether or not to print debug information when function is called
 
@@ -422,7 +423,7 @@ def thrust(V_i, params):
 
     return T
 
-def mechanicalPower(V_ia, params):
+def mechanicalPower(V_i, params):
     '''
     Calculates and returns the shaft power (W) applied to the propeller 
     '''
@@ -432,7 +433,7 @@ def mechanicalPower(V_ia, params):
     # Calculate Local Axial Flow Velocity
 
     # net torque over one rotation
-    Q = torque(V_ia, params, debug=False)
+    Q = torque(V_i, params, debug=False)
 
     # Net mechanical power (omega in rad/s, torque in Nm)
     P = Q * omega

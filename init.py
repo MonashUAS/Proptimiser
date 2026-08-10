@@ -85,8 +85,9 @@ class Params(eqx.Module):
     Parameters for a given blade solution.
     Ensure that all inputs are 1D arrays upon assignment.
 
-    shape(r, dr, c, beta, V_ia_0) = (N_r,)
+    shape(r, dr, c, beta) = (N_r,)
     shape(psi, dpsi) = (N_psi,)
+    shape(V_i) = (3, N_r, N_psi) [axial, tangential, radial]
     '''
     # Domain of Integration
     r: jnp.ndarray          # radial stations
@@ -153,7 +154,16 @@ class Params(eqx.Module):
 
 def build_default_propeller(c: float = 0.02, beta: float = 10.0, inputs: Inputs = None, airfoil_name: str = "arad10") -> Params:
     """
-    Factory function to build a default Params configuration.
+        Builds a default Params configuration with a 3D induced velocity guess.
+
+        Inputs:
+            c (float): The chord length in meters.
+            beta (float): The blade twist angle in degrees.
+            inputs (Inputs): The input configuration object.
+            airfoil_name (str): The name of the airfoil profile.
+
+        Returns:
+            Params configuration object
     """
     # Internal Imports
     from airfoil import load_airfoil_data

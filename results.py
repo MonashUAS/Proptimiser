@@ -158,24 +158,24 @@ class LivePropPlotter:
         # Subplot 3: Polar Map (Induced Velocity)
         self.ax3 = self.fig.add_subplot(2, 2, 3, projection="polar")
         self.ax3.set_title("Induced Velocity Map [m/s]\n", pad=15)
-        dummy_V_ia = np.zeros((len(self.r), len(self.psi)))
-        self.contour = self.ax3.contourf(self.psi, self.r_m, dummy_V_ia, cmap='viridis')
+        dummy_V_i = np.zeros(3, (len(self.r), len(self.psi)))
+        self.contour = self.ax3.contourf(self.psi, self.r_m, dummy_V_i, cmap='viridis')
         self.cbar = self.fig.colorbar(self.contour, ax=self.ax3, pad=0.1)
 
         # Subplot 4: Induced Velocity Profile & Loss Metrics
         self.ax4 = self.fig.add_subplot(2, 2, 4)
-        self.line_via_avg, = self.ax4.plot(self.r, np.zeros_like(self.r), 'g-', linewidth=2, label=r'Avg $V_{ia}$ [m/s]')
+        self.line_vi_avg, = self.ax4.plot(self.r, np.zeros_like(self.r), 'g-', linewidth=2, label=r'Avg $V_{i}$ [m/s]')
         self.ax4_twin = self.ax4.twinx()
         self.line_loss, = self.ax4_twin.plot(self.r, np.zeros_like(self.r), 'm--', linewidth=1.5, label='Loss Factor ($F$)')
         
         self.ax4.set_title("Induced Velocity Profile and Prandtl Loss Metrics")
         self.ax4.set_xlabel("Radius (mm)")
-        self.ax4.set_ylabel(r"Induced Velocity $V_{ia}$ (m/s)", color='g')
+        self.ax4.set_ylabel(r"Induced Velocity $V_{i}$ (m/s)", color='g')
         self.ax4_twin.set_ylabel("Prandtl Factor ($F$)", color='m')
         self.ax4_twin.set_ylim(-0.05, 1.05) # Bound the loss factor naturally between 0 and 1
         
         # Combine legends cleanly for twin axis
-        lines = [self.line_via_avg, self.line_loss]
+        lines = [self.line_vi_avg, self.line_loss]
         labels = [l.get_label() for l in lines]
         self.ax4.legend(lines, labels, loc='upper right')
         self.ax4.grid(True, alpha=0.3)
@@ -194,12 +194,13 @@ class LivePropPlotter:
                 break
         
         if latest_params is None:
-            return self.line_c, self.line_beta, self.line_err, self.line_via_avg, self.line_loss
+            return self.line_c, self.line_beta, self.line_err, self.line_vi_avg, self.line_loss
 
         # --- Compute aerodynamic flow states internally ---
         # This keeps the main execution loop entirely free of plotting logic
-        V_ia = propmodel.inflow_model(latest_params.V_ia_0, latest_params)
-        tip_loss, root_loss = airflow.tip_root_loss_factors(V_ia, latest_params)
+        V_i = propmodel.inflow_model(latest_params.V_i_0, latest_params)
+        _, phi = airflow.resultantVelocityComponents(V_i, latest_params)
+        tip_loss, root_loss = airflow.tip_root_loss_factors(phi, latest_params)
         F_curr = jnp.multiply(tip_loss, root_loss) 
 
         # Update Subplot 1 Lines (Geometry)
@@ -212,6 +213,7 @@ class LivePropPlotter:
         self.line_err.set_data(iters, error_log)
 
         # Update Subplot 4 Lines (Induced Velocity Profile & Losses)
+        V_ia = V_i[0]
         via_avg_profile = np.mean(np.array(V_ia), axis=1) # Average over azimuthal stations (psi)
         self.line_via_avg.set_ydata(via_avg_profile)
         
@@ -261,21 +263,21 @@ def debug_diagnostics_plot(params, cond_idx, show=True):
         beta_deg = np.degrees(params.beta)
         
         # Resolve Flow Kinematics
-        V_ia = propmodel.inflow_model(params.V_ia_0, params)
-        V_R, phi = airflow.resultantVelocityComponents(V_ia, params)
+        V_i = propmodel.inflow_model(params.V_i_0, params)
+        V_R, phi = airflow.resultantVelocityComponents(V_i, params)
         
         # Average across the azimuthal axis for 1D plotting
         phi_mean_deg = np.degrees(jnp.mean(phi, axis=1))
         VR_mean = jnp.mean(V_R, axis=1)
         
         # Extract Aerodynamic Coefficients
-        C_L, C_D, _ = airfoil.aero_coeffs(V_ia, params)
+        C_L, C_D, _ = airfoil.aero_coeffs(V_i, params)
         CL_mean = jnp.mean(C_L, axis=1)
         CD_mean = jnp.mean(C_D, axis=1)
         
         # Extract Sectional Forces
-        dT_ave, _ = propmodel.dT_blade(V_ia, params)
-        dQ_ave = propmodel.dQ_blade(V_ia, params)
+        dT_ave, _ = propmodel.dT_blade(V_i, params)
+        dQ_ave = propmodel.dQ_blade(V_i, params)
         
         # Extract Flow Regime (Reynolds Number)
         Re = airflow.calc_reynolds(params.rho, jnp.maximum(VR_mean, 1e-6), params.c, params.mu)
@@ -435,7 +437,7 @@ def loadprop(prop_timestamp):
         c=dummy_scalar, beta=dummy_scalar,
         r=dummy_scalar, dr=dummy_scalar, psi=dummy_scalar, dpsi=dummy_scalar,
         V_x=dummy_scalar, V_yz=dummy_scalar, omega=dummy_scalar, omega_max=0.0,
-        V_ia_0=dummy_scalar, c_scale=0.0, beta_scale=0.0,
+        V_i_0=dummy_scalar, c_scale=0.0, beta_scale=0.0,
         error_log=dummy_scalar, time_log=dummy_scalar,
         objective_thrust=dummy_scalar, objective_MIL=dummy_scalar, objective_power=int(1),
         objective_weight=dummy_scalar, thrust_target=dummy_scalar,
@@ -483,8 +485,8 @@ if __name__ == "__main__":
     # pass the base name/timestamp
     timestamps = ["20260629-0117.eqx"]
     weights = np.array([1.0])
-    # Blending with multiple propeller geometries
-    inputs, params_base = propgeomblender(timestamps, weights)
+    # unit test propeller
+    params_base = propmodel.build_default_propeller()
     inputs = init.Inputs # comment out to use flight conditions from propeller file
     print(f"--- Evaluating {inputs.n_cond} Flight Conditions ---")
 
@@ -507,14 +509,14 @@ if __name__ == "__main__":
                 (jnp.array([cond_omega]), jnp.array([cond_Vx]), jnp.array([cond_Vyz]))
             )
             
-            # This guarantees that geometry changes (e.g. from smoothing) propagate into V_ia.
-            _, V_ia_0_solved = propmodel.induced_velocity(params_cond)
+            # This guarantees that geometry changes (e.g. from smoothing) propagate into V_i.
+            _, V_i_0_solved = propmodel.induced_velocity(params_cond)
 
-            # write solved V_ia_0 into params
+            # write solved V_i_0 into params
             params_cond = eqx.tree_at(
                 lambda p: p.V_ia_0, 
                 params_cond, 
-                V_ia_0_solved
+                V_i_0_solved
             )
             
             evaluated_conditions.append(params_cond)

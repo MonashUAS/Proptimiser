@@ -140,13 +140,18 @@ def peters_he_model(V_i_0, params):
 
     return simple_inflow(V_i_0, params)
 
-def inflow_model(V_i_0, params):
-    ''' 
-    Switches between inflow models based on global configuration.
+def inflow_model(V_i_0: jnp.ndarray, params) -> jnp.ndarray:
     '''
+    Selects and executes the configured inflow velocity calculation model.
 
+    Args:
+        V_i_0: Initial 3D induced velocity array of shape (3, n_r).
+        params: Propeller parameter structure containing flight state.
+
+    Returns:
+        Calculated 3D induced velocity field of shape (3, n_r, n_psi).
+    '''
     V_i = lax.switch(Inputs.inflow_model, [simple_inflow, pitt_peters, peters_he_model], *(V_i_0, params))
-
     return V_i
 
 

@@ -20,13 +20,17 @@ from jax.scipy.special import gammaln
 
 
 
-def minimumInducedLossCost(V_ia, params):
+def minimumInducedLossCost(V_i, params):
     """
     Returns a DIMENSIONLESS cost measuring deviation from the Betz uniform-inflow
     condition (coefficient of variation, weighted toward the tip).
+    Inputs:
+        V_i: shape = (3, Nr, Npsi)
 
-    V_ia shape: (Nr, Npsi)
+    TODO: Evaluate if depreciated with new power implementations, update to V_i
     """
+    # Unpack Induced Velocity
+    V_ia = V_i[0]
     # Global mean over disk (scalar)
     mean_V_ia = jnp.mean(V_ia)
 
@@ -77,23 +81,23 @@ def objectives(params):
     Values of interest include power, thrust error, minimum induced loss error,
     '''
     # replace params object (works in function)
-    V_ia, V_ia_0   = propmodel.induced_velocity(params)             # Solve induced velocity field for current guess
-    thrust = jnp.squeeze(propmodel.thrust(V_ia, params))            # return the total thrust the propeller produce
-    torque = jnp.squeeze(propmodel.torque(V_ia, params))            # return total torque propeller produces
-    rms_MIL_err = minimumInducedLossCost(V_ia, params)            # minimum induced loss condition root mean square error
+    V_i, V_i_0   = propmodel.induced_velocity(params)             # Solve induced velocity field for current guess
+    thrust = jnp.squeeze(propmodel.thrust(V_i, params))            # return the total thrust the propeller produce
+    torque = jnp.squeeze(propmodel.torque(V_i, params))            # return total torque propeller produces
+    rms_MIL_err = minimumInducedLossCost(V_i, params)            # minimum induced loss condition root mean square error
     
     # calculate the motor power
     motor_power = motorPower(torque, params.omega, I_0 = Inputs.I_0, R_m = Inputs.R_m, k_V = Inputs.k_V)
 
-    # Return V_ia_0 so we can catch it!
-    return motor_power, thrust, rms_MIL_err, V_ia_0 
+    # Return V_i_0 so we can catch it!
+    return motor_power, thrust, rms_MIL_err, V_i_0 
 
 def cost_fn(params):
     ''' 
-    Computes cost and returns updated V_ia_0 for exactly ONE condition 
+    Computes cost and returns updated V_i_0 for exactly ONE condition 
     '''
     # unpack objectives and induced velocity
-    motor_power, thrust, rms_MIL_err, V_ia_0 = objectives(params)
+    motor_power, thrust, rms_MIL_err, V_i_0 = objectives(params)
     # calculate scaled variables
     thrust_err_rel = (thrust - params.thrust_target)/params.thrust_target
     # efficiency compared to actuator disk
@@ -109,7 +113,7 @@ def cost_fn(params):
     
     # Scale by the relative importance weight of this flight condition
     weighted_cost = cost * params.objective_weight
-    return weighted_cost, V_ia_0
+    return weighted_cost, V_i_0
 
 def objectives_fn(opt_vars_scaled, params_list): 
     '''
@@ -133,9 +137,9 @@ def objectives_fn(opt_vars_scaled, params_list):
 
     # vmap cost function over parameters list
     cost_fn_vmap = jax.vmap(cost_fn, in_axes=0)
-    costs, V_ia_0 = cost_fn_vmap(params_list)
+    costs, V_i_0 = cost_fn_vmap(params_list)
 
-    aux = (V_ia_0)
+    aux = (V_i_0)
     return jnp.sum(costs), aux
 
 def apply_vars_to_struct(vars_scaled, params_struct):
@@ -246,25 +250,31 @@ def run_optimization(params_base, update_queue=None):
     '''
     # Debug Print to check initial thrust residual
     if Inputs.verbose:
-        res_check = propmodel.thrust_residual(params_base.V_ia_0, params_base)
+        res_check = propmodel.thrust_residual(params_base.V_i_0, params_base)
         jax.debug.print("Initial Residuals Check: {dT_res}", dT_res=res_check)
 
+    # Construct initial induced velocity guess
+
     ## Construct params_struct for all flight conditions
-    conditions_list = [
-    replace(
+    params_list = []
+    for index in range(Inputs.n_cond):
+        #import ic's
+        p_temp = replace(
             params_base,
-            V_x=Inputs.V_x[i],
-            V_yz=Inputs.V_yz[i],
-            omega=Inputs.omega[i],
-            thrust_target=Inputs.thrust_target[i],
-            objective_weight=Inputs.objective_weight[i],
-            V_ia_0=jnp.full((Inputs.n_r,), 4.0)
+            V_x=Inputs.V_x[index],
+            V_yz=Inputs.V_yz[index],
+            omega=Inputs.omega[index],
+            thrust_target=Inputs.thrust_target[index],
+            objective_weight=Inputs.objective_weight[index]
         )
-        for i in range(Inputs.n_cond)
-    ]
-    
+        # calculate first guess for V_i_0 field
+        v_scale = propmodel.get_velocity_scales(p_temp)
+        v_i_0 = jnp.broadcast_to(v_scale, (3, Inputs.n_r))
+        replace(p_temp, V_i_0=v_i_0)
+        params_list.extend([p_temp])
+
     # Convert list into a stacked PyTree object that JAX natively unrolls via vmap
-    params_struct = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *conditions_list)
+    params_struct = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *params_list)
 
     vars_scaled = (
         params_base.c / params_base.c_scale,
@@ -324,7 +334,7 @@ def run_optimization(params_base, update_queue=None):
             def f(x):
                 vars_scl = unflatten_fn(x)
                 params_updated = apply_vars_to_struct(vars_scl, current_params)
-                motor_power, _, rms_MIL_err, final_V_ia_0 = evaluate_all_conditions(params_updated)
+                motor_power, _, rms_MIL_err, final_V_i_0 = evaluate_all_conditions(params_updated)
                 
                 actuator_disk_power = jax.vmap(propmodel.actuator_disk_power)(params_updated.thrust_target, params_updated)
                 efficiency = motor_power / actuator_disk_power
@@ -335,45 +345,45 @@ def run_optimization(params_base, update_queue=None):
                 )
                 weighted_cost = cost * params_updated.objective_weight
                 total_cost = jnp.sum(weighted_cost)
-                return total_cost, final_V_ia_0
+                return total_cost, final_V_i_0
 
-            (cost, final_V_ia_0), grad = jax.value_and_grad(f, has_aux=True)(flat_x)
-            return cost, grad, final_V_ia_0
+            (cost, final_V_i_0), grad = jax.value_and_grad(f, has_aux=True)(flat_x)
+            return cost, grad, final_V_i_0
 
         @jax.jit
         def compute_con_val_and_jac(flat_x, current_params):
             def c_fn(x):
                 vars_scl = unflatten_fn(x)
                 params_updated = apply_vars_to_struct(vars_scl, current_params)
-                _, thrust, _, final_V_ia_0 = evaluate_all_conditions(params_updated)
+                _, thrust, _, final_V_i_0 = evaluate_all_conditions(params_updated)
                 thrust_err_rel = (thrust - params_updated.thrust_target) / params_updated.thrust_target
-                return thrust_err_rel, final_V_ia_0
+                return thrust_err_rel, final_V_i_0
 
-            val, final_V_ia_0 = c_fn(flat_x)
+            val, final_V_i_0 = c_fn(flat_x)
             # Shared graph computation via XLA means c_fn evaluates efficiently here
             jac = jax.jacobian(lambda x: c_fn(x)[0])(flat_x)
-            return val, jac, final_V_ia_0
+            return val, jac, final_V_i_0
 
         # 4. DEFINE SCIPY-COMPATIBLE WRAPPERS (Converts JAX types to NumPy)
         def scipy_objective(flat_x_np):
             flat_x = jnp.array(flat_x_np, dtype=jnp.float64)
             current_params = state_container["params_struct"]
-            cost, grad, final_V_ia_0 = compute_obj_val_and_grad(flat_x, current_params)
+            cost, grad, final_V_i_0 = compute_obj_val_and_grad(flat_x, current_params)
             
             # Catch the updated inner-solver state and feed it forward as a warm start
             state_container["params_struct"] = eqx.tree_at(
-                lambda p: p.V_ia_0, current_params, final_V_ia_0
+                lambda p: p.V_i_0, current_params, final_V_i_0
             )
             return float(cost), np.array(grad, dtype=np.float64)
 
         def scipy_constraint(flat_x_np):
             flat_x = jnp.array(flat_x_np, dtype=jnp.float64)
             current_params = state_container["params_struct"]
-            val, jac, final_V_ia_0 = compute_con_val_and_jac(flat_x, current_params)
+            val, jac, final_V_i_0 = compute_con_val_and_jac(flat_x, current_params)
             
             # Sync the warm-start state and cache the Jacobian array 
             state_container["params_struct"] = eqx.tree_at(
-                lambda p: p.V_ia_0, current_params, final_V_ia_0
+                lambda p: p.V_i_0, current_params, final_V_i_0
             )
             state_container["last_jac"] = jac
             return np.array(val, dtype=np.float64)
@@ -410,8 +420,8 @@ def run_optimization(params_base, update_queue=None):
                 # Pass current error log structure
                 current_errors = np.array(error_log) 
                 
-                V_ia_0_curr = params_updated.V_ia_0[0]
-                V_ia_curr = np.array(propmodel.inflow_model(V_ia_0_curr, params_base))
+                V_i_0_curr = params_updated.V_i_0[0]
+                V_ia_curr = np.array(propmodel.inflow_model(V_i_0_curr, params_base))
                 
                 update_queue.put({
                     'c': c_np,
@@ -446,8 +456,8 @@ def run_optimization(params_base, update_queue=None):
         params_struct = state_container["params_struct"]
         params_struct = apply_vars_to_struct(vars_scaled_opt, params_struct)
         
-        powers, thrusts, rms_MIL_errs, final_V_ia_0 = evaluate_all_conditions(params_struct)
-        params_struct = eqx.tree_at(lambda p: p.V_ia_0, params_struct, final_V_ia_0)
+        powers, thrusts, rms_MIL_errs, final_V_i_0 = evaluate_all_conditions(params_struct)
+        params_struct = eqx.tree_at(lambda p: p.V_i_0, params_struct, final_V_i_0)
         
         print(f"\nOptimization Complete. Status: {res.message}")
         time_log = jnp.append(time_log, time.time() - start_time)
@@ -485,13 +495,13 @@ def run_optimization(params_base, update_queue=None):
                 beta = params_struct.beta_scale[:, None] * beta_scaled[None, :]
 
                 # Extract and unpack induced velocity
-                V_ia_0 = state.aux
+                V_i_0 = state.aux
 
                 ## Insert all new Guesses into params_struct
                 params_struct = eqx.tree_at(
-                    lambda p: (p.c, p.beta, p.omega, p.V_ia_0), 
+                    lambda p: (p.c, p.beta, p.omega, p.V_i_0), 
                     params_struct, 
-                    (c, beta, omega, V_ia_0)
+                    (c, beta, omega, V_i_0)
                 )
 
                 # Print Statements for this Iteration
@@ -569,13 +579,13 @@ def run_optimization(params_base, update_queue=None):
     final_c = params_struct.c[0]
     final_beta = params_struct.beta[0]
     final_omega = jnp.atleast_1d(params_struct.omega[0])
-    final_V_ia_0 = params_struct.V_ia_0[0]
+    final_V_i_0 = params_struct.V_i_0[0]
 
     return replace(params_base, 
                 c=final_c, 
                 beta=final_beta,   
                 omega=final_omega,
-                V_ia_0=final_V_ia_0,
+                V_i_0=final_V_i_0,
                 error_log=error_log, 
                 time_log=time_log)
 

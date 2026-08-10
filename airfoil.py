@@ -17,6 +17,159 @@ from pathlib import Path
 from init import Inputs
 from airflow import resultantVelocityComponents, calc_reynolds
 
+from aerosandbox.geometry.airfoil.airfoil_families import (
+    get_kulfan_parameters,
+    get_kulfan_coordinates
+)
+
+def fit_and_plot_kulfan(image_path: str, n_weights: int = 8, plot: bool = True):
+    """
+    Reads an airfoil image, downsamples the boundary using linear bin averaging,
+    and fits Kulfan (CST) parameters using AeroSandbox. Plots all Kulfan 
+    components on a single standard matplotlib axis.
+    
+    Parameters:
+        image_path (str): Path to the image file.
+        n_weights (int): Number of Kulfan weights per side (default: 8).
+        plot (bool): If True, plots the airfoil and all Kulfan modes on one axis.
+        
+    Returns:
+        dict: The Kulfan parameters required by NeuralFoil.
+    """
+    # Load and binarize the image
+    arr = plt.imread(image_path)
+    if arr.ndim >= 3:
+        arr = np.mean(arr[..., :3], axis=2)
+        
+    binary = arr < np.mean(arr)
+    rows, cols = np.where(binary)
+    
+    if len(cols) == 0:
+        raise ValueError("No airfoil shape detected in the image.")
+        
+    # Extract raw boundaries (one min/max per pixel column)
+    x_unique = np.unique(cols)
+    y_upper_raw = np.array([rows[cols == x].min() for x in x_unique], dtype=float)
+    y_lower_raw = np.array([rows[cols == x].max() for x in x_unique], dtype=float)
+    
+    # Normalize X domain
+    x_min, x_max = x_unique.min(), x_unique.max()
+    chord = float(x_max - x_min)
+    x_norm = (x_unique - x_min) / chord
+    
+    # Set Y origin to LE center and normalize
+    le_idx = np.argmin(x_norm)
+    y_center = (y_upper_raw[le_idx] + y_lower_raw[le_idx]) / 2.0
+    y_u_norm = -(y_upper_raw - y_center) / chord
+    y_l_norm = -(y_lower_raw - y_center) / chord
+
+    # Downsample to ~60 linearly spaced averaged elements
+    num_elements = 80
+    bins = np.linspace(0, 1, num_elements + 1)
+    x_sampled = 0.5 * (bins[:-1] + bins[1:])  # Bin centers
+    
+    y_u_sampled = np.zeros(num_elements)
+    y_l_sampled = np.zeros(num_elements)
+    
+    for i in range(num_elements):
+        mask = (x_norm >= bins[i]) & (x_norm <= bins[i+1])
+        if np.any(mask):
+            y_u_sampled[i] = np.mean(y_u_norm[mask])
+            y_l_sampled[i] = np.mean(y_l_norm[mask])
+        else:
+            # Fallback to interpolation if a bin is empty 
+            y_u_sampled[i] = np.interp(x_sampled[i], x_norm, y_u_norm)
+            y_l_sampled[i] = np.interp(x_sampled[i], x_norm, y_l_norm)
+    
+    # Construct ordered Counter-Clockwise (CCW) array: TE -> LE -> TE
+    x_upper_ccw = x_sampled[::-1]
+    y_upper_ccw = y_u_sampled[::-1]
+    x_lower_ccw = x_sampled[1:] 
+    y_lower_ccw = y_l_sampled[1:]
+    
+    coords = np.column_stack((
+        np.concatenate([x_upper_ccw, np.array([0]), x_lower_ccw]),
+        np.concatenate([y_upper_ccw, np.array([0]), y_lower_ccw])
+    ))
+
+    # Fit Kulfan parameters via AeroSandbox
+    params = get_kulfan_parameters(
+        coordinates=coords,
+        n_weights_per_side=n_weights
+    )
+
+    # Plotting on a single axis
+    if plot:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        
+        # Plot the Averaged Image Points
+        ax.scatter(coords[:, 0], coords[:, 1], color='black', s=15, 
+                   label='Averaged Extracted Points', zorder=5)
+        
+        # Plot the Final Reconstructed Airfoil
+        base_airfoil = get_kulfan_coordinates(
+            lower_weights=params["lower_weights"],
+            upper_weights=params["upper_weights"],
+            leading_edge_weight=params["leading_edge_weight"],
+            TE_thickness=params["TE_thickness"],
+            n_points_per_side=200
+        )
+        ax.plot(base_airfoil[:, 0], base_airfoil[:, 1], color='black', 
+                linewidth=2, label='Full Kulfan Fit', zorder=4)
+    
+        # Plot Upper Modes
+        for i in range(n_weights):
+            w_u = np.zeros(n_weights)
+            w_u[i] = params["upper_weights"][i]
+            mode_u = get_kulfan_coordinates(
+                lower_weights=np.zeros(n_weights), upper_weights=w_u,
+                leading_edge_weight=0.0, TE_thickness=0.0, n_points_per_side=200
+            )
+            label = 'Upper Modes' if i == 0 else None
+            ax.plot(mode_u[:, 0], mode_u[:, 1], color='tab:orange', alpha=0.5, label=label, zorder=2)
+
+        # Plot Lower Modes
+        for i in range(n_weights):
+            w_l = np.zeros(n_weights)
+            w_l[i] = params["lower_weights"][i]
+            mode_l = get_kulfan_coordinates(
+                lower_weights=w_l, upper_weights=np.zeros(n_weights),
+                leading_edge_weight=0.0, TE_thickness=0.0, n_points_per_side=200
+            )
+            label = 'Lower Modes' if i == 0 else None
+            ax.plot(mode_l[:, 0], mode_l[:, 1], color='tab:blue', alpha=0.5, label=label, zorder=2)
+
+        # Plot LEM
+        mode_lem = get_kulfan_coordinates(
+            lower_weights=np.zeros(n_weights), upper_weights=np.zeros(n_weights),
+            leading_edge_weight=params["leading_edge_weight"], TE_thickness=0.0, n_points_per_side=200
+        )
+        ax.plot(mode_lem[:, 0], mode_lem[:, 1], color='tab:red', linewidth=2, 
+                linestyle='--', label='LE Modification', zorder=3)
+
+        # Plot TE Mode
+        mode_te = get_kulfan_coordinates(
+            lower_weights=np.zeros(n_weights), upper_weights=np.zeros(n_weights),
+            leading_edge_weight=0.0, TE_thickness=params["TE_thickness"], n_points_per_side=200
+        )
+        ax.plot(mode_te[:, 0], mode_te[:, 1], color='tab:green', linewidth=2, 
+                linestyle=':', label='TE Thickness', zorder=3)
+
+        # Axis styling
+        ax.set_title(f"Airfoil Kulfan Fit and Component Breakdown ({n_weights*2 + 2} parameters)")
+        ax.set_xlabel("x/c")
+        ax.set_ylabel("y/c")
+        ax.axis('equal')
+        ax.grid(True, linestyle='--', alpha=0.6)
+        
+        # Format Legend (moving it outside the plot so it doesn't obscure lines)
+        ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=10)
+        
+        plt.tight_layout()
+        plt.show()
+
+    return params
+
 def apply_mach_corrections(cl_inc, cd_inc, cm_inc, mach, t_over_c=0.10):
     """
     Advanced compressibility correction handling high-subsonic drag rise.
@@ -688,11 +841,13 @@ def du_selig_correction(operands):
 
 ## jax dispatch pipeline
 
-def aero_coeffs(V_ia, params):
+def aero_coeffs(V_i, params):
     # Route to parametric (0) or interpolated (1) based on static config.
     # Using int() ensures this is a Python-level constant at JIT trace-time,
     # which is required for lax.switch — a traced jnp.where index would fail.
     method_idx = int(Inputs.coeff_method > 0)
+
+    V_ia = V_i[0] #TODO: Implement Full 3D induced Velocity Solve
     
     C_L_2D, C_D_2D, C_M = lax.switch(
         method_idx,
