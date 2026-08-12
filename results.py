@@ -155,11 +155,15 @@ class LivePropPlotter:
         self.ax2.set_yscale('log') 
         self.ax2.grid(True, which="both", alpha=0.3)
 
+        dummy_V_ia = np.zeros((len(self.r), len(self.psi)))
+        # Wrap data periodically for 360-degree polar contouring
+        psi_plot = np.append(self.psi, 2 * np.pi)
+        dummy_V_ia = np.hstack([dummy_V_ia, dummy_V_ia[:, :1]])
+
         # Subplot 3: Polar Map (Induced Velocity)
         self.ax3 = self.fig.add_subplot(2, 2, 3, projection="polar")
         self.ax3.set_title("Induced Velocity Map [m/s]\n", pad=15)
-        dummy_V_ia = np.zeros((len(self.r), len(self.psi)))
-        self.contour = self.ax3.contourf(self.psi, self.r_m, dummy_V_ia, cmap='viridis')
+        self.contour = self.ax3.contourf(psi_plot, self.r_m, dummy_V_ia, cmap='viridis')
         self.cbar = self.fig.colorbar(self.contour, ax=self.ax3, pad=0.1)
 
         # Subplot 4: Induced Velocity Profile & Loss Metrics
@@ -234,8 +238,12 @@ class LivePropPlotter:
         vmin = max(0.0, np.min(V_ia))
         levels = np.linspace(vmin, vmax, 15)
 
-        # Draw new contour
-        self.contour = self.ax3.contourf(self.psi, self.r_m, V_ia, levels=levels, cmap='viridis', extend='both')
+        # Wrap data periodically for 360-degree polar contouring
+        psi_plot = np.append(self.psi, 2 * np.pi)
+        V_ia_plot = np.hstack([V_ia, V_ia[:, :1]])
+
+        # Draw new contour using the wrapped arrays
+        self.contour = self.ax3.contourf(psi_plot, self.r_m, V_ia_plot, levels=levels, cmap='viridis', extend='both')
 
         # Clear the colorbar axis and redraw inside it cleanly
         self.cbar.ax.clear()

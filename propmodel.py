@@ -332,26 +332,28 @@ def thrust(V_ia, params):
 
     return T
 
-def power(V_ia, params):
-    '''
-    Calculates the aerodynamic Power of Propeller (W) using Momentum Theory.
+def motorPower(torque: float, omega: float, I_0: float = 0.7, R_m: float = 0.120, k_V: float = 150):
+    """
+    Calcualtes Power Consumption required of the motor to drive the propeller
 
-    DO NOT USE THIS FUNCTION FOR DETERMINING THE POWER INPUT FOR THE PROPELLER
-    '''
+    Inputs:
+        torque: torque of the motor (Nm)
+        omega: rotational rate of the motor (rad/s)
+        I_0: zero load current (A)
+        R_m: Coil resistance (ohms)
+        K_v: motor speed constant (RPM/volt)
+    """
+    P_out = torque*omega
 
-    # Unpack Params
-    r, psi = params.r, params.psi
-    # Calculate Local Axial Flow Velocity
-    V_x = params.V_x
-    V = V_ia+V_x 
+    K_t = 60 / (2*jnp.pi*k_V) # Calculate the torque constant (Nm/A)
 
-    # Elemental torque
-    dT = dT_momentum(V_ia, params)
+    I = torque / K_t # calculate the current consumed by the motor
 
-    dP = dT[:,None]*V
+    V = omega*60/(2*jnp.pi) / k_V
 
-    P = jnp.trapezoid(jnp.trapezoid(dP,x=r,axis=0),x=psi)
-    return P
+    P_in = P_out + R_m * (I+I_0)**2 + V*I_0
+
+    return P_in
 
 def mechanicalPower(V_ia, params):
     '''
@@ -442,10 +444,14 @@ def flatblade(c, beta, N, plot=False):
     actuatorEffiency = equivelantActuatorDiskEfficiency(T, params)
     print("Actuator efficiency:", actuatorEffiency)
 
+    # Wrap data periodically for 360-degree polar contouring
+    psi_plot = np.append(params.psi, 2 * np.pi)
+    V_ia_plot = np.hstack([V_ia, V_ia[:, :1]])
+
     if plot == True:
         # Plot heatmap using structured params properties
         fig, ax = plt.subplots(subplot_kw={"projection": "polar"})
-        plt.contourf(params.psi, params.r, V_ia, cmap='viridis')
+        plt.contourf(psi_plot, params.r, V_ia_plot, cmap='viridis')
         plt.colorbar(label='Induced Velocity [m/s]')
         plt.xlabel('X [m]')
         plt.ylabel('Y [m]')
@@ -513,7 +519,7 @@ def apc_model(filepath, plot=True):
     T = thrust(V_ia, params)
     P_mech = mechanicalPower(V_ia, params)
     print(f"--- Solve Complete ---")
-    print(f"Thrust: {T:.4f} N | Mechanical Power: {P_mech:.4f} W")
+    print(f"Thrust: {T:.4f} N | Motor Power: {P_mech:.4f} W")
 
     # Plotting via LivePropPlotter
     if plot:
@@ -522,15 +528,8 @@ def apc_model(filepath, plot=True):
         plotter = results.LivePropPlotter(params)
         tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
         F_curr = jnp.multiply(tip_loss, root_loss) 
-        # Build the frame data dictionary expected by LivePropPlotter.update()
-        frame_data = {
-            'c': params.c * 1000,
-            'beta': jnp.degrees(params.beta),
-            'error_log': params.error_log,
-            'V_ia': V_ia,
-            'F_loss': F_curr  # Map this key to your Prandtl tip/root total loss array
-        }
-        gui_queue.put(frame_data)
+
+        gui_queue.put(params)
         
         ani = FuncAnimation(
             plotter.fig, 
@@ -541,21 +540,25 @@ def apc_model(filepath, plot=True):
             blit=False
 
         )
+
         plt.show()
 
         fig = results.debug_diagnostics_plot(params, 0)
 
-        dummy = input("Done with plots?")
+        dummy = input("Done with plots? \n")
 
     return params, V_ia, T
 
 if __name__ == "__main__":
+
+    flatblade(10,0.3,2,plot=True)
+
     import apcpropanalysis
     apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0")
     rpm_data = apcpropanalysis.parse_apc_dat("apc_prop_data/performance_data/PER3_20x8.dat")
     # Extract as raw scalar floats instead of numpy arrays
-    target_rpm = float(np.squeeze(Inputs.omega / 0.1047))
-    target_V = float(np.squeeze(Inputs.V_x))
+    target_rpm = float(np.squeeze(Inputs.omega[1] / 0.1047))
+    target_V = float(np.squeeze(Inputs.V_x[1]))
 
     if rpm_data:
         # Find the closest RPM block (broadcasting works flawlessly with scalar targets)
@@ -577,7 +580,7 @@ if __name__ == "__main__":
         extracted_eff = matrix[closest_v_idx, 2]      
         extracted_power = matrix[closest_v_idx, 8]    
 
-        # --- 4. Print Summary Cleanly ---
+        # Print Summary Cleanly
         print("\n" + "="*45)
         print("      APC PERFORMANCE DATA EXTRACTION")
         print("="*45)

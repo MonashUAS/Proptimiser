@@ -22,16 +22,37 @@ def calc_phi(V_ia, params):
     '''
     raise(NotImplementedError("This function has been deprecated, please modify code to use the 'resultantVelocityComponents' function"))
 
-def equivelantActuatorDiskEfficiency(T,params):
+def equivelantActuatorDiskEfficiency(T, params):
     '''
-    Computes the equivalent actuator effiency for the given conditions, useful as a measure 
-    of the optimality, with this effiency representing the theoretical maximum effiency (never attainable).
+    Computes equivalent actuator disk efficiency across all regimes (hover to forward flight).
+    
+    Uses general momentum theory to solve for induced velocity v_i, 
+    avoiding division by zero at V_x = 0.
     '''
-    r = params.r
-    R = Inputs.R_tip
-    A_disk = jnp.pi*(R**2)
-
-    eta_actuator_disk = 2 / ((T/(A_disk*(params.V_x**2)*(params.rho/2)))**(0.5)+1)
+    R = Inputs.R_tip  # Assuming R_tip is inside params or Inputs
+    A_disk = jnp.pi * (R**2)
+    
+    # Ideal hover induced velocity: v_0 = sqrt(T / (2 * rho * A))
+    v_0 = jnp.sqrt(T / (2.0 * params.rho * A_disk))
+    
+    # Free-stream velocity
+    V_x = params.V_x
+    
+    # Solve for total axial velocity at disk
+    v_i = jnp.sqrt((V_x / 2.0)**2 + v_0**2) - (V_x / 2.0)
+    
+    # Ideal Power required by actuator disk
+    P_ideal = T * (V_x + v_i)
+    
+    # At V_x = 0 (Hover), we return Figure of Merit (v_0 / v_i = 1.0 for ideal actuator disk)
+    # At V_x > 0, we return classic propulsive efficiency (T * V_x / P_ideal)
+    
+    # Smooth blending or non-zero efficiency formulation:
+    eta_actuator_disk = jnp.where(
+        V_x < 1e-5,
+        1.0,  # Ideal actuator disk efficiency at hover (FM = 1.0)
+        (T * V_x) / P_ideal
+    )
     
     return eta_actuator_disk
 

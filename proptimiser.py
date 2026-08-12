@@ -48,28 +48,6 @@ def minimumInducedLossCost(V_ia, params):
 
     return rms_err
 
-def motorPower(torque: float, omega: float, I_0: float = 0.7, R_m: float = 0.120, k_V: float = 150):
-    """
-    Calcualtes Power Consumption required of the motor to drive the propeller
-
-    Inputs:
-        torque: torque of the motor (Nm)
-        omega: rotational rate of the motor (rad/s)
-        I_0: zero load current (A)
-        R_m: Coil resistance (ohms)
-        K_v: motor speed constant (RPM/volt)
-    """
-    P_out = torque*omega
-
-    K_t = 60 / (2*jnp.pi*k_V) # Calculate the torque constant (Nm/A)
-
-    I = torque / K_t # calculate the current consumed by the motor
-
-    V = omega*60/(2*jnp.pi) / k_V
-
-    P_in = P_out + R_m * (I+I_0)**2 + V*I_0
-
-    return P_in
 
 def objectives(params):
     '''
@@ -83,7 +61,7 @@ def objectives(params):
     rms_MIL_err = minimumInducedLossCost(V_ia, params)            # minimum induced loss condition root mean square error
     
     # calculate the motor power
-    motor_power = motorPower(torque, params.omega, I_0 = Inputs.I_0, R_m = Inputs.R_m, k_V = Inputs.k_V)
+    motor_power = propmodel.motorPower(torque, params.omega, I_0 = Inputs.I_0, R_m = Inputs.R_m, k_V = Inputs.k_V)
 
     # Return V_ia_0 so we can catch it!
     return motor_power, thrust, rms_MIL_err, V_ia_0 
@@ -520,7 +498,6 @@ def run_optimization(params_base, update_queue=None):
                         timing = f"{time.time() - iter_time:<4.1f}s" if idx == 0 else ""
                         
                         print(f"{iter_info} C{idx:<3} | {om:<5.2f} | {pwr:<12.4f} | {thr:<12.4f} | {t_err:<12.4f} | {mil:<10.4f} | {opt_err} | {timing}")
-                        print(f"Cond {idx} Internal Costs -> Thrust: {float(c_T):.4e} | Power: {float(c_P):.4e} | Induced: {float(mil):.4e}")
                     print_time = time.time()
                     
                     ## Plotting Thread Update

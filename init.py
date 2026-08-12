@@ -20,7 +20,7 @@ class Inputs(eqx.Module):
     opt_tol: float = 1e-2 
 
     # Induced Velocity Settings
-    V_ia_0_max_iter: int = 300
+    V_ia_0_max_iter: int = 150
     V_ia_0_eps: float = 5e-3
 
     # Solver Type
@@ -28,29 +28,29 @@ class Inputs(eqx.Module):
     solve_omega: int = 0 # 0: No. 1: Objective
 
     # Discretisation settings
-    n_r: int = 5
-    n_psi: int = 4
+    n_r: int = 10
+    n_psi: int = 12
 
     # Diagnostics
     verbose: bool = False
     jax_tracing: bool = False
 
     # Geometry Setup
-    R_tip: float = 0.25
+    R_tip: float = 0.275
     R_hub: float = 0.025
 
     # Flight Conditions
-    n_cond: int = 1
-    thrust_target = jnp.array([29.6])
-    V_x = jnp.array([8.60])
-    V_yz = jnp.array([12.29])
-    omega = jnp.array([535.0])
-    objective_weight = jnp.array([0.8])
+    n_cond: int = 2
+    thrust_target = jnp.array([15.9,45.0])
+    V_x = jnp.array([18.0,34.0])
+    V_yz = jnp.array([3.0,3.0])
+    omega = jnp.array([588.0,927.0])
+    objective_weight = jnp.array([0.7,0.3])
 
     # Motor Information
-    I_0: float = 0.7           
-    R_m: float = 0.120         
-    k_V: float = 150
+    I_0: float = 2.0      
+    R_m: float = 0.037
+    k_V: float = 220
 
     # Aerodynamic Models Selection
     inflow_model: int = 1
@@ -219,7 +219,7 @@ if __name__ == "__main__":
     r_apc_in = apc_geom["r"]
     c_apc_in = apc_geom["chord"]
     beta_apc_deg = apc_geom["twist_deg"]
-    airfoil_apc = "clarky"
+    airfoil_apc = "arad10"
 
     # Convert inches to meters and degrees to radians to match JAX solver SI units
     r_apc_m = jnp.array(r_apc_in) * 0.0254
