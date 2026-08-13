@@ -4,19 +4,13 @@ import time
 import jax.numpy as jnp
 import jaxopt
 import matplotlib.pyplot as plt
-from jax.flatten_util import ravel_pytree
-import optimistix as optx
-from slsqp_jax import SLSQP, SLSQPConfig, ToleranceConfig
 from dataclasses import replace
 from jax import lax
 import equinox as eqx
 
 # Internal Imports
-from init import Params, Inputs
-from airfoil import load_airfoil_data
-import airflow
+from init import Inputs
 import propmodel
-from jax.scipy.special import gammaln
 
 
 
@@ -74,15 +68,15 @@ def cost_fn(params):
     motor_power, thrust, rms_MIL_err, V_ia_0 = objectives(params)
     # calculate scaled variables
     thrust_err_rel = (thrust - params.thrust_target)/params.thrust_target
-    # efficiency compared to actuator disk
-    actuator_disk_power = propmodel.actuator_disk_power(params.thrust_target, params)
-    efficiency = motor_power/actuator_disk_power
+    # efficiency compared to actuator disk (not a good FOM for a prop, cuases divergence.)
+    #actuator_disk_power = propmodel.actuator_disk_power(params.thrust_target, params)
+    #efficiency = motor_power/actuator_disk_power
 
     # Calculate base cost using this condition's specific targets
     cost = (
         (params.objective_thrust * thrust_err_rel)**2 + 
         (params.objective_MIL * rms_MIL_err)**2 + 
-        (params.objective_power * efficiency)**2
+        (params.objective_power * motor_power)**2
     )
     
     # Scale by the relative importance weight of this flight condition

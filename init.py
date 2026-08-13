@@ -13,6 +13,20 @@ import jax.numpy as jnp
 # Internal Imports
 import geometry
 
+def enable_gpu_acceleration():
+    """
+    Configures JAX to execute calculations on the GPU.
+
+    Inputs:
+        None
+
+    Returns:
+        str: Active JAX device platform name
+    """
+    gpu_device = jax.devices("gpu")[0]
+    jax.config.update("jax_default_device", gpu_device)
+    return gpu_device.platform
+
 class Inputs(eqx.Module):
     # Outer-loop Optimisation (Currently only L-BFGS-B works)
     opt_solver: str = "L-BFGS-B"
@@ -20,7 +34,7 @@ class Inputs(eqx.Module):
     opt_tol: float = 1e-2 
 
     # Induced Velocity Settings
-    V_ia_0_max_iter: int = 150
+    V_ia_0_max_iter: int = 500
     V_ia_0_eps: float = 5e-3
 
     # Solver Type
@@ -28,8 +42,8 @@ class Inputs(eqx.Module):
     solve_omega: int = 0 # 0: No. 1: Objective
 
     # Discretisation settings
-    n_r: int = 10
-    n_psi: int = 12
+    n_r: int = 25
+    n_psi: int = 24
 
     # Diagnostics
     verbose: bool = False
@@ -41,11 +55,11 @@ class Inputs(eqx.Module):
 
     # Flight Conditions
     n_cond: int = 2
-    thrust_target = jnp.array([15.9,45.0])
-    V_x = jnp.array([18.0,34.0])
+    thrust_target = jnp.array([15.9,100.0])
+    V_x = jnp.array([18.0,0.8])
     V_yz = jnp.array([3.0,3.0])
-    omega = jnp.array([588.0,927.0])
-    objective_weight = jnp.array([0.7,0.3])
+    omega = jnp.array([588.0,727.0])
+    objective_weight = jnp.array([0.9,0.1])
 
     # Motor Information
     I_0: float = 2.0      
@@ -55,9 +69,9 @@ class Inputs(eqx.Module):
     # Aerodynamic Models Selection
     inflow_model: int = 1
     coeff_method: int = 3 # 0: Parametric, 1: 2D Interp, 2: 3D Interp, 3: NeuralFoil
-    tip_loss_model: int = 1 # 0: No Loss 1: Prandtl
-    root_loss_model: int = 1
-    rot_corr_model: int = 1 # 3D inflow correction model
+    tip_loss_model: int = 0 # 0: No Loss 1: Prandtl
+    root_loss_model: int = 0
+    rot_corr_model: int = 0 # 3D inflow correction model
     high_induction_model: int = 0 # (0: Classical Momentum, 1: Buhl Correction) NOT USEFUL FOR REGULAR FLIGHT
 
     def save_state(self, filename: str = "inputs_state.eqx"):
@@ -190,7 +204,7 @@ def build_default_propeller(c: float = 0.02, beta: float = 10.0, inputs: Inputs 
         beta_scale=beta_scale,
         error_log=jnp.array([1.0]),
         time_log=jnp.array([0.0]),
-        objective_thrust=10.0,
+        objective_thrust=500.0,
         objective_MIL=0.0,
         objective_power=0.5,
         objective_weight=inputs.objective_weight[0],
@@ -198,6 +212,9 @@ def build_default_propeller(c: float = 0.02, beta: float = 10.0, inputs: Inputs 
     )
 
 if __name__ == "__main__":
+
+    #enable_gpu_acceleration() #a bit of work; you need linux for this
+
     from datetime import datetime
     import threading
     import queue
@@ -209,44 +226,11 @@ if __name__ == "__main__":
     import results
     import geometry
 
-    ## Import APC propeller for initial geom
-    import apcpropanalysis
-    geom = apcpropanalysis.parse_apc_pe0
-    
-    apc_geom = apcpropanalysis.parse_apc_pe0("apc_prop_data/propgeom_data/20x8-PERF.PE0")
-    
-    # Unpack the specific geometry fields needed
-    r_apc_in = apc_geom["r"]
-    c_apc_in = apc_geom["chord"]
-    beta_apc_deg = apc_geom["twist_deg"]
-    airfoil_apc = "arad10"
+    _, params_init = results.loadprop("currawong_v0")
 
-    # Convert inches to meters and degrees to radians to match JAX solver SI units
-    r_apc_m = jnp.array(r_apc_in) * 0.0254
-    c_apc_m = jnp.array(c_apc_in) * 0.0254
-    beta_apc_rad = jnp.radians(jnp.array(beta_apc_deg))
-
-    # Configure default inputs to match the physical boundaries of the APC prop
-    inputs = Inputs()
-    inputs = eqx.tree_at(
-        lambda i: (i.R_hub, i.R_tip), 
-        inputs, 
-        (r_apc_m.min(), r_apc_m.max())
-    )
-    
-    # Build baseline structure
-    params = build_default_propeller(inputs=inputs, airfoil_name=airfoil_apc)
-
-    # Interpolate APC geometry onto the solver's discretized radial array
-    c_interp = jnp.interp(params.r, r_apc_m, c_apc_m)
-    beta_interp = jnp.interp(params.r, r_apc_m, beta_apc_rad)
-
-    # Inject the mapped geometry into the Params tree
-    params_init = eqx.tree_at(
-        lambda p: (p.c, p.beta),
-        params,
-        (c_interp, beta_interp)
-    )
+    objective_thrust=jnp.array([500.0]),
+    objective_MIL=jnp.array([0.0]),
+    objective_power=jnp.array([0.5]),
 
     print(f"Initialised airfoil interpolation with airfoil {params_init.airfoil}")
 

@@ -484,15 +484,14 @@ def propgeomblender(timestamps, weights):
 
 if __name__ == "__main__":
     import proptimiser
-    import geometry
-    import matplotlib
     from matplotlib.animation import FuncAnimation
     # pass the base name/timestamp
-    timestamps = ["Redback V2.eqx"]
+    timestamps = ["currawong_v0.eqx"]
     weights = np.array([1.0])
     # Blending with multiple propeller geometries
     inputs, params_base = propgeomblender(timestamps, weights)
     inputs = init.Inputs() # comment out to use flight conditions from propeller file
+
     print(f"--- Evaluating {inputs.n_cond} Flight Conditions ---")
 
     # Execution & Processing Loop
