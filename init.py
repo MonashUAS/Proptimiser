@@ -62,9 +62,10 @@ class Inputs(eqx.Module):
     objective_weight = jnp.array([0.9,0.1])
 
     # Motor Information
-    I_0: float = 2.0      
+    I_0: float = 2.0
     R_m: float = 0.037
-    k_V: float = 220
+    kV: float = 220
+    W_max: float = 3300
 
     # Aerodynamic Models Selection
     inflow_model: int = 1
@@ -225,12 +226,9 @@ if __name__ == "__main__":
     import proptimiser
     import results
     import geometry
+    import propmodel
 
-    _, params_init = results.loadprop("currawong_v0")
-
-    objective_thrust=jnp.array([500.0]),
-    objective_MIL=jnp.array([0.0]),
-    objective_power=jnp.array([0.5]),
+    params_init, _, _ = propmodel.apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0", plot=False)
 
     print(f"Initialised airfoil interpolation with airfoil {params_init.airfoil}")
 

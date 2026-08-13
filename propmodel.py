@@ -332,7 +332,7 @@ def thrust(V_ia, params):
 
     return T
 
-def motorPower(torque: float, omega: float, I_0: float = 0.7, R_m: float = 0.120, k_V: float = 150):
+def motorPower(torque: float, omega: float, I_0: float = 0.7, R_m: float = 0.120, kV: float = 150):
     """
     Calcualtes Power Consumption required of the motor to drive the propeller
 
@@ -517,7 +517,7 @@ def apc_model(filepath, plot=True):
 
     # Calculate overall performance metrics
     T = thrust(V_ia, params)
-    P_mech = mechanicalPower(V_ia, params)
+    P_mech = motorPower(V_ia, params)
     print(f"--- Solve Complete ---")
     print(f"Thrust: {T:.4f} N | Motor Power: {P_mech:.4f} W")
 

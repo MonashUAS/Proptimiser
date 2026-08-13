@@ -55,7 +55,7 @@ def objectives(params):
     rms_MIL_err = minimumInducedLossCost(V_ia, params)            # minimum induced loss condition root mean square error
     
     # calculate the motor power
-    motor_power = propmodel.motorPower(torque, params.omega, I_0 = Inputs.I_0, R_m = Inputs.R_m, k_V = Inputs.k_V)
+    motor_power = propmodel.motorPower(torque, params.omega, I_0 = Inputs.I_0, R_m = Inputs.R_m, k_V = Inputs.kV)
 
     # Return V_ia_0 so we can catch it!
     return motor_power, thrust, rms_MIL_err, V_ia_0 
@@ -68,15 +68,11 @@ def cost_fn(params):
     motor_power, thrust, rms_MIL_err, V_ia_0 = objectives(params)
     # calculate scaled variables
     thrust_err_rel = (thrust - params.thrust_target)/params.thrust_target
-    # efficiency compared to actuator disk (not a good FOM for a prop, cuases divergence.)
-    #actuator_disk_power = propmodel.actuator_disk_power(params.thrust_target, params)
-    #efficiency = motor_power/actuator_disk_power
 
     # Calculate base cost using this condition's specific targets
     cost = (
-        (params.objective_thrust * thrust_err_rel)**2 + 
-        (params.objective_MIL * rms_MIL_err)**2 + 
-        (params.objective_power * motor_power)**2
+        (thrust_err_rel)**2 +
+        (motor_power/Inputs.W_max)
     )
     
     # Scale by the relative importance weight of this flight condition
