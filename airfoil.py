@@ -741,7 +741,7 @@ def parametric_functions(alpha_rad,
     
     return Cl, Cd, Cm
 
-def parametric_coeffs(V_ia, params):
+def parametric_coeffs(V_i, params):
     '''
     Calculates aerodynamic coefficients using parametric functions
     for a given induced velocity and params, including flat-plate estimate.
@@ -755,7 +755,7 @@ def parametric_coeffs(V_ia, params):
     geometric_angle = params.beta[:, None]
 
     # calculate aerodynamic incidence
-    _, phi = resultantVelocityComponents(V_ia, params) # get only second output
+    _, phi = resultantVelocityComponents(V_i, params) # get only second output
 
     # Angle of attack
     AoA_eff = geometric_angle - phi - AoA_0
@@ -768,13 +768,13 @@ def parametric_coeffs(V_ia, params):
     
     return C_L, C_D, C_M
 
-def interpolated_coeffs(V_ia, params):
+def interpolated_coeffs(V_i, params):
     '''
     Aerodynamic coefficients from Xfoil, XFLR5, or NeuralFoil solvers.
     This unifies the pipeline as the underlying JAX interpolator abstractly handles the method.
     '''
     geometric_angle = params.beta[:, None]
-    V_R, phi = resultantVelocityComponents(V_ia, params) 
+    V_R, phi = resultantVelocityComponents(V_i, params) 
 
     # No zero-lift offset applied to geometric solvers
     AoA_eff = geometric_angle - phi
@@ -802,7 +802,7 @@ def du_selig_correction(operands):
     Applies the Du-Selig 3D Rotational Stall Delay correction.
     Modifies C_L and C_D based on local chord-to-radius ratios.
     '''
-    C_L_2D, C_D_2D, C_M, V_ia, params = operands
+    C_L_2D, C_D_2D, C_M, V_i, params = operands
     
     # Extract geometry and prevent division by zero at the exact root
     c = params.c[:, None]
@@ -815,7 +815,7 @@ def du_selig_correction(operands):
     
     # Calculate Effective Angle of Attack (AoA_eff)
     geometric_angle = params.beta[:, None]
-    _, phi = resultantVelocityComponents(V_ia, params)
+    _, phi = resultantVelocityComponents(V_i, params)
     AoA_eff = geometric_angle - phi
     
     # Calculate Du-Selig empirical factor (f1 = f2)
@@ -846,17 +846,15 @@ def aero_coeffs(V_i, params):
     # Using int() ensures this is a Python-level constant at JIT trace-time,
     # which is required for lax.switch — a traced jnp.where index would fail.
     method_idx = int(Inputs.coeff_method > 0)
-
-    V_ia = V_i[0] #TODO: Implement Full 3D induced Velocity Solve
     
     C_L_2D, C_D_2D, C_M = lax.switch(
         method_idx,
         [parametric_coeffs, interpolated_coeffs],
-        V_ia, params 
+        V_i, params 
     )
     
     # Apply 3D Rotational Corrections
-    operands = (C_L_2D, C_D_2D, C_M, V_ia, params)
+    operands = (C_L_2D, C_D_2D, C_M, V_i, params)
     C_L_final, C_D_final, C_M_final = lax.switch(
         Inputs.rot_corr_model,
         [no_3d_correction, du_selig_correction],

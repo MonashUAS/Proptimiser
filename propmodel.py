@@ -532,7 +532,7 @@ def flatblade(c, beta, N, plot=False):
     if plot == True:
         # Plot heatmap using structured params properties
         fig, ax = plt.subplots(subplot_kw={"projection": "polar"})
-        plt.contourf(params.psi, params.r, V_ia, cmap='viridis')
+        plt.contourf(params.psi, params.r, V_i, cmap='viridis')
         plt.colorbar(label='Induced Velocity [m/s]')
         plt.xlabel('X [m]')
         plt.ylabel('Y [m]')
@@ -638,7 +638,7 @@ def apc_model(filepath, plot=True):
 
 if __name__ == "__main__":
 
-    flatblade(0.05, 0.1, 2)
+    flatblade(0.05, 0.1, 2, plot=True)
 #     import apcpropanalysis
 #     apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0")
 #     rpm_data = apcpropanalysis.parse_apc_dat("apc_prop_data/performance_data/PER3_20x8.dat")
