@@ -31,6 +31,12 @@ class DraggableSplineEditor:
         self.ax.set_title(f"Interactive Editor: {name}\nDrag the red points up/down/left/right. Close window when finished.")
         self.ax.set_xlabel("Radius (r)")
         self.ax.set_ylabel(name)
+        # Compute a safe top limit with 10% padding above maximum data point
+        y_max = float(np.max(y_dense))
+        top_limit = y_max * 1.1 if y_max > 0 else 1.0
+
+        # Explicitly set bounds (grounds bottom at 0, top at y_max + padding)
+        self.ax.set_ylim(bottom=0, top=top_limit)
         
         # Plot original data as a faint background reference
         self.ax.plot(r_dense, y_dense, '.', color='gray', alpha=0.5, label='Original Data')
@@ -62,7 +68,7 @@ class DraggableSplineEditor:
         
         # Calculate normalized 2D distance for intuitive grabbing
         x_range = self.cp_r[-1] - self.cp_r[0]
-        y_range = max(self.y_dense.max() - self.y_dense.min(), 1e-6)
+        y_range = max(self.y_dense.max(), 1e-6)
         
         dx = (self.cp_r - event.xdata) / x_range
         dy = (self.cp_y - event.ydata) / y_range
@@ -125,15 +131,20 @@ def iterativesmoothing(params):
     )
     
     return params
+
+
 class LivePropPlotter:
+    '''
+    Live Updating Solver Plot with Debugging information
+    '''
     def __init__(self, params_base):
-        # 1. Setup Figure
+        # Setup Figure
         self.fig = plt.figure(figsize=(14, 8))
         self.r = np.array(params_base.r * 1000)  # Radius in mm
         self.r_m = np.array(params_base.r)      # Radius in m
         self.psi = np.array(params_base.psi)
 
-        # Subplot 1: Chord & Twist
+        # Subplot: Chord & Twist
         self.ax1 = self.fig.add_subplot(2, 2, 1)
         self.line_c, = self.ax1.plot(self.r, np.zeros_like(self.r), 'b-o', label='Chord (mm)')
         self.ax1_twin = self.ax1.twinx()
@@ -155,16 +166,22 @@ class LivePropPlotter:
         self.ax2.set_yscale('log') 
         self.ax2.grid(True, which="both", alpha=0.3)
 
-        # Subplot 3: Polar Map (Induced Velocity)
+        dummy_V_i_a = np.zeros((len(self.r), len(self.psi)))
+        # Wrap data periodically for 360-degree polar contouring
+        psi_plot = np.append(self.psi, 2 * np.pi)
+        dummy_V_i_a = np.hstack([dummy_V_i_a, dummy_V_i_a[:, :1]])
+
+        # Subplot 3: Polar Map (Induced Velocity+swirl vectors)
         self.ax3 = self.fig.add_subplot(2, 2, 3, projection="polar")
         self.ax3.set_title("Induced Velocity Map [m/s]\n", pad=15)
-        dummy_V_i = np.zeros(3, (len(self.r), len(self.psi)))
-        self.contour = self.ax3.contourf(self.psi, self.r_m, dummy_V_i, cmap='viridis')
+        self.contour = self.ax3.contourf(psi_plot, self.r_m, dummy_V_i_a, cmap='viridis')
         self.cbar = self.fig.colorbar(self.contour, ax=self.ax3, pad=0.1)
 
         # Subplot 4: Induced Velocity Profile & Loss Metrics
         self.ax4 = self.fig.add_subplot(2, 2, 4)
-        self.line_vi_avg, = self.ax4.plot(self.r, np.zeros_like(self.r), 'g-', linewidth=2, label=r'Avg $V_{i}$ [m/s]')
+        self.line_via_avg, = self.ax4.plot(self.r, np.zeros_like(self.r), 'g-', linewidth=2, label=r'Avg $V_{i,a}$ [m/s]')
+        self.line_vit_avg, = self.ax4.plot(self.r, np.zeros_like(self.r), 'c-', linewidth=2, label=r'Avg $V_{i,t}$ [m/s]')
+
         self.ax4_twin = self.ax4.twinx()
         self.line_loss, = self.ax4_twin.plot(self.r, np.zeros_like(self.r), 'm--', linewidth=1.5, label='Loss Factor ($F$)')
         
@@ -174,11 +191,10 @@ class LivePropPlotter:
         self.ax4_twin.set_ylabel("Prandtl Factor ($F$)", color='m')
         self.ax4_twin.set_ylim(-0.05, 1.05) # Bound the loss factor naturally between 0 and 1
         
-        # Combine legends cleanly for twin axis
-        lines = [self.line_vi_avg, self.line_loss]
+        # Update the legend to include the new line
+        lines = [self.line_via_avg, self.line_vit_avg, self.line_loss]
         labels = [l.get_label() for l in lines]
         self.ax4.legend(lines, labels, loc='upper right')
-        self.ax4.grid(True, alpha=0.3)
 
         plt.tight_layout()
 
@@ -194,7 +210,7 @@ class LivePropPlotter:
                 break
         
         if latest_params is None:
-            return self.line_c, self.line_beta, self.line_err, self.line_vi_avg, self.line_loss
+            return self.line_c, self.line_beta, self.line_err, self.line_via_avg, self.line_vit_avg, self.line_loss
 
         # --- Compute aerodynamic flow states internally ---
         # This keeps the main execution loop entirely free of plotting logic
@@ -214,8 +230,14 @@ class LivePropPlotter:
 
         # Update Subplot 4 Lines (Induced Velocity Profile & Losses)
         V_ia = V_i[0]
+        V_it = V_i[1]
         via_avg_profile = np.mean(np.array(V_ia), axis=1) # Average over azimuthal stations (psi)
-        self.line_via_avg.set_ydata(via_avg_profile)
+        vit_avg_profile = np.mean(np.array(V_it), axis=1) # Average over azimuthal stations (psi)
+        self.line_via_avg.set_ydata(via_avg_profile) 
+        self.line_vit_avg.set_ydata(vit_avg_profile)
+        # Wrap data periodically for 360-degree polar contouring
+        psi_plot = np.append(self.psi, 2 * np.pi)
+        V_ia_plot = np.hstack([V_ia, V_ia[:, :1]])
         
         F_factors = np.mean(np.array(F_curr), axis=1) # Average over azimuthal stations (psi)
         self.line_loss.set_ydata(F_factors)
@@ -237,7 +259,36 @@ class LivePropPlotter:
         levels = np.linspace(vmin, vmax, 15)
 
         # Draw new contour
-        self.contour = self.ax3.contourf(self.psi, self.r_m, V_ia, levels=levels, cmap='viridis', extend='both')
+        self.contour = self.ax3.contourf(psi_plot, self.r_m, V_ia_plot, levels=levels, cmap='viridis', extend='both')
+        # Clear old quiver arrows if they exist to prevent lag
+        if hasattr(self, 'quiver_overlay'):
+            self.quiver_overlay.remove()
+
+        # Unpack in-plane velocity components
+        V_it = V_i[1]  # Tangential (Swirl)
+        V_it_plot = np.hstack([V_it, V_it[:, :1]])
+        V_ir = V_i[2]  # Radial
+        V_ir_plot = np.hstack([V_ir, V_ir[:, :1]])
+
+        # Mesh 1D radial and azimuthal grids into 2D matrices
+        PSI, R = np.meshgrid(psi_plot, self.r_m)
+
+        # Transform Cylindrical Velocity (V_ir, V_it) into Cartesian (Vx, Vy)
+        U_x = V_ir_plot * np.cos(PSI) - V_it_plot * np.sin(PSI)
+        U_y = V_ir_plot * np.sin(PSI) + V_it_plot * np.cos(PSI)
+
+        # Overlay vector field using Cartesian displacement vectors
+        self.quiver_overlay = self.ax3.quiver(
+            PSI, 
+            R, 
+            U_x, 
+            U_y, 
+            color='white', 
+            angles='uv',       # Calculates arrow directions directly from (U_x, U_y)
+            scale_units='xy',  # Scales vector length relative to axes coordinates
+            pivot='tail',      # Roots arrow base at the grid point
+            alpha=0.7
+        )
 
         # Clear the colorbar axis and redraw inside it cleanly
         self.cbar.ax.clear()
@@ -276,7 +327,7 @@ def debug_diagnostics_plot(params, cond_idx, show=True):
         CD_mean = jnp.mean(C_D, axis=1)
         
         # Extract Sectional Forces
-        dT_ave, _ = propmodel.dT_blade(V_i, params)
+        dT_ave = propmodel.dT_blade(V_i, params)
         dQ_ave = propmodel.dQ_blade(V_i, params)
         
         # Extract Flow Regime (Reynolds Number)

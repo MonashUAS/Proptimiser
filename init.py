@@ -21,7 +21,7 @@ class Inputs(eqx.Module):
 
     # Induced Velocity Settings
     V_i_0_max_iter: int = 300
-    V_i_0_eps: float = 5e-3
+    V_i_0_eps: float = 5e-1
 
     # Solver Type
     bemt_type: int = 1 # 0: Thrust (axial), 1: Thrust+Torque (axial+tangential)
@@ -248,7 +248,6 @@ if __name__ == "__main__":
 
     ## Import APC propeller for initial geom
     import apcpropanalysis
-    geom = apcpropanalysis.parse_apc_pe0
     
     apc_geom = apcpropanalysis.parse_apc_pe0("apc_prop_data/propgeom_data/20x8-PERF.PE0")
     
