@@ -521,7 +521,7 @@ def flatblade(c, beta, N, plot=False):
     V_i, _ = induced_velocity(params)
     V_i.block_until_ready()
     jax.profiler.stop_trace()
-
+    V_i_a = V_i[0,:,:]
     # Calculate total thrust
     T = thrust(V_i, params)
     print("Total Thrust:", T)
@@ -532,7 +532,7 @@ def flatblade(c, beta, N, plot=False):
     if plot == True:
         # Plot heatmap using structured params properties
         fig, ax = plt.subplots(subplot_kw={"projection": "polar"})
-        plt.contourf(params.psi, params.r, V_i, cmap='viridis')
+        plt.contourf(params.psi, params.r, V_i_a, cmap='viridis')
         plt.colorbar(label='Induced Velocity [m/s]')
         plt.xlabel('X [m]')
         plt.ylabel('Y [m]')

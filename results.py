@@ -506,7 +506,7 @@ if __name__ == "__main__":
             params_cond = eqx.tree_at(
                 lambda p: (p.omega, p.V_x, p.V_yz), 
                 params_base, 
-                (jnp.array([cond_omega]), jnp.array([cond_Vx]), jnp.array([cond_Vyz]))
+                (jnp.squeeze(cond_omega), jnp.squeeze(cond_Vx), jnp.squeeze(cond_Vyz))
             )
             
             # This guarantees that geometry changes (e.g. from smoothing) propagate into V_i.
@@ -514,7 +514,7 @@ if __name__ == "__main__":
 
             # write solved V_i_0 into params
             params_cond = eqx.tree_at(
-                lambda p: p.V_ia_0, 
+                lambda p: p.V_i_0, 
                 params_cond, 
                 V_i_0_solved
             )
