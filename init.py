@@ -28,7 +28,7 @@ class Inputs(eqx.Module):
     solve_omega: int = 0 # 0: No. 1: Objective
 
     # Discretisation settings
-    n_r: int = 50
+    n_r: int = 10
     n_psi: int = 12
 
     # Diagnostics
@@ -40,20 +40,19 @@ class Inputs(eqx.Module):
     R_hub: float = 0.025
 
     # Flight Conditions
-    n_cond: int = 1
+    n_cond: int = 2
     thrust_target = jnp.array([22.5, 29.6])
     V_x = jnp.array([0.0, 8.60])
     V_yz = jnp.array([0.0, 12.29])
     omega = jnp.array([420.0, 535.0])
+    #solve_omega = jnp.array([0, 1]) #TODO: Implement "omega screen" for solving.
     objective_weight = jnp.array([0.2,0.8])
-
-    # Flight Condition Inflow Array
-
 
     # Motor Information
     I_0: float = 0.7           
     R_m: float = 0.120         
-    k_V: float = 150
+    kV: float = 150
+    P_max: float = 3000
 
     # Aerodynamic Models Selection
     inflow_model: int = 1
@@ -170,7 +169,7 @@ def build_default_propeller(c: float = 0.02, beta: float = 10.0, inputs: Inputs 
     if inputs is None:
         inputs = Inputs()
 
-    # Geometry constraints
+    # Geometry Scales
     c_scale = 0.2                   
     beta_scale = jnp.radians(50)    
 

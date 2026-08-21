@@ -1,4 +1,4 @@
-## Define All Aerodynamic Properties for Given Propeller Geometry
+## Define All Physical Properties for Given Propeller Geometry
 
 # External Libraries
 import jax
@@ -16,6 +16,61 @@ import matplotlib.pyplot as plt
 from init import build_default_propeller, Inputs, Params
 from airfoil import aero_coeffs
 from airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskEfficiency, resultantVelocityComponents, high_induction_correction
+
+def minimumInducedLossCost(V_i, params):
+    """
+    Returns a DIMENSIONLESS cost measuring deviation from the Betz uniform-inflow
+    condition (coefficient of variation, weighted toward the tip).
+    Inputs:
+        V_i: shape = (3, Nr, Npsi)
+
+    TODO: Evaluate if depreciated with new power implementations, update to V_i
+    """
+    # Unpack Induced Velocity
+    V_ia = V_i[0]
+    # Global mean over disk (scalar)
+    mean_V_ia = jnp.mean(V_ia)
+
+    # Safe denominator: avoid divide-by-zero for near-unloaded blades
+    mean_V_ia_safe = jnp.maximum(jnp.abs(mean_V_ia), 1e-3)
+
+    # Normalised squared error at every (r, psi) station — dimensionless
+    sq_err_normalised = ((V_ia - mean_V_ia) / mean_V_ia_safe) ** 2
+
+    # Collapse azimuthal axis → radial profile (Nr,)
+    radial_sq_err = jnp.mean(sq_err_normalised, axis=1)
+
+    # Outer annuli carry more of the wake energy
+    r_norm = params.r / jnp.max(params.r)
+    weighted_sq_err = radial_sq_err * r_norm
+
+    # RMS over radial stations — O(0.1–0.5) for a realistic propeller in forward flight
+    rms_err = jnp.sqrt(jnp.mean(weighted_sq_err))
+
+    return rms_err
+
+def motorPower(torque: float, omega: float, I_0: float = 0.7, R_m: float = 0.120, kV: float = 150):
+    """
+    Calcualtes Power Consumption required of the motor to drive the propeller
+
+    Inputs:
+        torque: torque of the motor (Nm)
+        omega: rotational rate of the motor (rad/s)
+        I_0: zero load current (A)
+        R_m: Coil resistance (ohms)
+        kV: motor speed constant (RPM/volt)
+    """
+    P_out = torque*omega
+
+    K_t = 60 / (2*jnp.pi*kV) # Calculate the torque constant (Nm/A)
+
+    I = torque / K_t # calculate the current consumed by the motor
+
+    V = omega*60/(2*jnp.pi) / kV
+
+    P_in = P_out + R_m * (I+I_0)**2 + V*I_0
+
+    return P_in
 
 ## Blade Element Theory 
 def dT_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):

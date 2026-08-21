@@ -529,10 +529,10 @@ def propgeomblender(timestamps, weights):
     return inputs, params
 
 if __name__ == "__main__":
+
     import proptimiser
-    import geometry
-    import matplotlib
     from matplotlib.animation import FuncAnimation
+
     # pass the base name/timestamp
     timestamps = ["20260629-0117.eqx"]
     weights = np.array([1.0])
