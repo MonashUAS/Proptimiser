@@ -546,7 +546,7 @@ if __name__ == "__main__":
     import results 
 
     # Load the saved aerodynamic propeller
-    prop_filename = "Redback V2" 
+    prop_filename = "Currawong_V1" 
     inputs, params = results.loadprop(prop_filename)
     
     r = np.array(params.r)

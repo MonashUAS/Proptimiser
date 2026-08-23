@@ -534,11 +534,17 @@ if __name__ == "__main__":
     from matplotlib.animation import FuncAnimation
 
     # pass the base name/timestamp
-    timestamps = ["20260629-0117.eqx"]
+    timestamps = ["Currawong_V1.eqx"]
     weights = np.array([1.0])
     # unit test propeller
-    params_base = propmodel.build_default_propeller()
-    inputs = init.Inputs # comment out to use flight conditions from propeller file
+    #inputs, params_base, _, _ = propmodel.apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0", plot=False)
+    inputs = init.Inputs() # comment out to use flight conditions from propeller file
+    inputs.save_state("prop_inputs_Currawong_V1")
+    # geometry blend of n propellers
+    inputs, params_base = propgeomblender(timestamps, weights) 
+
+
+
     print(f"--- Evaluating {inputs.n_cond} Flight Conditions ---")
 
     # Execution & Processing Loop

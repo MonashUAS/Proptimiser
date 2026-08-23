@@ -396,9 +396,6 @@ def get_velocity_scales(params):
     # Radial Scale: Tip Speed (Centrifugal reference)
     V_tip = params.omega * Inputs.R_tip
 
-    # Protect against zero-torque states (e.g., if thrust target is 0)
-    V_it_mean = jnp.maximum(V_it_mean, 1e-4)
-
     # Stack and reshape to (3, 1) so it broadcasts perfectly with (3, n_r)
     return jnp.array([V_ia_mean, V_it_mean, V_tip])[:, None]
 
@@ -423,6 +420,7 @@ def induced_velocity(params):
         maxiter=Inputs.V_i_0_max_iter, 
         tol=Inputs.V_i_0_eps, 
         implicit_diff=True,
+        jit = True,
         verbose = Inputs.verbose
     )
     
@@ -644,35 +642,23 @@ def apc_model(filepath, plot=True):
         (c_interp, beta_interp)
     )
     
-    print("Solving Induced Velocity Field...")
     # Solve Induced Velocity
-    V_ia, V_ia_0 = induced_velocity(params)
+    V_i, V_i_0 = induced_velocity(params)
     
     # Update params with solved state
-    params = eqx.tree_at(lambda p: p.V_ia_0, params, V_ia_0)
+    params = eqx.tree_at(lambda p: p.V_i_0, params, V_i_0)
 
     # Calculate overall performance metrics
-    T = thrust(V_ia, params)
-    P_mech = mechanicalPower(V_ia, params)
-    print(f"--- Solve Complete ---")
-    print(f"Thrust: {T:.4f} N | Mechanical Power: {P_mech:.4f} W")
+    T = thrust(V_i, params)
+    P_mech = mechanicalPower(V_i, params)
 
     # Plotting via LivePropPlotter
     if plot:
         print("Launching LivePropPlotter canvas...")
         gui_queue = queue.Queue()
         plotter = results.LivePropPlotter(params)
-        tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
-        F_curr = jnp.multiply(tip_loss, root_loss)
-        # Build the frame data dictionary expected by LivePropPlotter.update()
-        frame_data = {
-            'c': params.c * 1000,
-            'beta': jnp.degrees(params.beta),
-            'error_log': params.error_log,
-            'V_ia': V_ia,
-            'F_loss': F_curr  # Map this key to your Prandtl tip/root total loss array
-        }
-        gui_queue.put(frame_data)
+
+        gui_queue.put(params)
         
         ani = FuncAnimation(
             plotter.fig, 
@@ -689,46 +675,7 @@ def apc_model(filepath, plot=True):
 
         dummy = input("Done with plots?")
 
-    return params, V_ia, T
+    return inputs, params, V_i_0, T
 
 if __name__ == "__main__":
-
-    flatblade(0.05, 0.1, 2, plot=True)
-#     import apcpropanalysis
-#     apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0")
-#     rpm_data = apcpropanalysis.parse_apc_dat("apc_prop_data/performance_data/PER3_20x8.dat")
-#     # Extract as raw scalar floats instead of numpy arrays
-#     target_rpm = float(np.squeeze(Inputs.omega / 0.1047))
-#     target_V = float(np.squeeze(Inputs.V_x))
-
-#     if rpm_data:
-#         # Find the closest RPM block (broadcasting works flawlessly with scalar targets)
-#         available_rpms = np.array(list(rpm_data.keys()))
-#         closest_rpm = available_rpms[np.argmin(np.abs(available_rpms - target_rpm))]
-        
-#         # Extract the data matrix for the closest RPM
-#         matrix = rpm_data[closest_rpm]
-        
-#         # Convert the file's velocity column (mph) to m/s
-#         V_ms = matrix[:, 0] * 0.44704
-        
-#         # Find the closest velocity row within this specific RPM block
-#         closest_v_idx = np.argmin(np.abs(V_ms - target_V))
-        
-#         # Extract performance metrics
-#         matched_V = V_ms[closest_v_idx]
-#         extracted_thrust = matrix[closest_v_idx, 10]  
-#         extracted_eff = matrix[closest_v_idx, 2]      
-#         extracted_power = matrix[closest_v_idx, 8]    
-
-#         # --- 4. Print Summary Cleanly ---
-#         print("\n" + "="*45)
-#         print("      APC PERFORMANCE DATA EXTRACTION")
-#         print("="*45)
-#         print(f"Target Conditions:  {target_rpm:.2f} RPM  |  {target_V:.2f} m/s")
-#         print(f"Closest APC Match:  {closest_rpm} RPM  |  {matched_V:.2f} m/s")
-#         print("-"*45)
-#         print(f"Extracted Thrust:   {extracted_thrust:.4f} N")
-#         print(f"Extracted Efficiency: {extracted_eff * 100:.2f}% (Pe)")
-#         print(f"Extracted Power:    {extracted_power:.2f} W")
-#         print("="*45)
+    params, V_i_0, T = apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0", plot=True)

@@ -16,19 +16,19 @@ import geometry
 class Inputs(eqx.Module):
     # Outer-loop Optimisation (Currently only L-BFGS-B works)
     opt_solver: str = "L-BFGS-B"
-    opt_max_iter: int = 1000
-    opt_tol: float = 1e-2 
+    opt_max_iter: int = 2000
+    opt_tol: float = 1e-4
 
     # Induced Velocity Settings
-    V_i_0_max_iter: int = 300
-    V_i_0_eps: float = 5e-1
+    V_i_0_max_iter: int = 500
+    V_i_0_eps: float = 5e-2
 
     # Solver Type
-    bemt_type: int = 1 # 0: Thrust (axial), 1: Thrust+Torque (axial+tangential)
+    bemt_type: int = 0 # 0: Thrust (axial), 1: Thrust+Torque (axial+tangential)
     solve_omega: int = 0 # 0: No. 1: Objective
 
     # Discretisation settings
-    n_r: int = 10
+    n_r: int = 8
     n_psi: int = 12
 
     # Diagnostics
@@ -36,23 +36,23 @@ class Inputs(eqx.Module):
     jax_tracing: bool = False
 
     # Geometry Setup
-    R_tip: float = 0.25
+    R_tip: float = 0.275
     R_hub: float = 0.025
 
     # Flight Conditions
     n_cond: int = 2
-    thrust_target = jnp.array([22.5, 29.6])
-    V_x = jnp.array([0.0, 8.60])
-    V_yz = jnp.array([0.0, 12.29])
-    omega = jnp.array([420.0, 535.0])
+    thrust_target = jnp.array([15.9, 70.0])
+    V_x = jnp.array([18.0, 0.8])
+    V_yz = jnp.array([3.0, 3.0])
+    omega = jnp.array([588.0, 650.0])
     #solve_omega = jnp.array([0, 1]) #TODO: Implement "omega screen" for solving.
-    objective_weight = jnp.array([0.2,0.8])
+    objective_weight = jnp.array([0.9,0.1])
 
     # Motor Information
-    I_0: float = 0.7           
-    R_m: float = 0.120         
-    kV: float = 150
-    P_max: float = 3000
+    I_0: float = 2.0          
+    R_m: float = 0.037         
+    kV: float = 220
+    P_max: float = 3300
 
     # Aerodynamic Models Selection
     inflow_model: int = 1
@@ -242,46 +242,11 @@ if __name__ == "__main__":
 
     # Internal Imports
     import proptimiser
+    import propmodel
     import results
     import geometry
 
-    ## Import APC propeller for initial geom
-    import apcpropanalysis
-    
-    apc_geom = apcpropanalysis.parse_apc_pe0("apc_prop_data/propgeom_data/20x8-PERF.PE0")
-    
-    # Unpack the specific geometry fields needed
-    r_apc_in = apc_geom["r"]
-    c_apc_in = apc_geom["chord"]
-    beta_apc_deg = apc_geom["twist_deg"]
-    airfoil_apc = "clarky"
-
-    # Convert inches to meters and degrees to radians to match JAX solver SI units
-    r_apc_m = jnp.array(r_apc_in) * 0.0254
-    c_apc_m = jnp.array(c_apc_in) * 0.0254
-    beta_apc_rad = jnp.radians(jnp.array(beta_apc_deg))
-
-    # Configure default inputs to match the physical boundaries of the APC prop
-    inputs = Inputs()
-    inputs = eqx.tree_at(
-        lambda i: (i.R_hub, i.R_tip), 
-        inputs, 
-        (r_apc_m.min(), r_apc_m.max())
-    )
-    
-    # Build baseline structure
-    params = build_default_propeller(inputs=inputs, airfoil_name=airfoil_apc)
-
-    # Interpolate APC geometry onto the solver's discretized radial array
-    c_interp = jnp.interp(params.r, r_apc_m, c_apc_m)
-    beta_interp = jnp.interp(params.r, r_apc_m, beta_apc_rad)
-
-    # Inject the mapped geometry into the Params tree
-    params_init = eqx.tree_at(
-        lambda p: (p.c, p.beta),
-        params,
-        (c_interp, beta_interp)
-    )
+    params_init, _, _ = propmodel.apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0", plot=False)
 
     print(f"Initialised airfoil interpolation with airfoil {params_init.airfoil}")
 
@@ -289,7 +254,9 @@ if __name__ == "__main__":
     print("Setting up live visualization canvas...")
     gui_queue = queue.Queue()
     plotter = results.LivePropPlotter(params_init)
+    gui_queue.put(params_init)
 
+    # Jax Profiling (optional)
     if Inputs.jax_tracing:
         print("Starting Profiler...")
         jax.profiler.start_trace("/tmp/jax_trace")
