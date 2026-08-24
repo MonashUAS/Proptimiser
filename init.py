@@ -34,7 +34,7 @@ class Inputs(eqx.Module):
     opt_tol: float = 1e-2 
 
     # Induced Velocity Settings
-    V_ia_0_max_iter: int = 500
+    V_ia_0_max_iter: int = 300
     V_ia_0_eps: float = 5e-3
 
     # Solver Type
@@ -55,10 +55,10 @@ class Inputs(eqx.Module):
 
     # Flight Conditions
     n_cond: int = 2
-    thrust_target = jnp.array([15.9,100.0])
+    thrust_target = jnp.array([15.9,70.0])
     V_x = jnp.array([18.0,0.8])
     V_yz = jnp.array([3.0,3.0])
-    omega = jnp.array([588.0,727.0])
+    omega = jnp.array([588.0,680.0])
     objective_weight = jnp.array([0.9,0.1])
 
     # Motor Information
@@ -70,9 +70,9 @@ class Inputs(eqx.Module):
     # Aerodynamic Models Selection
     inflow_model: int = 1
     coeff_method: int = 3 # 0: Parametric, 1: 2D Interp, 2: 3D Interp, 3: NeuralFoil
-    tip_loss_model: int = 0 # 0: No Loss 1: Prandtl
-    root_loss_model: int = 0
-    rot_corr_model: int = 0 # 3D inflow correction model
+    tip_loss_model: int = 1 # 0: No Loss 1: Prandtl
+    root_loss_model: int = 1
+    rot_corr_model: int = 1 # 3D inflow correction model
     high_induction_model: int = 0 # (0: Classical Momentum, 1: Buhl Correction) NOT USEFUL FOR REGULAR FLIGHT
 
     def save_state(self, filename: str = "inputs_state.eqx"):

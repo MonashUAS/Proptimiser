@@ -55,7 +55,7 @@ def objectives(params):
     rms_MIL_err = minimumInducedLossCost(V_ia, params)            # minimum induced loss condition root mean square error
     
     # calculate the motor power
-    motor_power = propmodel.motorPower(torque, params.omega, I_0 = Inputs.I_0, R_m = Inputs.R_m, k_V = Inputs.kV)
+    motor_power = propmodel.motorPower(torque, params.omega, I_0 = Inputs.I_0, R_m = Inputs.R_m, kV = Inputs.kV)
 
     # Return V_ia_0 so we can catch it!
     return motor_power, thrust, rms_MIL_err, V_ia_0 

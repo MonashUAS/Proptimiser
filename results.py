@@ -486,11 +486,13 @@ if __name__ == "__main__":
     import proptimiser
     from matplotlib.animation import FuncAnimation
     # pass the base name/timestamp
-    timestamps = ["currawong_v0.eqx"]
+    timestamps = ["Currawong_V1.eqx"]
     weights = np.array([1.0])
     # Blending with multiple propeller geometries
     inputs, params_base = propgeomblender(timestamps, weights)
-    inputs = init.Inputs() # comment out to use flight conditions from propeller file
+    
+    #params_base, _, _ = propmodel.apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0", plot=False)
+    #inputs = init.Inputs() # comment out to use flight conditions from propeller file
 
     print(f"--- Evaluating {inputs.n_cond} Flight Conditions ---")
 

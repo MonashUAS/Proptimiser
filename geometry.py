@@ -546,7 +546,7 @@ if __name__ == "__main__":
     import results 
 
     # Load the saved aerodynamic propeller
-    prop_filename = "Redback V2" 
+    prop_filename = "Currawong_V1" 
     inputs, params = results.loadprop(prop_filename)
     
     r = np.array(params.r)
@@ -565,7 +565,7 @@ if __name__ == "__main__":
     r_foils = np.array([0.0, R_hub, R_aero, r[len(r)//2], r[-1]])
     
     # Overwrite the structural root on the 3D arrays
-    HUB_CHORD = 0.03
+    HUB_CHORD = 0.025
     c, beta, pitch_axis_array = overwrite_hub_planform(
         r, c, beta, r_foils, 
         hub_chord=HUB_CHORD, hub_twist=0.0, aero_pitch_axis=0.25

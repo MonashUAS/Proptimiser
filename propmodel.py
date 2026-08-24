@@ -345,11 +345,11 @@ def motorPower(torque: float, omega: float, I_0: float = 0.7, R_m: float = 0.120
     """
     P_out = torque*omega
 
-    K_t = 60 / (2*jnp.pi*k_V) # Calculate the torque constant (Nm/A)
+    K_t = 60 / (2*jnp.pi*kV) # Calculate the torque constant (Nm/A)
 
     I = torque / K_t # calculate the current consumed by the motor
 
-    V = omega*60/(2*jnp.pi) / k_V
+    V = omega*60/(2*jnp.pi) / kV
 
     P_in = P_out + R_m * (I+I_0)**2 + V*I_0
 
@@ -485,13 +485,19 @@ def apc_model(filepath, plot=True):
     r_apc_m = jnp.array(r_apc_in) * 0.0254
     c_apc_m = jnp.array(c_apc_in) * 0.0254
     beta_apc_rad = jnp.radians(jnp.array(beta_apc_deg))
+    
+    # filter hub geometry
+    inputs = Inputs()
+
+    c_apc_m = c_apc_m[r_apc_m>inputs.R_hub]
+    beta_apc_rad = beta_apc_rad[r_apc_m>inputs.R_hub]
+    r_apc_m = r_apc_m[r_apc_m>inputs.R_hub]
 
     # Configure default inputs to match the physical boundaries of the APC prop
-    inputs = Inputs()
     inputs = eqx.tree_at(
-        lambda i: (i.R_hub, i.R_tip), 
+        lambda i: (i.R_tip), 
         inputs, 
-        (r_apc_m.min(), r_apc_m.max())
+        (r_apc_m.max())
     )
     
     # Build baseline structure
@@ -517,7 +523,7 @@ def apc_model(filepath, plot=True):
 
     # Calculate overall performance metrics
     T = thrust(V_ia, params)
-    P_mech = motorPower(V_ia, params)
+    P_mech = 0.0
     print(f"--- Solve Complete ---")
     print(f"Thrust: {T:.4f} N | Motor Power: {P_mech:.4f} W")
 
@@ -526,9 +532,6 @@ def apc_model(filepath, plot=True):
         print("Launching LivePropPlotter canvas...")
         gui_queue = queue.Queue()
         plotter = results.LivePropPlotter(params)
-        tip_loss, root_loss = tip_root_loss_factors(V_ia, params)
-        F_curr = jnp.multiply(tip_loss, root_loss) 
-
         gui_queue.put(params)
         
         ani = FuncAnimation(
