@@ -20,11 +20,11 @@ class Inputs(eqx.Module):
     opt_tol: float = 1e-4
 
     # Induced Velocity Settings
-    V_i_0_max_iter: int = 500
+    V_i_0_max_iter: int = 1000
     V_i_0_eps: float = 5e-2
 
     # Solver Type
-    bemt_type = jnp.array([1, 0, 0],dtype=bool) # (V_ia,V_it,V_ir)
+    bemt_type = jnp.array([1, 1, 0],dtype=bool) # (V_ia,V_it,V_ir)
     solve_omega: int = 0 # 0: No. 1: Objective
 
     # Discretisation settings
@@ -55,10 +55,10 @@ class Inputs(eqx.Module):
     P_max: float = 3300
 
     # Aerodynamic Models Selection
-    inflow_model: int = 1
+    inflow_model: int = 1   #0: Simple 1: Pitt-Peters
     coeff_method: int = 3 # 0: Parametric, 1: 2D Interp, 2: 3D Interp, 3: NeuralFoil
     tip_loss_model: int = 1 # 0: No Loss 1: Prandtl
-    root_loss_model: int = 1
+    root_loss_model: int = 1 # 0: No Loss 1: Prandtl
     rot_corr_model: int = 1 # 3D inflow correction model
     high_induction_model: int = 0 # (0: Classical Momentum, 1: Buhl Correction) NOT USEFUL FOR REGULAR FLIGHT
 
@@ -128,10 +128,13 @@ class Params(eqx.Module):
     airfoil: str = eqx.field(static=True) # Strings must be static
     airfoil_interp: callable = eqx.field(static=True)
 
+    # Parametric Airfoil Constants
+    #TODO: Implement parsing into airfoil.py to quickly evaluate new foils.
+
     # Aerodynamic Constants
     rho: float = 1.225          # air density (kgm^{-3})
     mu: float = 1.798e-5        # air viscosity (kgm^-1s^-1)
-    a: float = 343.0            # speed of sound (m/s)      
+    a: float = 343.0            # speed of sound (m/s)     
 
     def save_state(self, filename: str = "params_state.eqx"):
         
@@ -190,7 +193,7 @@ def build_default_propeller(c: float = 0.02, beta: float = 10.0, inputs: Inputs 
     v_h = jnp.sqrt(inputs.thrust_target[0] / (2.0 * Params.rho * A))
     # General axial induced velocity including forward flight velocity
     V_ia_mean = -inputs.V_x[0] / 2.0 + jnp.sqrt((inputs.V_x[0] / 2.0)**2 + v_h**2)
-    V_ia_0 = jnp.full((inputs.n_r,), 5)
+    V_ia_0 = jnp.full((inputs.n_r,), V_ia_mean)
 
     # Tangential Inflow Guess (Ideal Angular Momentum)
     # Estimate ideal power and torque to find mean swirl velocity

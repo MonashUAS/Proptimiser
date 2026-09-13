@@ -5,15 +5,15 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 import jaxopt
-from dataclasses import replace
 
-import numpy as np
 import matplotlib.pyplot as plt
 
 # Internal Libraries
 from init import build_default_propeller, Inputs, Params
 from airfoil import aero_coeffs
 from airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskEfficiency, resultantVelocityComponents, high_induction_correction
+
+jax.config.update("jax_enable_x64", True)
 
 def minimumInducedLossCost(V_i, params):
     """
@@ -70,7 +70,8 @@ def motorPower(torque: float, omega: float, I_0: float = 0.7, R_m: float = 0.120
 
     return P_in
 
-## Blade Element Theory 
+## Blade Element Theory
+
 def dT_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
     """
     Calculates instantaneous thrust at each radial and azimuthal station, 
@@ -107,11 +108,10 @@ def dT_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
     # Average thrust in each annulus over one rotation
     dT_blade_ave = N / (2 * jnp.pi) * jnp.trapezoid(dT_blade_instantaneous, x=psi, axis=1)
 
-    if Inputs.verbose:
-        jax.debug.print("dT_blade: {dT_blade_ave}", dT_blade=dT_blade_ave)
-        
+    if Inputs.verbose>1:
+        jax.debug.print("dT_blade: {dT_blade_ave}", dT_blade_ave=dT_blade_ave)
+    
     return dT_blade_ave
-
 
 def dH_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
     """
@@ -150,7 +150,6 @@ def dH_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
     
     # Calculate the total prandtl loss correction factor
     F = jnp.multiply(tip_loss, root_loss)
-    F = jnp.clip(F, min=0.05, max=1.0) # clip to prevent div by zero
 
     # Inner integral term
     inner = (V_R**2) * (C_L * jnp.sin(phi) + C_D * jnp.cos(phi))
@@ -204,7 +203,7 @@ def dQ_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
 
 
 ### Momentum Theory
-def dT_momentum(V_i: jnp.ndarray, params: Params, debug: bool = False):
+def dT_momentum(V_i: jnp.ndarray, params: Params, debug: bool = False, apply_tip_loss: bool = True):
     """
     Calculates instantaneous thrust at each radial and azimuthal station, 
     and calculates the average thrust in each annulus over a rotation.
@@ -236,10 +235,12 @@ def dT_momentum(V_i: jnp.ndarray, params: Params, debug: bool = False):
 
     V_R, phi = resultantVelocityComponents(V_i, params)
 
-    # Tip and Root Loss Factors
-    tip_loss, root_loss = tip_root_loss_factors(phi, params)
-    F = jnp.multiply(tip_loss, root_loss) 
-    F = jnp.clip(F, min=0.05, max=1.0) # clip to prevent div by zero
+    if apply_tip_loss:
+        tip_loss, root_loss = tip_root_loss_factors(phi, params)
+        F = jnp.multiply(tip_loss, root_loss)
+        F = jnp.clip(F, min=0.05, max=1.0)
+    else:
+        F = jnp.ones_like(V_ia)   # smooth, well-scaled system for the solve
 
     # Compute baseline classical momentum element locally
     V_prime = jnp.sqrt((V_x + V_ia) ** 2 + V_yz ** 2)
@@ -260,7 +261,7 @@ def dT_momentum(V_i: jnp.ndarray, params: Params, debug: bool = False):
 
     return dT_momentum_ave
 
-def dQ_momentum(V_i, params, debug=False):
+def dQ_momentum(V_i, params, debug=False, apply_tip_loss=True):
     """
     Calculates instantaneous torque at each radial and azimuthal station, 
     and calculate the average torque in each annulus over a rotation
@@ -288,11 +289,13 @@ def dQ_momentum(V_i, params, debug=False):
     rho = params.rho
 
     V_R, phi = resultantVelocityComponents(V_i, params)
-
-    # Tip and Root Loss Factors
-    tip_loss, root_loss = tip_root_loss_factors(phi, params)
-    F = jnp.multiply(tip_loss, root_loss) 
-    F = jnp.clip(F, min=0.05, max=1.0) # clip to prevent div by zero
+   
+    if apply_tip_loss:
+        tip_loss, root_loss = tip_root_loss_factors(phi, params)
+        F = jnp.multiply(tip_loss, root_loss)
+        F = jnp.clip(F, min=0.05, max=1.0)
+    else:
+        F = jnp.ones_like(V_ia)   # smooth, well-scaled system for the solve
 
     # Compute baseline classical momentum element locally
     # Uses V_prime to account for skewed wake mass flux (Nahon 2015)
@@ -320,8 +323,7 @@ def thrust_residual(V_i, params):
     Returns array of shape (n_r,)
     """
     dT_BEMT_avg = dT_blade(V_i, params, debug=False)
-    dT_MMNT_avg = dT_momentum(V_i, params, debug=False)
-    
+    dT_MMNT_avg = dT_momentum(V_i, params, debug=False, apply_tip_loss=False)   # smooth for the solve
     return dT_BEMT_avg - dT_MMNT_avg
 
 def torque_residual(V_i, params):
@@ -329,9 +331,8 @@ def torque_residual(V_i, params):
     Calculates the 1D torque residual (BEMT vs Momentum) across radial stops.
     Returns array of shape (n_r,)
     """
-    dQ_BEMT_avg  = dQ_blade(V_i, params, debug=False)
-    dQ_MMNT_avg = dQ_momentum(V_i, params, debug=False)
-    
+    dQ_BEMT_avg = dQ_blade(V_i, params, debug=False)
+    dQ_MMNT_avg = dQ_momentum(V_i, params, debug=False, apply_tip_loss=False)
     return dQ_BEMT_avg - dQ_MMNT_avg
 
 def bemt_residuals(lambda_i_0_guess, params):
@@ -341,7 +342,7 @@ def bemt_residuals(lambda_i_0_guess, params):
     """
     # Retrieve scales and Re-dimensionalise
     V_scale = get_velocity_scales(params)
-    V_i_0_guess_dim = lambda_i_0_guess #* V_scale
+    V_i_0_guess_dim = lambda_i_0_guess * V_scale
 
     # Introduce zero for non-solved components to maintain shape (3, n_r)
     V_i_0_guess_dim = jnp.zeros_like(params.V_i_0).at[Inputs.bemt_type].set(V_i_0_guess_dim)
@@ -351,21 +352,20 @@ def bemt_residuals(lambda_i_0_guess, params):
 
     # Axial Residual (Scale by Thrust Target)
     dT_res_physical = thrust_residual(V_i, params)
-    dT_res = dT_res_physical #/ params.thrust_target
+    dT_res = dT_res_physical / params.thrust_target
     
-    # Radial Residual (Already O(1))
-    dR_res = lambda_i_0_guess[2]
+    # Radial Residual (Already O(1)) TODO: 
+    dR_res = jnp.zeros_like(lambda_i_0_guess[0])
 
     # Tangential Residual (Scale by Approximate Ideal Torque)
     dQ_res_physical = torque_residual(V_i, params)
 
     # Scale by an approximate ideal torque to make O(1)
     Q_ref = params.thrust_target * Inputs.R_tip 
-    dQ_res = dQ_res_physical #/ Q_ref
+    dQ_res = dQ_res_physical / Q_ref
 
-    # residual vector of shape (3, n_r)
-    res = jnp.stack([dT_res, dQ_res, dR_res], axis=0)
-
+    res_components = {0: dT_res, 1: dQ_res, 2: dR_res}
+    res = jnp.stack([res_components[i] for i in range(3)], axis=0)
     # filter out non-solved components
     res_filtered = res[Inputs.bemt_type]
     
@@ -408,7 +408,7 @@ def induced_velocity(params):
 
     # Non-Dimensionalise Initial Guess Component-Wise
     V_scale = get_velocity_scales(params)
-    initial_guess_lambda = V_i_0_guess_physical #/ V_scale
+    initial_guess_lambda = V_i_0_guess_physical / V_scale
 
     # Broyden Solver Call
     solver = jaxopt.Broyden(
@@ -416,7 +416,7 @@ def induced_velocity(params):
         maxiter=Inputs.V_i_0_max_iter, 
         tol=Inputs.V_i_0_eps,
         implicit_diff=True,
-        implicit_diff_solve=jaxopt.linear_solve.solve_gmres,
+        implicit_diff_solve=jaxopt.linear_solve.solve_lu,
         jit = True,
         verbose = Inputs.verbose
     )
@@ -424,7 +424,7 @@ def induced_velocity(params):
     (lambda_i_0, info) = solver.run(initial_guess_lambda, params)
 
     # Re-dimensionalise the converged solution
-    V_i_0 = lambda_i_0 #* V_scale
+    V_i_0 = lambda_i_0 * V_scale
 
     # re-add non solver components to the solution vector
     V_i_0 = jnp.zeros_like(params.V_i_0).at[Inputs.bemt_type].set(V_i_0)
@@ -447,6 +447,7 @@ def torque(V_i, params, debug=False):
         V_i        <- Induced velocity at each radial and azimuthal station
         params      <- Params object used in the optimisation loop, remains unmodified by function execution
         debug       <- Boolean to select whether or not to print debug information when function is called
+        apply_tip_loss <- Boolean to select whether or not to apply tip loss correction when calculating torque
 
     Outputs:
         Q <- Net torque per rotation of the propeller
@@ -458,7 +459,7 @@ def torque(V_i, params, debug=False):
     r = params.r
 
     # Get the average torque per rotation in each annulus using the dQ_blade function
-    dQ_blade_ave = dQ_blade(V_i, params, debug)
+    dQ_blade_ave = dQ_momentum(V_i, params, debug, apply_tip_loss=True)   # accurate, applied post-solve
 
     # Use trapezoidal integration in the radial direction to compute the total torque
     Q = jnp.trapezoid(dQ_blade_ave, x=r)
@@ -470,7 +471,8 @@ def thrust(V_i, params):
     Calculate total thrust from solved induced velocity
     '''
     r = params.r
-    dT = dT_momentum(V_i, params)
+    
+    dT = dT_momentum(V_i, params, apply_tip_loss=True)   # accurate, applied post-solve
 
     # Numerically Compute Double Integral to Solve for Thrust
     T = jnp.trapezoid(dT, x=r)
@@ -614,7 +616,7 @@ def apc_model(filepath, plot=True):
     r_apc_in = apc_geom["r"]
     c_apc_in = apc_geom["chord"]
     beta_apc_deg = apc_geom["twist_deg"]
-    airfoil_apc = "clarky"
+    airfoil_apc = "arad10"
     
     # Convert inches to meters and degrees to radians to match JAX solver SI units
     r_apc_m = jnp.array(r_apc_in) * 0.0254
@@ -668,7 +670,6 @@ def apc_model(filepath, plot=True):
             interval=200, 
             cache_frame_data=False,
             blit=False
-
         )
         plt.show()
 

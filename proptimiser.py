@@ -55,7 +55,6 @@ def total_cost(vars_scaled, params_struct):
     '''
     Total cost of all n conditions specified in Inputs.
     '''
-    
     # Update parameters struct with new geometry and control points
     params_struct = apply_vars_to_struct(vars_scaled, params_struct)
 

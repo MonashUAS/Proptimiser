@@ -1,6 +1,10 @@
+# external imports
 import jax.numpy as jnp
-from init import Inputs
+import jax
 from jax import lax
+
+# Internal Inputs
+from init import Inputs
 
 ##  Dimensionless Constants 
 def calc_mach(V, a):
@@ -105,37 +109,34 @@ def simple_inflow(V_i_0, params):
     return V_i
 
 def pitt_peters(V_i_0, params):
-    ''' 
-    Computes skewed rotor inflow using the Pitt & Peters (1981) model.
+    '''
+    Pitt Peters inflow model for skewed inflow conditions.
 
     Takes in V_i_0 of shape (3, N_r)
+
     Output: V_i of shape (3, N_r, N_psi)
     '''
     V_x, V_yz, r, psi = params.V_x, params.V_yz, params.r, params.psi
     R = Inputs.R_tip
 
-    # Wake Skew Angle
     V_ia_0 = V_i_0[0]
-    V_ia_0_mean = jnp.mean(V_ia_0)
-    xi = jnp.arctan2(V_yz, V_x + V_ia_0_mean)  # scalar
-    
-    # Compute axial skew factor grid -> shape (N_r, N_psi)
-    skew_factor = 1.0 + ((15.0 * jnp.pi) / 32.0) * jnp.tan(xi / 2.0) * (r[:, None] / R) * jnp.cos(psi[None, :])
+    xi = jnp.arctan2(V_yz, V_x + V_ia_0)          # shape (n_r,), local per station
 
-    # Apply skew factor ONLY to the axial inflow component (index 0)
-    V_i_a = V_i_0[0:1, :, None] * skew_factor[None, :, :]  # shape (1, N_r, N_psi)
-    V_i_t = jnp.broadcast_to(V_i_0[1:, :, None], (2, V_i_0.shape[1], psi.shape[0]))  # shape (2, N_r, N_psi)
+    skew_factor = 1.0 + ((15.0*jnp.pi)/32.0) * jnp.tan(xi[:, None]/2.0) * (r[:, None]/R) * jnp.cos(psi[None, :])
 
-    # Recombine components -> shape (3, N_r, N_psi)
-    V_i = jnp.concatenate([V_i_a, V_i_t], axis=0)
+    N_r, N_psi = V_i_0.shape[1], psi.shape[0]
 
-    return V_i
+    V_i_a = V_i_0[0:1, :, None] * skew_factor[None, :, :]                      # shape (1, N_r, N_psi)
+    V_i_t = jnp.broadcast_to(V_i_0[1:2, :, None], (1, N_r, N_psi))             # shape (1, N_r, N_psi)
+    V_i_r = jnp.broadcast_to(V_i_0[2:3, :, None], (1, N_r, N_psi))             # shape (1, N_r, N_psi)
+
+    return jnp.concatenate([V_i_a, V_i_t, V_i_r], axis=0)
 
 def peters_he_model(V_i_0, params):
     ''' 
     Expands the induced velocity up to a 3D state vector, allowing complete modelling of the propeller.
 
-    CURRENTLY NOT IMPLEMENTED-PITT_PETERS IS BEST MODEL
+    CURRENTLY NOT IMPLEMENTED, TOO EXPENSIVE. PITT_PETERS IS BEST MODEL FOR NOW.
     '''
 
     return simple_inflow(V_i_0, params)
@@ -163,28 +164,29 @@ def no_loss(phi, params):
     '''
     return jnp.ones_like(phi)
 
-
 def prandtl_tip_loss(phi, params):
     ''' 
     Calculates the Prandtl tip loss according to "Propeller blade element momentum theory with vortex wake deflection"
     M. K. Rwigema : https://www.icas.org/icas_archive/ICAS2010/PAPERS/434.PDF
     '''
-    eps = 1e-2
+    eps = 1e-3
     B = params.N
     r = params.r
-    R_tip = Inputs.R_tip
+    R_tip = Inputs.R_tip * 1.05
 
     abs_phi = jnp.abs(phi)
+    sin_phi_safe = jnp.maximum(jnp.sin(abs_phi), 1e-3)   #guard low-phi (rotation-dominated) stations
 
-    f_tip = (B / 2.0) * (R_tip - r[:, None]) / (r[:, None] * jnp.sin(abs_phi))
-    
-    # Clip to guarantee arccos operates within valid domain [-1, 1]
-    f = jnp.clip(jnp.exp(-f_tip), -1.0 + eps, 1.0 - eps)
-    
-    F_tip = (2.0 / jnp.pi) * jnp.arccos(f)
+    f_tip = (B / 2.0) * (R_tip - r[:, None]) / (r[:, None] * sin_phi_safe)
+
+    # Soft-saturate f_tip itself (smooth floor) rather than hard-clipping exp(-f_tip).
+    # This keeps d(F)/d(phi) finite AND continuous, instead of exactly zero past a hard cutoff.
+    f_tip_safe = jax.nn.softplus(f_tip - eps) + eps   # smooth floor near f_tip -> 0, ~linear elsewhere
+
+    f = jnp.exp(-f_tip_safe)
+    F_tip = (2.0 / jnp.pi) * jnp.arccos(jnp.clip(f, -1.0 + 1e-6, 1.0 - 1e-6))
 
     return F_tip
-
 
 def prandtl_root_loss(phi, params):
     ''' 
@@ -197,13 +199,17 @@ def prandtl_root_loss(phi, params):
     R_hub = Inputs.R_hub / 2.0
 
     abs_phi = jnp.abs(phi)
+    sin_phi_safe = jnp.maximum(jnp.sin(abs_phi), 1e-3)   #guard low-phi (rotation-dominated) stations
+
 
     f_root = (B / 2.0) * (r[:, None] - R_hub) / (r[:, None] * jnp.sin(abs_phi))
     
     # Clip to guarantee arccos operates within valid domain [-1, 1]
-    f = jnp.clip(jnp.exp(-f_root), -1.0 + eps, 1.0 - eps)
+    f_root_safe = jax.nn.softplus(f_root - eps) + eps   # smooth floor near f_tip -> 0, ~linear elsewhere
 
-    F_root = (2.0 / jnp.pi) * jnp.arccos(f)
+    f = jnp.exp(-f_root_safe)
+
+    F_root = (2.0 / jnp.pi) * jnp.arccos(jnp.clip(f, -1.0 + 1e-6, 1.0 - 1e-6))
 
     return F_root
 
