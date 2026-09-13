@@ -24,7 +24,7 @@ class Inputs(eqx.Module):
     V_i_0_eps: float = 5e-2
 
     # Solver Type
-    bemt_type: int = 0 # 0: Thrust (axial), 1: Thrust+Torque (axial+tangential)
+    bemt_type = jnp.array([1, 0, 0],dtype=bool) # (V_ia,V_it,V_ir)
     solve_omega: int = 0 # 0: No. 1: Objective
 
     # Discretisation settings
@@ -32,7 +32,7 @@ class Inputs(eqx.Module):
     n_psi: int = 12
 
     # Diagnostics
-    verbose: bool = False
+    verbose: bool = True
     jax_tracing: bool = False
 
     # Geometry Setup

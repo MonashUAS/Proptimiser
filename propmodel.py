@@ -7,8 +7,6 @@ import equinox as eqx
 import jaxopt
 from dataclasses import replace
 
-import time
-
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -348,6 +346,11 @@ def bemt_residuals(lambda_i_0_guess, params):
     V_scale = get_velocity_scales(params)
     V_i_0_guess_dim = lambda_i_0_guess * V_scale
 
+    # Introduce zero for non-solved components to maintain shape (3, n_r)
+
+    V_i_0_guess_dim = jnp.zeros_like(params.V_i_0).at[Inputs.bemt_type].set(V_i_0_guess_dim)
+
+
     # Expand to 3D grid
     V_i = inflow_model(V_i_0_guess_dim, params)
 
@@ -358,23 +361,20 @@ def bemt_residuals(lambda_i_0_guess, params):
     # Radial Residual (Already O(1))
     dR_res = lambda_i_0_guess[2] - 0.0
 
-    # Tangential Residual Branches
-    def a_dQ_res(V_i, params):
-        return lambda_i_0_guess[1] - 0.0
+    # Tangential Residual (Scale by Approximate Ideal Torque)
+    dQ_res_physical = torque_residual(V_i, params)
 
-    def at_dQ_res(V_i, params):
-        dQ_res_physical = torque_residual(V_i, params)
-        # Scale by an approximate ideal torque to make O(1)
-        Q_ref = params.thrust_target * Inputs.R_tip 
-        return dQ_res_physical / Q_ref
+    # Scale by an approximate ideal torque to make O(1)
+    Q_ref = params.thrust_target * Inputs.R_tip 
+    dQ_res = dQ_res_physical / Q_ref
 
-    dQ_res = jax.lax.switch(
-        Inputs.bemt_type, 
-        [a_dQ_res, at_dQ_res], 
-        *(V_i, params)
-    )
+    # residual vector of shape (3, n_r)
+    res = jnp.stack([dT_res, dQ_res, dR_res], axis=0)
 
-    return jnp.stack([dT_res, dQ_res, dR_res], axis=0)
+    # filter out non-solved components
+    res_filtered = res[Inputs.bemt_type]
+    
+    return res_filtered
 
 def get_velocity_scales(params):
     """
@@ -397,7 +397,9 @@ def get_velocity_scales(params):
     V_tip = params.omega * Inputs.R_tip
 
     # Stack and reshape to (3, 1) so it broadcasts perfectly with (3, n_r)
-    return jnp.array([V_ia_mean, V_it_mean, V_tip])[:, None]
+    V_scale = jnp.array([V_ia_mean, V_it_mean, V_tip])[:, None]
+    V_scale = V_scale[Inputs.bemt_type]  # Only keep the components that are being solved for
+    return V_scale
 
 @jax.jit
 def induced_velocity(params):
@@ -406,33 +408,37 @@ def induced_velocity(params):
     '''
     V_i_0_guess_physical = params.V_i_0
 
+    # Apply Induced Velocity Solver Type (remove non-solve components)
+    V_i_0_guess_physical = V_i_0_guess_physical[Inputs.bemt_type]
+
     # Non-Dimensionalise Initial Guess Component-Wise
     V_scale = get_velocity_scales(params)
     initial_guess_lambda = V_i_0_guess_physical / V_scale
-
-    if Inputs.verbose:
-        res_check = bemt_residuals(initial_guess_lambda, params)
-        jax.debug.print("Initial Residual Shape {s}", s=jnp.shape(res_check))
 
     # Broyden Solver Call
     solver = jaxopt.Broyden(
         fun=bemt_residuals, 
         maxiter=Inputs.V_i_0_max_iter, 
-        tol=Inputs.V_i_0_eps, 
+        tol=Inputs.V_i_0_eps,
         implicit_diff=True,
+        implicit_diff_solve=jaxopt.linear_solve.solve_lu,
         jit = True,
         verbose = Inputs.verbose
     )
     
     (lambda_i_0, info) = solver.run(initial_guess_lambda, params)
 
+    # Re-dimensionalise the converged solution
+    V_i_0 = lambda_i_0 * V_scale
+
+    # re-add non solver components to the solution vector
+    V_i_0 = jnp.zeros_like(params.V_i_0).at[Inputs.bemt_type].set(V_i_0)
+
     if Inputs.verbose:
         final_res = bemt_residuals(lambda_i_0, params)
         jax.debug.print("Final Residuals: {res}", res=final_res)
 
-    # Re-dimensionalise the converged solution
-    V_i_0 = lambda_i_0 * V_scale
-
+    # Expand to 3D inflow grid
     V_i = inflow_model(V_i_0, params)
 
     return V_i, V_i_0
