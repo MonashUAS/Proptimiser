@@ -190,7 +190,7 @@ def build_default_propeller(c: float = 0.02, beta: float = 10.0, inputs: Inputs 
     v_h = jnp.sqrt(inputs.thrust_target[0] / (2.0 * Params.rho * A))
     # General axial induced velocity including forward flight velocity
     V_ia_mean = -inputs.V_x[0] / 2.0 + jnp.sqrt((inputs.V_x[0] / 2.0)**2 + v_h**2)
-    V_ia_0 = jnp.full((inputs.n_r,), V_ia_mean)
+    V_ia_0 = jnp.full((inputs.n_r,), 5)
 
     # Tangential Inflow Guess (Ideal Angular Momentum)
     # Estimate ideal power and torque to find mean swirl velocity

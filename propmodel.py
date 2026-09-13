@@ -107,12 +107,9 @@ def dT_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
     # Average thrust in each annulus over one rotation
     dT_blade_ave = N / (2 * jnp.pi) * jnp.trapezoid(dT_blade_instantaneous, x=psi, axis=1)
 
-    if debug:
-        print("------dT_blade DEBUG------")
-        print("dT Shapes (inst., ave.):", (jnp.shape(dT_blade_instantaneous), jnp.shape(dT_blade_ave)))
-        print("V_i shape:", jnp.shape(V_i))
-        print("------dT_blade DEBUG------")
-
+    if Inputs.verbose:
+        jax.debug.print("dT_blade: {dT_blade_ave}", dT_blade=dT_blade_ave)
+        
     return dT_blade_ave
 
 
@@ -344,29 +341,27 @@ def bemt_residuals(lambda_i_0_guess, params):
     """
     # Retrieve scales and Re-dimensionalise
     V_scale = get_velocity_scales(params)
-    V_i_0_guess_dim = lambda_i_0_guess * V_scale
+    V_i_0_guess_dim = lambda_i_0_guess #* V_scale
 
     # Introduce zero for non-solved components to maintain shape (3, n_r)
-
     V_i_0_guess_dim = jnp.zeros_like(params.V_i_0).at[Inputs.bemt_type].set(V_i_0_guess_dim)
-
 
     # Expand to 3D grid
     V_i = inflow_model(V_i_0_guess_dim, params)
 
     # Axial Residual (Scale by Thrust Target)
     dT_res_physical = thrust_residual(V_i, params)
-    dT_res = dT_res_physical / params.thrust_target
+    dT_res = dT_res_physical #/ params.thrust_target
     
     # Radial Residual (Already O(1))
-    dR_res = lambda_i_0_guess[2] - 0.0
+    dR_res = lambda_i_0_guess[2]
 
     # Tangential Residual (Scale by Approximate Ideal Torque)
     dQ_res_physical = torque_residual(V_i, params)
 
     # Scale by an approximate ideal torque to make O(1)
     Q_ref = params.thrust_target * Inputs.R_tip 
-    dQ_res = dQ_res_physical / Q_ref
+    dQ_res = dQ_res_physical #/ Q_ref
 
     # residual vector of shape (3, n_r)
     res = jnp.stack([dT_res, dQ_res, dR_res], axis=0)
@@ -413,7 +408,7 @@ def induced_velocity(params):
 
     # Non-Dimensionalise Initial Guess Component-Wise
     V_scale = get_velocity_scales(params)
-    initial_guess_lambda = V_i_0_guess_physical / V_scale
+    initial_guess_lambda = V_i_0_guess_physical #/ V_scale
 
     # Broyden Solver Call
     solver = jaxopt.Broyden(
@@ -421,7 +416,7 @@ def induced_velocity(params):
         maxiter=Inputs.V_i_0_max_iter, 
         tol=Inputs.V_i_0_eps,
         implicit_diff=True,
-        implicit_diff_solve=jaxopt.linear_solve.solve_lu,
+        implicit_diff_solve=jaxopt.linear_solve.solve_gmres,
         jit = True,
         verbose = Inputs.verbose
     )
@@ -429,7 +424,7 @@ def induced_velocity(params):
     (lambda_i_0, info) = solver.run(initial_guess_lambda, params)
 
     # Re-dimensionalise the converged solution
-    V_i_0 = lambda_i_0 * V_scale
+    V_i_0 = lambda_i_0 #* V_scale
 
     # re-add non solver components to the solution vector
     V_i_0 = jnp.zeros_like(params.V_i_0).at[Inputs.bemt_type].set(V_i_0)
@@ -684,4 +679,4 @@ def apc_model(filepath, plot=True):
     return inputs, params, V_i_0, T
 
 if __name__ == "__main__":
-    params, V_i_0, T = apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0", plot=True)
+    inputs, params, V_i_0, T = apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0", plot=True)
