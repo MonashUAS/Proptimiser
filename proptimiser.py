@@ -1,17 +1,51 @@
 # External Imports
 import jax
 import time
+import sys
+import signal
+import threading
 import jax.numpy as jnp
 import jaxopt
-import matplotlib.pyplot as plt
 from dataclasses import replace
-from jax import lax
 import equinox as eqx
 from abc import ABC, abstractmethod
 
 # Internal Imports
 from init import Inputs
 import propmodel
+
+_stop_event = threading.Event()
+_sigint_installed = False
+ 
+ 
+def _sigint_handler(signum, frame):
+    if not _stop_event.is_set():
+        _stop_event.set()
+        # Write + flush immediately so the message shows up in VSCode's
+        # integrated terminal without waiting on buffered/batched output.
+        sys.stdout.write("\n[Ctrl+C] Interrupt received — stopping after the current iteration...\n")
+        sys.stdout.flush()
+    else:
+        # A second Ctrl+C means "I really mean it, stop now".
+        sys.stdout.write("\n[Ctrl+C] Second interrupt received — forcing immediate exit.\n")
+        sys.stdout.flush()
+        raise KeyboardInterrupt
+ 
+ 
+def install_sigint_handler():
+    """
+    Installs the custom SIGINT handler once, from the main thread only.
+    Safe to call multiple times (idempotent).
+    """
+    global _sigint_installed
+    if _sigint_installed:
+        return
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGINT, _sigint_handler)
+        _sigint_installed = True
+ 
+install_sigint_handler()
+
 
 def objectives(params):
     '''
@@ -73,13 +107,14 @@ def apply_vars_to_struct(vars_scaled_dict, params_struct):
     scales = {
         'c': params_struct.c_scale[:, None],
         'beta': params_struct.beta_scale[:, None],
-        'omega': params_struct.omega_max
+        'omega': params_struct.omega_max,
+        'tilt': params_struct.tilt_scale
     }
     
     # Define mapping for condition-specific toggles (reference Inputs)
     masks = {
         'omega': Inputs.solve_omega,
-        'beta': Inputs.solve_tilt
+        'tilt': Inputs.solve_tilt
     }
     
     # Iteratively evaluate and inject variables back into the Equinox module
@@ -131,10 +166,11 @@ class BaseSolver(ABC):
                 thrust_target=Inputs.thrust_target[index],
                 objective_weight=Inputs.objective_weight[index]
             )
-            v_scale = propmodel.get_velocity_scales(p_temp)
+            V_scale = propmodel.get_velocity_scales(p_temp)
 
-            v_i_0 = jnp.broadcast_to(v_scale, (3, Inputs.n_r))
-            replace(p_temp, V_i_0=v_i_0)
+                # Introduce zero for non-solved components to maintain shape (3, n_r)
+            V_i_0 = jnp.zeros_like(p_temp.V_i_0).at[Inputs.bemt_type].set(V_scale)
+            p_temp = replace(p_temp, V_i_0=V_i_0)
             params_list.extend([p_temp])
 
         params_struct = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *params_list)
@@ -146,7 +182,14 @@ class BaseSolver(ABC):
             'tilt': params_struct.tilt / self.params_base.tilt_scale
         }
 
-        lower_bounds = {k: jnp.full_like(v, 1e-4 if k == 'c' else 0.0) for k, v in vars_scaled.items()}
+        def get_lower_bound(k, v):
+            if k == 'c':
+                return 0.005
+            elif k == 'omega':
+                return self.params_base.omega_max / 10.0
+            return 0.0
+
+        lower_bounds = {k: jnp.full_like(v, get_lower_bound(k, v)) for k, v in vars_scaled.items()}
         upper_bounds = {k: jnp.full_like(v, 1.0) for k, v in vars_scaled.items()}
         bounds = (lower_bounds, upper_bounds)
         
@@ -164,6 +207,9 @@ class BaseSolver(ABC):
 
     def solve(self):
         """The main optimization loop returning params_solved."""
+        # Reset the stop event at the beginning of each solve to ensure clean state
+        _stop_event.clear()
+ 
         state = self.init_state()
         vars_scaled = self.vars_scaled
         params_struct = self.params_struct
@@ -178,12 +224,18 @@ class BaseSolver(ABC):
         print("-" * 103)
 
         for i in range(Inputs.opt_max_iter):
+            if _stop_event.is_set():
+                # Stop event check
+                print(f"\nStopping: interrupted by user at step {i}", flush=True)
+                break
+
             # Step delegated to the specific solver
             vars_scaled, state, V_i_0 = self.step(vars_scaled, state, params_struct)
 
             # Update and rescale params
             params_struct = apply_vars_to_struct(vars_scaled, params_struct)
-
+            
+            V_i_0 = jnp.where(jnp.isfinite(V_i_0), V_i_0, params_struct.V_i_0)
             # Update the V_i_0 field
             params_struct = eqx.tree_at(
                 lambda p: (p.V_i_0), 
@@ -242,7 +294,7 @@ class BaseSolver(ABC):
                     self.update_queue.put(params_hover)
                 
                 if is_terminal:
-                    print(f"\nStopping: Convergence reached at step {i}")
+                    print(f"\nStopping: Convergence reached at step {i}",flush=True)
                     break
 
             error_log = jnp.append(error_log, getattr(state, 'error', 1.0))
@@ -250,10 +302,10 @@ class BaseSolver(ABC):
             iter_time = time.time()
 
             if is_terminal:
-                print(f"\nStopping: Convergence reached at step {i}")
+                print(f"\nStopping: Convergence reached at step {i}",flush=True)
                 break
 
-        print(f"\nTotal Solve Time: {time.time() - start_time:.2f} seconds")
+        print(f"\nTotal Solve Time: {time.time() - start_time:.2f} seconds", flush=True)
 
         final_c = params_struct.c[0]
         final_beta = params_struct.beta[0]
@@ -329,7 +381,7 @@ if __name__ == "__main__":
         v_scale = propmodel.get_velocity_scales(p_temp)
 
         V_i_0_guess_dim = jnp.zeros_like(p_temp.V_i_0).at[Inputs.bemt_type].set(V_i_0_guess_dim)
-        replace(p_temp, V_i_0=V_i_0)
+        p_temp = replace(p_temp, V_i_0=V_i_0)
         params_list.extend([p_temp])
     
     # Convert list into a stacked PyTree object that JAX natively unrolls via vmap

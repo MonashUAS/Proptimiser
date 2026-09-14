@@ -45,8 +45,8 @@ class Inputs(eqx.Module):
     V_yz = jnp.array([3.0, 3.0])
     omega = jnp.array([588.0, 650.0])
     tilt = jnp.array([0.0, 0.0])                    #No angular offset (CSU)
-    solve_omega = jnp.array([0, 1], dtype=bool)     #0: Fixed Omega, 1: Vary Omega
-    solve_tilt = jnp.array([0, 1], dtype=bool)      #0: Fixed Beta, 1: Vary Beta
+    solve_omega = jnp.array([0, 0], dtype=bool)     #0: Fixed Omega, 1: Vary Omega
+    solve_tilt = jnp.array([0, 0], dtype=bool)      #0: Fixed Beta, 1: Vary Beta
     objective_weight = jnp.array([0.9,0.1])
 
     # Motor Information
@@ -57,7 +57,7 @@ class Inputs(eqx.Module):
 
     # Aerodynamic Models Selection
     inflow_model: int = 0   #0: Simple 1: Pitt-Peters
-    coeff_method: int = 0 # 0: Parametric, 1: 2D Interp, 2: 3D Interp, 3: NeuralFoil
+    coeff_method: int = 3 # 0: Parametric, 1: 2D Interp, 2: 3D Interp, 3: NeuralFoil
     tip_loss_model: int = 0 # 0: No Loss 1: Prandtl
     root_loss_model: int = 0 # 0: No Loss 1: Prandtl
     rot_corr_model: int = 0 # 3D inflow correction model
