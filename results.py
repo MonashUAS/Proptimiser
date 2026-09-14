@@ -543,8 +543,6 @@ if __name__ == "__main__":
     # geometry blend of n propellers
     inputs, params_base = propgeomblender(timestamps, weights) 
 
-
-
     print(f"--- Evaluating {inputs.n_cond} Flight Conditions ---")
 
     # Execution & Processing Loop

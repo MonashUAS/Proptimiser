@@ -24,15 +24,14 @@ class Inputs(eqx.Module):
     V_i_0_eps: float = 5e-2
 
     # Solver Type
-    bemt_type = jnp.array([1, 1, 0],dtype=bool) # (V_ia,V_it,V_ir)
-    solve_omega: int = 0 # 0: No. 1: Objective
+    bemt_type = jnp.array([1, 1, 0],dtype=bool) # (V_ia,gaV_it,V_ir)
 
     # Discretisation settings
     n_r: int = 8
     n_psi: int = 12
 
     # Diagnostics
-    verbose: bool = True
+    verbose: bool = False
     jax_tracing: bool = False
 
     # Geometry Setup
@@ -45,7 +44,9 @@ class Inputs(eqx.Module):
     V_x = jnp.array([18.0, 0.8])
     V_yz = jnp.array([3.0, 3.0])
     omega = jnp.array([588.0, 650.0])
-    #solve_omega = jnp.array([0, 1]) #TODO: Implement "omega screen" for solving.
+    tilt = jnp.array([0.0, 0.0])                    #No angular offset (CSU)
+    solve_omega = jnp.array([0, 1], dtype=bool)     #0: Fixed Omega, 1: Vary Omega
+    solve_tilt = jnp.array([0, 1], dtype=bool)      #0: Fixed Beta, 1: Vary Beta
     objective_weight = jnp.array([0.9,0.1])
 
     # Motor Information
@@ -55,11 +56,11 @@ class Inputs(eqx.Module):
     P_max: float = 3300
 
     # Aerodynamic Models Selection
-    inflow_model: int = 1   #0: Simple 1: Pitt-Peters
-    coeff_method: int = 3 # 0: Parametric, 1: 2D Interp, 2: 3D Interp, 3: NeuralFoil
-    tip_loss_model: int = 1 # 0: No Loss 1: Prandtl
-    root_loss_model: int = 1 # 0: No Loss 1: Prandtl
-    rot_corr_model: int = 1 # 3D inflow correction model
+    inflow_model: int = 0   #0: Simple 1: Pitt-Peters
+    coeff_method: int = 0 # 0: Parametric, 1: 2D Interp, 2: 3D Interp, 3: NeuralFoil
+    tip_loss_model: int = 0 # 0: No Loss 1: Prandtl
+    root_loss_model: int = 0 # 0: No Loss 1: Prandtl
+    rot_corr_model: int = 0 # 3D inflow correction model
     high_induction_model: int = 0 # (0: Classical Momentum, 1: Buhl Correction) NOT USEFUL FOR REGULAR FLIGHT
 
     def save_state(self, filename: str = "inputs_state.eqx"):
@@ -77,7 +78,6 @@ class Inputs(eqx.Module):
         if not filename.endswith(".eqx"): filename += ".eqx"
         filename = "propellers/" + filename
         return eqx.tree_deserialise_leaves(filename, self)
-
 
 class Params(eqx.Module):
     '''
@@ -108,6 +108,9 @@ class Params(eqx.Module):
 
     omega: jnp.ndarray      # rotational speed (rad/s)
     omega_max: jnp.ndarray  # max subsonic omega
+
+    tilt: jnp.ndarray      # tilt angle of propeller (rad)
+    tilt_scale: jnp.ndarray# scale of tilt angle
 
     # Cost Weights
     objective_thrust: jnp.ndarray
@@ -224,6 +227,8 @@ def build_default_propeller(c: float = 0.02, beta: float = 10.0, inputs: Inputs 
         V_yz=inputs.V_yz[0],
         omega=inputs.omega[0],
         omega_max=343.0 / inputs.R_tip,
+        tilt=inputs.tilt[0],
+        tilt_scale=jnp.radians(30),
         V_i_0=V_i_0_init, 
         c_scale=c_scale,
         beta_scale=beta_scale,
@@ -249,7 +254,7 @@ if __name__ == "__main__":
     import results
     import geometry
 
-    params_init, _, _ = propmodel.apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0", plot=False)
+    _, params_init, _, _ = propmodel.apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0", plot=False)
 
     print(f"Initialised airfoil interpolation with airfoil {params_init.airfoil}")
 

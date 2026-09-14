@@ -65,27 +65,43 @@ def total_cost(vars_scaled, params_struct):
     aux = (V_i_0)
     return jnp.sum(costs), aux
 
-def apply_vars_to_struct(vars_scaled, params_struct):
+def apply_vars_to_struct(vars_scaled_dict, params_struct):
     """
-    Helper function to apply scaled variables to the batched parameter structure.
+    Applies scaled variables to the params_struct dynamically using dictionaries.
     """
-    c_scaled, beta_scaled, omega_scaled = vars_scaled
+    # Define mapping for how each variable scales up from [0, 1] bounds
+    scales = {
+        'c': params_struct.c_scale[:, None],
+        'beta': params_struct.beta_scale[:, None],
+        'omega': params_struct.omega_max
+    }
     
-    # Direct pointwise variable assignment
-    c = params_struct.c_scale[:, None] * c_scaled[None, :]
-    beta = params_struct.beta_scale[:, None] * beta_scaled[None, :]
-    # Enable or disable omega solving
-    omega = lax.switch(Inputs.solve_omega, [lambda _: params_struct.omega, lambda _: params_struct.omega_max * omega_scaled], None)
-
-    # Update parameters struct with new geometry and control points
-    params_struct_updated = eqx.tree_at(
-        lambda p: (p.c, p.beta, p.omega), 
-        params_struct, 
-        (c, beta, omega)
-    )
-
-    # Update parameters list with new geometry and control points
-    return params_struct_updated
+    # Define mapping for condition-specific toggles (reference Inputs)
+    masks = {
+        'omega': Inputs.solve_omega,
+        'beta': Inputs.solve_tilt
+    }
+    
+    # Iteratively evaluate and inject variables back into the Equinox module
+    for key, scaled_value in vars_scaled_dict.items():
+        # Scale the variable
+        real_value = scaled_value * scales[key]
+        
+        # Apply conditional masking if a mask is defined and exists
+        if key in masks and masks[key] is not None:
+            mask = masks[key]
+            # Ensure 1D masks broadcast correctly over 2D variable arrays
+            mask = mask[:, None] if real_value.ndim > mask.ndim else mask
+            base_value = getattr(params_struct, key)
+            real_value = jnp.where(mask, real_value, base_value)
+            
+        # Dynamically inject the updated variable back into the struct
+        params_struct = eqx.tree_at(
+            lambda p, k=key: getattr(p, k), 
+            params_struct, 
+            real_value
+        )
+    return params_struct
 
 @jax.jit
 def evaluate_all_conditions(params_struct):
@@ -104,38 +120,34 @@ class BaseSolver(ABC):
     def _prepare_problem(self):
         """Universal setup: builds the batched params_struct and optimization bounds."""
         params_list = []
+
         for index in range(Inputs.n_cond):
             p_temp = replace(
                 self.params_base,
                 V_x=Inputs.V_x[index],
                 V_yz=Inputs.V_yz[index],
                 omega=Inputs.omega[index],
+                tilt=Inputs.tilt[index],
                 thrust_target=Inputs.thrust_target[index],
                 objective_weight=Inputs.objective_weight[index]
             )
             v_scale = propmodel.get_velocity_scales(p_temp)
+
             v_i_0 = jnp.broadcast_to(v_scale, (3, Inputs.n_r))
             replace(p_temp, V_i_0=v_i_0)
             params_list.extend([p_temp])
 
         params_struct = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *params_list)
 
-        vars_scaled = (
-            self.params_base.c / self.params_base.c_scale,
-            self.params_base.beta / self.params_base.beta_scale,
-            params_struct.omega / self.params_base.omega_max 
-        )
+        vars_scaled = {
+            'c': self.params_base.c / self.params_base.c_scale,
+            'beta': self.params_base.beta / self.params_base.beta_scale,
+            'omega': params_struct.omega / self.params_base.omega_max,
+            'tilt': params_struct.tilt / self.params_base.tilt_scale
+        }
 
-        lower_bounds = (
-            jnp.full_like(vars_scaled[0], 1e-4),
-            jnp.full_like(vars_scaled[1], 0.0),
-            jnp.full_like(vars_scaled[2], 300 / self.params_base.omega_max)
-        )
-        upper_bounds = (
-            jnp.full_like(vars_scaled[0], 1.0),
-            jnp.full_like(vars_scaled[1], 1.0),
-            jnp.full_like(vars_scaled[2], 1.0)
-        )
+        lower_bounds = {k: jnp.full_like(v, 1e-4 if k == 'c' else 0.0) for k, v in vars_scaled.items()}
+        upper_bounds = {k: jnp.full_like(v, 1.0) for k, v in vars_scaled.items()}
         bounds = (lower_bounds, upper_bounds)
         
         return params_struct, vars_scaled, bounds
@@ -172,11 +184,7 @@ class BaseSolver(ABC):
             # Update and rescale params
             params_struct = apply_vars_to_struct(vars_scaled, params_struct)
 
-            c_scaled, beta_scaled, omega_scaled = vars_scaled
-            # toggle for omega solving
-            omega = lax.switch(Inputs.solve_omega, [lambda _: params_struct.omega, lambda _: params_struct.omega_max * omega_scaled], None)
-                
-
+            # Update the V_i_0 field
             params_struct = eqx.tree_at(
                 lambda p: (p.V_i_0), 
                 params_struct, 
@@ -193,6 +201,9 @@ class BaseSolver(ABC):
                 # Vectorized array math for errors and costs
                 t_errs = thrusts - params_struct.thrust_target
 
+                # Extract omega
+                omegas = params_struct.omega
+
                 # vmap the reference power calculation over the batched thrust_targets
                 vmapped_actuator_pwr = jax.vmap(propmodel.actuator_disk_power, in_axes=(0, None))
                 actuator_pwr_refs = vmapped_actuator_pwr(params_struct.thrust_target, self.params_base)
@@ -201,7 +212,7 @@ class BaseSolver(ABC):
 
                 # Clean zip over the pre-calculated batched arrays
                 for idx, (pwr, thr, t_err, mil, om, c_T, c_P) in enumerate(zip(
-                    powers, thrusts, t_errs, rms_MIL_errs, omega, cost_Ts, cost_Ps
+                    powers, thrusts, t_errs, rms_MIL_errs, omegas, cost_Ts, cost_Ps
                 )):
                     # Only print iteration metadata on the first condition row
                     iter_info = f"{i:<6} |" if idx == 0 else f"{'':<6} |"
@@ -234,11 +245,10 @@ class BaseSolver(ABC):
                     print(f"\nStopping: Convergence reached at step {i}")
                     break
 
-
             error_log = jnp.append(error_log, getattr(state, 'error', 1.0))
             time_log = jnp.append(time_log, time.time() - iter_time)
             iter_time = time.time()
-            
+
             if is_terminal:
                 print(f"\nStopping: Convergence reached at step {i}")
                 break
@@ -266,7 +276,7 @@ class LBFGSBSolver(BaseSolver):
             has_aux=True,
             implicit_diff=True, 
             jit=True,
-            verbose=2
+            verbose=1
         )
 
     def init_state(self):
@@ -317,7 +327,8 @@ if __name__ == "__main__":
         )
         # calculate first guess for V_i_0 field
         v_scale = propmodel.get_velocity_scales(p_temp)
-        V_i_0 = jnp.broadcast_to(v_scale, (3, Inputs.n_r))
+
+        V_i_0_guess_dim = jnp.zeros_like(p_temp.V_i_0).at[Inputs.bemt_type].set(V_i_0_guess_dim)
         replace(p_temp, V_i_0=V_i_0)
         params_list.extend([p_temp])
     
