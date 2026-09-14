@@ -556,7 +556,7 @@ if __name__ == "__main__":
                 cache_frame_data=False,
                 blit=False
             )
-            
+
             print("Plotting Detailed Diagnostics for all conditions...")
             for idx, p_cond in enumerate(evaluated_conditions):
                 debug_diagnostics_plot(p_cond, idx, show=False)
@@ -564,9 +564,11 @@ if __name__ == "__main__":
             plt.show()  # Blocks until all window instances (LivePlotter & Diagnostics) are closed
 
         user_input = input("\nDoes your propeller need control-point based smoothing? (y/n): ")
+
         if user_input.lower() == 'y':
             # Smoothing modifies the global underlying geometry skeleton
             params_base = iterativesmoothing(params_base)
+
             print("Geometry updated. Induced velocity fields will automatically refresh on the next loop pass.")
 
             V_ia_0_avg = jnp.average(V_ia_0_solved)

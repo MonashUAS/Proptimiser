@@ -55,10 +55,10 @@ class Inputs(eqx.Module):
 
     # Flight Conditions
     n_cond: int = 2
-    thrust_target = jnp.array([15.9,70.0])
+    thrust_target = jnp.array([15.9,60.0])
     V_x = jnp.array([18.0,0.8])
     V_yz = jnp.array([3.0,3.0])
-    omega = jnp.array([588.0,680.0])
+    omega = jnp.array([570.0,680.0])
     objective_weight = jnp.array([0.9,0.1])
 
     # Motor Information
