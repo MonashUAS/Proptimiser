@@ -31,7 +31,7 @@ class Inputs(eqx.Module):
     # Outer-loop Optimisation (Currently only L-BFGS-B works)
     opt_solver: str = "L-BFGS-B"
     opt_max_iter: int = 1000
-    opt_tol: float = 1e-2 
+    opt_tol: float = 1e-5
 
     # Induced Velocity Settings
     V_ia_0_max_iter: int = 300
@@ -55,7 +55,7 @@ class Inputs(eqx.Module):
 
     # Flight Conditions
     n_cond: int = 2
-    thrust_target = jnp.array([15.9,60.0])
+    thrust_target = jnp.array([15.9,60.0]) # N
     V_x = jnp.array([18.0,0.8])
     V_yz = jnp.array([3.0,3.0])
     omega = jnp.array([570.0,680.0])
@@ -229,7 +229,8 @@ if __name__ == "__main__":
     import propmodel
 
     params_init, _, _ = propmodel.apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0", plot=False)
-
+    # enable the below to load propeller
+    #params = Params.load_state(params_init,"INSERT PROPNAME HERE")
     print(f"Initialised airfoil interpolation with airfoil {params_init.airfoil}")
 
     # Live Plotting Setup
