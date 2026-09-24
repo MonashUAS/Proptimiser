@@ -24,7 +24,7 @@ class Inputs(eqx.Module):
     V_i_0_eps: float = 5e-2
 
     # Solver Type
-    bemt_type = jnp.array([1, 1, 0],dtype=bool) # (V_ia,gaV_it,V_ir)
+    bemt_type = jnp.array([1, 1, 0],dtype=bool) # (V_ia,V_it,V_ir)
 
     # Discretisation settings
     n_r: int = 8
@@ -44,7 +44,7 @@ class Inputs(eqx.Module):
     V_x = jnp.array([18.0, 0.8])
     V_yz = jnp.array([3.0, 3.0])
     omega = jnp.array([588.0, 650.0])
-    tilt = jnp.array([0.0, 0.0])                    #No angular offset (CSU)
+    tilt = jnp.array([0.0, 0.0])                    #Angular offset of blade (for CSU)
     solve_omega = jnp.array([0, 0], dtype=bool)     #0: Fixed Omega, 1: Vary Omega
     solve_tilt = jnp.array([0, 0], dtype=bool)      #0: Fixed Beta, 1: Vary Beta
     objective_weight = jnp.array([0.9,0.1])
@@ -254,7 +254,8 @@ if __name__ == "__main__":
     import results
     import geometry
 
-    _, params_init, _, _ = propmodel.apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0", plot=False)
+    inputs = Inputs()
+    params_init = propmodel.build_default_propeller(inputs=inputs)
 
     print(f"Initialised airfoil interpolation with airfoil {params_init.airfoil}")
 

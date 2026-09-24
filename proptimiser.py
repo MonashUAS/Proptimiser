@@ -72,7 +72,7 @@ def condition_cost(params):
     motor_power, thrust, rms_MIL_err, V_i_0 = objectives(params)
     # calculate scaled variables
     thrust_err_rel = (thrust - params.thrust_target)/params.thrust_target
-    power_rel = (Inputs.P_max-motor_power)/Inputs.P_max
+    power_rel = jnp.abs((Inputs.P_max-motor_power)/Inputs.P_max)
 
     # Calculate base cost using this condition's specific targets
     cost = (

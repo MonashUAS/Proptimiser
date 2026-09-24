@@ -29,6 +29,7 @@ from init import Inputs
 import propmodel
 import airflow
 import airfoil
+import proptimiser
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +185,7 @@ def test_level4_objectives():
 
     def f(c):
         p = replace(params, c=c)
-        motor_power, thrust, rms_MIL_err, V_i_0 = propmodel.objectives(p)
+        motor_power, thrust, rms_MIL_err, V_i_0 = proptimiser.objectives(p)
         return motor_power + thrust + rms_MIL_err
 
     val, g = jax.value_and_grad(f)(params.c)
@@ -197,7 +198,7 @@ def test_level5_condition_cost():
 
     def f(c):
         p = replace(params, c=c)
-        cost, V_i_0 = propmodel.condition_cost(p)
+        cost, V_i_0 = proptimiser.condition_cost(p)
         return jnp.sum(cost)
 
     val, g = jax.value_and_grad(f)(params.c)
@@ -210,8 +211,6 @@ def test_level5_condition_cost():
 # ---------------------------------------------------------------------------
 
 def test_level6_solver_step():
-    import proptimiser
-
     params_base = base_params()
     solver = proptimiser.LBFGSBSolver(params_base)
     state = solver.init_state()
