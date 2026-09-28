@@ -15,38 +15,6 @@ from airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskE
 
 jax.config.update("jax_enable_x64", True)
 
-def minimumInducedLossCost(V_i, params):
-    """
-    Returns a DIMENSIONLESS cost measuring deviation from the Betz uniform-inflow
-    condition (coefficient of variation, weighted toward the tip).
-    Inputs:
-        V_i: shape = (3, Nr, Npsi)
-
-    TODO: Evaluate if depreciated with new power implementations, update to V_i
-    """
-    # Unpack Induced Velocity
-    V_ia = V_i[0]
-    # Global mean over disk (scalar)
-    mean_V_ia = jnp.mean(V_ia)
-
-    # Safe denominator: avoid divide-by-zero for near-unloaded blades
-    mean_V_ia_safe = jnp.maximum(jnp.abs(mean_V_ia), 1e-3)
-
-    # Normalised squared error at every (r, psi) station — dimensionless
-    sq_err_normalised = ((V_ia - mean_V_ia) / mean_V_ia_safe) ** 2
-
-    # Collapse azimuthal axis → radial profile (Nr,)
-    radial_sq_err = jnp.mean(sq_err_normalised, axis=1)
-
-    # Outer annuli carry more of the wake energy
-    r_norm = params.r / jnp.max(params.r)
-    weighted_sq_err = radial_sq_err * r_norm
-
-    # RMS over radial stations — O(0.1–0.5) for a realistic propeller in forward flight
-    rms_err = jnp.sqrt(jnp.mean(weighted_sq_err))
-
-    return rms_err
-
 def motorPower(torque: float, omega: float, I_0: float = 0.7, R_m: float = 0.120, kV: float = 150):
     """
     Calcualtes Power Consumption required of the motor to drive the propeller
