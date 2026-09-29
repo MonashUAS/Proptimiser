@@ -20,8 +20,8 @@ By leveraging [JAX](https://github.com/google/jax) for automatic differentiation
   * Uses the Kulfan Class Shape Transformation (CST) [13] via **AeroSandbox** [5] to create a fully continuous loft of the blade from the structural hub to the aerodynamic tip.
   * Directly exports production-ready `.ibl` surface meshes and mold-split parting lines directly to **Creo Parametric**.
 * **JAX-Accelerated Optimisation:**
-  * Multi-objective optimisation (combining Minimum Induced Loss constraints with pure motor power minimisation) using `JAXopt` [8]
-  * Optimises blade twist ($\beta$), chord ($c$), and operational RPM ($\omega$) simultaneously.
+  * Multi-condition optimisation of thrust targets and motor power using `JAXopt` [8]
+  * Optimises blade twist ($\beta$), chord ($c$), spanwise CST airfoil sections and operational RPM ($\omega$) simultaneously, with radial ranges of the blade optionally frozen for design purposes.
 
 ---
 
@@ -67,28 +67,32 @@ pip install -r requirements.txt
 
 Proptimiser is designed to be configured centrally and executed from the command line.
 
-### 1. Configuring Flight Conditions
+### 1. Configuring a Run
 
-Before running the solver or evaluating a propeller, open `init.py`. This file contains the `Inputs` dataclass, which controls the bounding conditions of the optimisation.
+A run is described by three classes in `init.py`:
+
+* **`Inputs`**: solver settings, discretisation, model selection, cost penalties and the flight conditions (one array entry per condition).
+* **`BladeSpec`**: the blade definition. `r_foils = [0, r_hub, r_aero, r_mid..., r_tip]` splits the blade into a structural hub (`r < r_hub`, outside the BEMT domain), a blend zone (`r_hub <= r < r_aero`) and the aerodynamic zone, where CST airfoil sections are defined at `r_foils[2:]` and interpolated along the span. `freeze` holds radial ranges (m) where chord, twist or CST sections keep their seed values during optimisation.
+* **`Propeller`**: a design (chord, twist, CST sections) plus the `Inputs` and `BladeSpec` it is analysed with. It builds the solver parameters and handles all saving and loading.
 
 ```python
-# init.py
-class Inputs(eqx.Module):
-    # Solver Configuration
-    opt_solver: str = "L-BFGS-B"
-    opt_max_iter: int = 1000
+from init import Inputs, BladeSpec, Propeller
 
-    # Geometry Setup
-    R_tip: float = 0.25   # Propeller Radius (m)
-    R_hub: float = 0.025  # Hub Radius (m)
-
-    # Flight Conditions (Supports Array Batching for Multi-Condition)
-    thrust_target = jnp.array([29.6, 22.5]) # Target Thrusts (N)
-    V_x = jnp.array([8.60, 0.0])            # Forward Velocity (m/s)
-    V_yz = jnp.array([12.29, 0.0])          # Crosswind/Off-axis Velocity (m/s)
-    omega = jnp.array([445.0, 400.0])       # Rotor speeds (rad/s)
-
+inputs = Inputs(
+    thrust_target=[29.6, 22.5],   # Target Thrusts (N)
+    V_x=[8.60, 0.0],              # Forward Velocity (m/s)
+    V_yz=[12.29, 0.0],            # Crosswind/Off-axis Velocity (m/s)
+    omega=[445.0, 400.0],         # Rotor speeds (rad/s)
+)
+blade = BladeSpec(
+    r_foils=(0.0, 0.025, 0.05, 0.15, 0.275),  # [0, r_hub, r_aero, r_mid, r_tip] (m)
+    airfoils=("arad10",),                     # seed airfoil for each aero station
+    freeze={"c": [(0.05, 0.08)]},             # hold the chord at its seed value between 50 and 80 mm
+)
+prop = Propeller.default(inputs=inputs, blade=blade)     # or Propeller.from_apc("apc_prop_data/propgeom_data/20x8-PERF.PE0")
 ```
+
+Chord and twist in the blend zone are always derived from the hub values (`hub_chord`, `hub_twist_deg`) and the first aerodynamic station, so the analysed blade matches the exported CAD. With NeuralFoil (`coeff_method = 3`) the CST sections are also design variables, kept buildable by a minimum thickness penalty (`BladeSpec.min_tc`) and inside NeuralFoil's trusted region by a confidence penalty.
 
 ### 2. Running the Optimisation via CLI
 
@@ -98,9 +102,11 @@ Execute the main optimisation loop by running:
 python init.py
 ```
 
-* **Interactive GUI:** If enabled, a Matplotlib window will spawn, updating the convergence plots, induced velocity fields, and blade shape at every solver step.
-* **Terminal Output:** The CLI will log the step time, current Thrust error, and current power consumption.
-* **Exporting:** Upon convergence (or hitting the maximum iteration limit), the CLI will prompt: `Save Propeller? (y/n)`. Selecting `y` saves the propeller to a `.eqx` file so flight conditions can be indexed later.
+* **Interactive GUI:** If enabled, a Matplotlib window will spawn, updating the convergence plots, induced velocity fields, airfoil sections and blade shape at every solver step.
+* **Terminal Output:** The CLI will log the step time, current Thrust error, current power consumption and each cost term.
+* **Exporting:** Upon convergence (or hitting the maximum iteration limit), the CLI will prompt: `Save Propeller? (y/n)`. Selecting `y` saves the propeller, its `Inputs` and `BladeSpec` to `propellers/<name>.json`.
+
+Saved propellers are reloaded with `Propeller.load("<name>")`. Files are plain JSON with named fields, so they can be read and diffed, and new fields never break old files. `prop.with_inputs(...)` and `prop.with_blade(...)` re-use a saved design with new flight conditions, discretisation or blade zones. Propellers saved in the old `.eqx` format are converted once with `Propeller.from_legacy_eqx("<name>").save("<name>")`.
 
 ### 3. Results and Post-Processing
 

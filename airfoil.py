@@ -1,6 +1,7 @@
 ### Establish Coefficients for Given Airfoil
 import glob
 import re
+from functools import lru_cache
 import numpy as np
 
 import jax
@@ -10,11 +11,10 @@ import matplotlib.pyplot as plt
 import interpax
 from scipy.ndimage import gaussian_filter
 import neuralfoil as nf
-import aerosandbox as asb
 from pathlib import Path
 
-from init import Inputs
 from airflow import resultantVelocityComponents, calc_reynolds
+from geometry import N_CST, cst_at_stations, max_thickness
 
 from aerosandbox.geometry.airfoil.airfoil_families import (
     get_kulfan_parameters,
@@ -179,7 +179,7 @@ class ParametricInterpolator:
         self.alpha_stall = jnp.radians(alpha_stall)
         self.k_smooth = k_smooth
 
-    def __call__(self, alpha, re, mach):
+    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_confidence=False):
         # Apply the zero-lift offset internally
         alpha_eff = alpha - self.AoA_0
         Cd90 = 1.98
@@ -206,8 +206,8 @@ class ParametricInterpolator:
         
         Cn_final = (1 - transition) * Cn_lin + transition * Cn_stall
         Cm = -Cn_final * (0.25 - 0.175 * (1 - 2 * jnp.abs(alpha_eff) / jnp.pi))
-        
-        return Cl, Cd, Cm
+
+        return _with_confidence((Cl, Cd, Cm), return_confidence)
 
 class AlphaReInterpolator:
     def __init__(self, airfoilname):
@@ -276,7 +276,7 @@ class AlphaReInterpolator:
         self.cd_grid = jnp.nan_to_num(interp_vmap(self.re_grid_log, log_re_array, cd_array))
         self.cm_grid = jnp.nan_to_num(interp_vmap(self.re_grid_log, log_re_array, cm_array))
 
-    def __call__(self, alpha, re, mach):
+    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_confidence=False):
         input_shape = jnp.shape(alpha)
         alpha_flat, re_flat, mach_flat = jnp.ravel(alpha), jnp.ravel(re), jnp.ravel(mach)
 
@@ -288,7 +288,8 @@ class AlphaReInterpolator:
         Cm = interpax.interp2d(alpha_flat, log_re_clipped, self.alpha_grid, self.re_grid_log, self.cm_grid, method='linear')
         
         cl_comp, cd_comp, cm_comp = apply_mach_corrections(Cl, Cd, Cm, mach_flat)
-        return jnp.reshape(cl_comp, input_shape), jnp.reshape(cd_comp, input_shape), jnp.reshape(cm_comp, input_shape)
+        coeffs = jnp.reshape(cl_comp, input_shape), jnp.reshape(cd_comp, input_shape), jnp.reshape(cm_comp, input_shape)
+        return _with_confidence(coeffs, return_confidence)
 
 class AlphaMachReInterpolator:
     def __init__(self, airfoilname):
@@ -365,7 +366,7 @@ class AlphaMachReInterpolator:
         self.cd_grid = jnp.nan_to_num(gaussian_filter(cd_grid, sigma=(1.5, 0.8, 1.0)))
         self.cm_grid = jnp.nan_to_num(gaussian_filter(cm_grid, sigma=(1.5, 0.8, 1.0)))
 
-    def __call__(self, alpha, re, mach):
+    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_confidence=False):
         input_shape = jnp.shape(alpha)
         alpha_flat, mach_flat, re_flat = jnp.ravel(alpha), jnp.ravel(mach), jnp.ravel(re)
 
@@ -379,47 +380,23 @@ class AlphaMachReInterpolator:
         Cd = interpax.interp3d(alpha_flat, mach_clipped, log_re_clipped, 
                                self.alpha_grid, self.mach_grid, self.re_grid_log, 
                                self.cd_grid, method='cubic')
-        Cm = interpax.interp3d(alpha_flat, mach_clipped, log_re_clipped, 
-                               self.alpha_grid, self.mach_grid, self.re_grid_log, 
+        Cm = interpax.interp3d(alpha_flat, mach_clipped, log_re_clipped,
+                               self.alpha_grid, self.mach_grid, self.re_grid_log,
                                self.cm_grid, method='cubic')
-        return Cl.reshape(input_shape), Cd.reshape(input_shape), Cm.reshape(input_shape)
+        coeffs = Cl.reshape(input_shape), Cd.reshape(input_shape), Cm.reshape(input_shape)
+        return _with_confidence(coeffs, return_confidence)
 
 class NeuralFoilInterpolator:
     '''
     A pure-JAX implementation of the NeuralFoil multi-layer perceptron (MLP) for aerodynamic coefficient prediction.
     By staying in JAX, this interpolator is 100% compatible with JIT compilation and autodiff.
 
+    The section shape is passed on every call as CST vectors [lower x8, upper x8, LE weight, TE thickness]
+    (normalised to unit chord), so each radial station can have its own airfoil and the shape can be optimised.
+
     Implementation mostly cloned from https://github.com/peterdsharpe/NeuralFoil/blob/master/neuralfoil/main.py
     '''
-    def __init__(self, airfoilname, model_size="large"):
-        # Attempt to load the airfoil geometry via aerosandbox (or locally from .dat)
-        try:
-            self.airfoil = asb.Airfoil(airfoilname).normalize()
-        except Exception:
-            try:
-                # Fall back to local .dat file in the airfoils directory
-                files = glob.glob(f"airfoils/{airfoilname}/*.dat")
-                if files:
-                    self.airfoil = asb.Airfoil(coordinates=files[0]).normalize()
-                else:
-                    raise FileNotFoundError(f"Cannot find airfoil {airfoilname}")
-            except Exception as e:
-                raise ValueError(f"Failed to load airfoil {airfoilname}: {e}")
-        
-        # Extract and scale the geometric "Kulfan" parameters, which the neural net uses as shape inputs
-        normalization_outputs = self.airfoil.normalize(return_dict=True)
-        normalized_airfoil = normalization_outputs["airfoil"].to_kulfan_airfoil(
-            n_weights_per_side=8,
-            normalize_coordinates=False, 
-        )
-        self.kulfan_parameters = {k: jnp.array(v) for k, v in normalized_airfoil.kulfan_parameters.items()}
-        self.delta_alpha = jnp.array(normalization_outputs["rotation_angle"])
-        
-        # Calculate coordinate translations to correct the moment coefficient (CM) later
-        self.x_translation_qc = jnp.array(-normalization_outputs["x_translation"] + 0.25 * (1 / normalization_outputs["scale_factor"] * jnp.cos(jnp.radians(normalization_outputs["rotation_angle"]))) - 0.25)
-        self.y_translation_qc = jnp.array(-normalization_outputs["y_translation"] + 0.25 * (1 / normalization_outputs["scale_factor"] * jnp.sin(jnp.radians(-normalization_outputs["rotation_angle"]))))
-        self.scale = jnp.array(normalization_outputs["scale_factor"])
-        
+    def __init__(self, model_size="large"):
         # Load the pre-trained neural network weights and input scaling distributions from the neuralfoil package
         nn_weights_dir = Path(nf.__file__).parent / "nn_weights_and_biases"
         self._scaled_input_distribution = {k: jnp.array(v) for k, v in dict(np.load(nn_weights_dir / "scaled_input_distribution.npz")).items()}
@@ -430,35 +407,36 @@ class NeuralFoilInterpolator:
         self.layer_indices = sorted(list(set([int(key.split(".")[1]) for key in nn_params_raw.keys()])))
         self.N_inputs = len(self._scaled_input_distribution["mean_inputs_scaled"])
 
-    def __call__(self, alpha, re, mach):
-        # 1. Wrap alpha to [-pi, pi] preserving original shape
-        alpha = jnp.mod(alpha + jnp.pi, 2 * jnp.pi) - jnp.pi
-        
-        # Broadcast arrays together to unify their shapes automatically
+    def raw(self, alpha, re, kulfan):
+        '''
+        Network outputs before flat-plate blending and Mach correction.
+        kulfan (..., N_CST) broadcasts against alpha along a trailing axis.
+
+        Returns CL, CD, CM and the analysis confidence (0-1), each shaped like alpha.
+        '''
         alpha, re = jnp.broadcast_arrays(alpha, re)
-        
-        re_scaled = re / self.scale
-        alpha_deg = jnp.degrees(alpha) + self.delta_alpha
-        
-        k = self.kulfan_parameters
-        
-        # 2. Assemble the 25-dimensional input vector along the LAST axis (-1)
-        # Using jnp.full_like preserves the broadcasted leading dimensions dynamically
-        x = jnp.stack([
-            *[jnp.full_like(alpha_deg, k["upper_weights"][i]) for i in range(8)],
-            *[jnp.full_like(alpha_deg, k["lower_weights"][i]) for i in range(8)],
-            jnp.full_like(alpha_deg, k["leading_edge_weight"]),
-            jnp.full_like(alpha_deg, k["TE_thickness"] * 50),
-            jnp.sin(jnp.radians(2 * alpha_deg)),
-            jnp.cos(jnp.radians(alpha_deg)),
-            1 - jnp.cos(jnp.radians(alpha_deg)) ** 2,
-            (jnp.log(re_scaled) - 12.5) / 3.5,
-            jnp.zeros_like(alpha_deg), # n_crit scaling
-            jnp.ones_like(alpha_deg),  # forced transition upper
-            jnp.ones_like(alpha_deg),  # forced transition lower
+        alpha_deg = jnp.degrees(alpha)
+        k = jnp.broadcast_to(kulfan, alpha_deg.shape + (N_CST,))
+
+        # 1. Assemble the 25-dimensional input vector along the LAST axis (-1)
+        # NeuralFoil takes the upper surface weights first
+        x = jnp.concatenate([
+            k[..., 8:16],               # upper weights
+            k[..., 0:8],                # lower weights
+            k[..., 16:17],              # leading edge weight
+            k[..., 17:18] * 50,         # TE thickness
+            jnp.stack([
+                jnp.sin(jnp.radians(2 * alpha_deg)),
+                jnp.cos(jnp.radians(alpha_deg)),
+                1 - jnp.cos(jnp.radians(alpha_deg)) ** 2,
+                (jnp.log(re) - 12.5) / 3.5,
+                jnp.zeros_like(alpha_deg), # n_crit scaling
+                jnp.ones_like(alpha_deg),  # forced transition upper
+                jnp.ones_like(alpha_deg),  # forced transition lower
+            ], axis=-1),
         ], axis=-1) # Shape: (*input_shape, 25)
         
-        # 3. Leading-dimension safe MLP using jnp.matmul
+        # 2. Leading-dimension safe MLP using jnp.matmul
         def net(x_in):
             layer_indices_to_iterate = self.layer_indices.copy()
             while len(layer_indices_to_iterate) != 0:
@@ -484,7 +462,7 @@ class NeuralFoilInterpolator:
         y = net(x)
         y = y.at[..., 0].set(y[..., 0] - sq_mahalanobis(x) / (2 * self.N_inputs))
         
-        # 4. Enforce symmetric consistency using slice syntax (...)
+        # 3. Enforce symmetric consistency using slice syntax (...)
         x_flipped = x \
             .at[..., :8].set(x[..., 8:16] * -1) \
             .at[..., 8:16].set(x[..., :8] * -1) \
@@ -505,13 +483,20 @@ class NeuralFoilInterpolator:
         y_fused = (y + y_unflipped) / 2
         
         # Extract coefficients
+        confidence = jax.nn.sigmoid(y_fused[..., 0])
         CL_raw = y_fused[..., 1] / 2
         CD_raw = jnp.exp((y_fused[..., 2] - 2) * 2)
         CM_raw = y_fused[..., 3] / 20
+        return CL_raw, CD_raw, CM_raw, confidence
+
+    def __call__(self, alpha, re, mach, kulfan, t_over_c=0.10, return_confidence=False):
+        # 1. Wrap alpha to [-pi, pi] preserving original shape
+        alpha = jnp.mod(alpha + jnp.pi, 2 * jnp.pi) - jnp.pi
         
-        # Coordinate translations
-        extra_CM = -CL_raw * self.x_translation_qc + CD_raw * self.y_translation_qc
-        CM_raw = CM_raw + extra_CM
+        # Broadcast arrays together to unify their shapes automatically
+        alpha, re = jnp.broadcast_arrays(alpha, re)
+
+        CL_raw, CD_raw, CM_raw, confidence = self.raw(alpha, re, kulfan)
         
         # Flat-Plate Blending
         alpha_trust_low = jnp.radians(-11.0)
@@ -538,7 +523,14 @@ class NeuralFoilInterpolator:
         CM_inc = weight * CM_raw + (1 - weight) * bg_cm
 
         # Apply Mach corrections (which handles shapes smoothly natively)
-        return apply_mach_corrections(CL_inc, CD_inc, CM_inc, mach)
+        coeffs = apply_mach_corrections(CL_inc, CD_inc, CM_inc, mach, t_over_c)
+        return coeffs + (confidence,) if return_confidence else coeffs
+
+def _with_confidence(coeffs, return_confidence):
+    '''
+    Table and parametric models have no confidence estimate; report full confidence when one is requested.
+    '''
+    return coeffs + (jnp.ones_like(coeffs[0]),) if return_confidence else coeffs
 
 ### Data Loading/Grid Utilities
 
@@ -575,20 +567,23 @@ def jax_idw_3d_grid(scattered_points, scattered_values, grid_X, grid_Y, power=2.
     # Reshape back to (N_alpha, N_Mach, N_Re)
     return interp_flat.reshape(scattered_values.shape[0], grid_X.shape[0], grid_X.shape[1])
 
-def load_airfoil_data(airfoilname):
+@lru_cache(maxsize=None)
+def load_airfoil_data(coeff_method, airfoilname="arad10"):
     '''
-    Instantiates the correct aerodynamic interpolator class based on configuration.
+    Instantiates the aerodynamic interpolator for coeff_method (0: Parametric, 1: 2D Interp, 2: 3D Interp, 3: NeuralFoil).
+    airfoilname selects the polar tables for methods 1 and 2; NeuralFoil takes section shapes per call instead.
+    Cached, so propellers sharing a configuration share one interpolator (and one jit trace).
     '''
-    if Inputs.coeff_method == 0:
+    if coeff_method == 0:
         return ParametricInterpolator() # Relies on default params, can be extended later
-    elif Inputs.coeff_method == 1:
+    elif coeff_method == 1:
         return AlphaReInterpolator(airfoilname)
-    elif Inputs.coeff_method == 2:
+    elif coeff_method == 2:
         return AlphaMachReInterpolator(airfoilname)
-    elif Inputs.coeff_method == 3:
-        return NeuralFoilInterpolator(airfoilname)
+    elif coeff_method == 3:
+        return NeuralFoilInterpolator()
     else:
-        raise ValueError("Incorrect coefficient method selected in Inputs.")
+        raise ValueError(f"Incorrect coefficient method {coeff_method} selected in Inputs.")
 
 ## AERODYNAMIC CORRECTIONS
 ## 3D ROTATIONAL STALL DELAY CORRECTIONS
@@ -610,7 +605,7 @@ def du_selig_correction(operands):
     # Extract geometry and prevent division by zero at the exact root
     c = params.c[:, None]
     r = params.r[:, None]
-    R = Inputs.R_tip*1.05
+    R = params.cfg.R_tip*1.05
     
     r_safe = jnp.maximum(r, 1e-6)
     c_over_r = c / r_safe
@@ -686,28 +681,39 @@ def apply_mach_corrections(cl_inc, cd_inc, cm_inc, mach, t_over_c=0.10):
     return cl_comp, cd_comp, cm_comp
 
 # Aerodynamic Coefficient Pipeline
-def aero_coeffs(V_i, params):
+def aero_coeffs(V_i, params, return_confidence=False):
     '''
     Universal Aerodynamic pipeline.
+
+    Each radial station uses its own section, interpolated along the span from the CST sections in params.cst.
+    With return_confidence=True the NeuralFoil analysis confidence (n_r, n_psi) is returned as a 4th output.
     '''
     geometric_angle = params.beta[:, None]
-    V_R, phi = resultantVelocityComponents(V_i, params) 
+    V_R, phi = resultantVelocityComponents(V_i, params)
     AoA_eff = geometric_angle - phi
-    
+
     Re = calc_reynolds(params.rho, jnp.maximum(V_R, 1e-6), params.c[:, None], params.mu)
     Mach = V_R / params.a
 
+    # Section shape and thickness at each radial station
+    kulfan = cst_at_stations(params.r, params.r_cst, params.cst)
+    t_over_c = max_thickness(kulfan)[:, None]
+
     # Natively calls the instantiated class
-    C_L_2D, C_D_2D, C_M = params.airfoil_interp(AoA_eff, Re, Mach)
-    
+    outputs = params.airfoil_interp(AoA_eff, Re, Mach, kulfan=kulfan[:, None, :], t_over_c=t_over_c,
+                                    return_confidence=return_confidence)
+    C_L_2D, C_D_2D, C_M = outputs[:3]
+
     # Apply 3D Rotational Corrections
     operands = (C_L_2D, C_D_2D, C_M, V_i, params)
     C_L_final, C_D_final, C_M_final = lax.switch(
-        Inputs.rot_corr_model,
+        params.cfg.rot_corr_model,
         [no_3d_correction, du_selig_correction],
         operands
     )
-    
+
+    if return_confidence:
+        return C_L_final, C_D_final, C_M_final, outputs[3]
     return C_L_final, C_D_final, C_M_final
 
 
@@ -729,18 +735,17 @@ if __name__ == "__main__":
     mach_fixed = 0.2
 
     # Evaluate Parametric
-    Inputs.coeff_method = 0
-    param_interp = load_airfoil_data("arad10")
+    param_interp = load_airfoil_data(0, "arad10")
     cl_param, cd_param, cm_param = param_interp(aoa_rad_360, re_fixed, mach_fixed)
 
     # Evaluate XFoil 2D
-    Inputs.coeff_method = 1
-    xfoil_interp = load_airfoil_data("arad10")
+    xfoil_interp = load_airfoil_data(1, "arad10")
     cl_xf, cd_xf, cm_xf = xfoil_interp(aoa_rad_360, re_fixed, mach_fixed)
 
-    # Evaluate NeuralFoil
-    Inputs.coeff_method = 3
-    nf_interp = load_airfoil_data("arad10")
+    # Evaluate NeuralFoil (section shape passed as CST weights)
+    from functools import partial
+    from geometry import kulfan_from_name
+    nf_interp = partial(load_airfoil_data(3), kulfan=jnp.asarray(kulfan_from_name("arad10")))
     cl_nf, cd_nf, cm_nf = nf_interp(aoa_rad_360, re_fixed, mach_fixed)
 
     active_interp = nf_interp

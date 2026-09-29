@@ -1,8 +1,19 @@
 ## Propeller Geometry Tools and Functions
 
+import glob
+from functools import lru_cache
+from math import comb
+from pathlib import Path
+
 import numpy as np
+import jax
 import jax.numpy as jnp
 import aerosandbox as asb
+
+# CST vectors are stored as [lower weights x8, upper weights x8, LE weight, TE thickness]
+N_CST_WEIGHTS = 8
+N_CST = 2 * N_CST_WEIGHTS + 2
+AIRFOIL_DIR = Path(__file__).resolve().parent / "airfoils"
 
 ### Integrand Functions
 def radial_stops(R, r_hub, n_r):
@@ -24,6 +35,166 @@ def angular_stops(n_psi):
     psi = jnp.linspace(0, 2 * jnp.pi, n_psi, endpoint=False)
     dpsi = jnp.ones_like(psi) * (2 * jnp.pi) / n_psi
     return psi, dpsi
+
+### CST (Kulfan) Airfoil Functions
+def kulfan_from_name(name, n_weights_per_side=N_CST_WEIGHTS):
+    """
+    Returns the CST vector [lower, upper, LE weight, TE thickness] of a named airfoil,
+    normalised to unit chord. Looks in the AeroSandbox database first, then airfoils/<name>/*.dat.
+    """
+    return np.array(_kulfan_from_name(name, n_weights_per_side))
+
+@lru_cache(maxsize=None)
+def _kulfan_from_name(name, n_weights_per_side):
+    airfoil = asb.Airfoil(name)
+    if airfoil.coordinates is None:
+        files = glob.glob(str(AIRFOIL_DIR / name / "*.dat"))
+        if not files:
+            raise FileNotFoundError(f"Cannot find airfoil '{name}' in AeroSandbox or {AIRFOIL_DIR / name}")
+        airfoil = asb.Airfoil(name=name, coordinates=files[0])
+
+    kulfan = airfoil.normalize().to_kulfan_airfoil(
+        n_weights_per_side=n_weights_per_side,
+        normalize_coordinates=False,
+    )
+    p = kulfan.kulfan_parameters
+    return tuple(np.concatenate([
+        p['lower_weights'],
+        p['upper_weights'],
+        [p['leading_edge_weight']],
+        [p['TE_thickness']]
+    ]).tolist())
+
+def get_cst_weights_from_names(airfoil_names):
+    """
+    Converts a list of airfoil strings into a (N_foils, N_CST) array of
+    [lower_weights, upper_weights, LE_weight, TE_thickness] for each airfoil.
+    """
+    return np.stack([kulfan_from_name(name) for name in airfoil_names])
+
+def cosine_spacing(n):
+    """
+    Chordwise stations clustered at the leading and trailing edges (matches np.cosspace in AeroSandbox).
+    """
+    return 0.5 * (1.0 - jnp.cos(jnp.linspace(0.0, jnp.pi, n)))
+
+def kulfan_coordinates(cst, x):
+    """
+    Upper and lower surface y/c at chordwise stations x for CST vectors of shape (..., N_CST).
+    JAX port of aerosandbox get_kulfan_coordinates (N1 = 0.5, N2 = 1.0, with leading-edge modification).
+
+    Returns y_upper, y_lower, each of shape (..., len(x)).
+    """
+    n = N_CST_WEIGHTS - 1
+    i = np.arange(N_CST_WEIGHTS)
+    K = np.array([comb(n, k) for k in i], dtype=float)
+
+    x = jnp.asarray(x)
+    bernstein = K * x[:, None] ** i * (1.0 - x[:, None]) ** (n - i)     # (n_x, 8)
+    class_fn = jnp.sqrt(x) * (1.0 - x)
+
+    lower, upper = cst[..., :N_CST_WEIGHTS], cst[..., N_CST_WEIGHTS:2 * N_CST_WEIGHTS]
+    le, te = cst[..., -2:-1], cst[..., -1:]
+
+    lem = le * x * (1.0 - x) ** (N_CST_WEIGHTS + 0.5)
+    y_lower = class_fn * (lower @ bernstein.T) - x * te / 2 + lem
+    y_upper = class_fn * (upper @ bernstein.T) + x * te / 2 + lem
+    return y_upper, y_lower
+
+def max_thickness(cst, n_points=65):
+    """
+    Maximum thickness-to-chord ratio of CST vectors of shape (..., N_CST).
+    """
+    y_upper, y_lower = kulfan_coordinates(cst, cosine_spacing(n_points))
+    return jnp.max(y_upper - y_lower, axis=-1)
+
+def cst_at_stations(r, r_cst, cst):
+    """
+    Linearly interpolates CST vectors defined at radii r_cst (n_st, N_CST) onto radial stations r.
+    CST is linear in its parameters, so this is equivalent to blending the section coordinates.
+    Stations outside [r_cst[0], r_cst[-1]] take the end sections.
+
+    Returns shape (n_r, N_CST).
+    """
+    return jax.vmap(jnp.interp, in_axes=(None, None, 1), out_axes=1)(r, r_cst, cst)
+
+### Hub and Blend Zone Functions
+def stadium_coordinates(template_coords, thickness_ratio):
+    """
+    Normalised rounded-rectangle (stadium) hub section sharing the x-coordinates of template_coords,
+    which must be ordered TE (upper) -> LE -> TE (lower) as Kulfan coordinates are.
+    """
+    hub_coords = np.zeros_like(template_coords)
+    hub_coords[:, 0] = template_coords[:, 0] # Lock X-coordinates to the template to prevent twist
+
+    le_idx = np.argmin(template_coords[:, 0])
+    rad = thickness_ratio / 2.0
+
+    for j, x in enumerate(hub_coords[:, 0]):
+        sign = 1.0 if j <= le_idx else -1.0
+
+        if x < rad:
+            y_val = np.sqrt(max(0, rad**2 - (rad - x)**2))
+        elif x > 1.0 - rad:
+            y_val = np.sqrt(max(0, rad**2 - (x - (1.0 - rad))**2))
+        else:
+            y_val = rad
+
+        hub_coords[j, 1] = sign * y_val
+    return hub_coords
+
+def fit_hub_cst(thickness_ratio, n_points_per_side=100):
+    """
+    Fits a CST vector to the stadium hub section, so the blend zone can be interpolated in CST space.
+    """
+    from aerosandbox.geometry.airfoil.airfoil_families import get_kulfan_coordinates, get_kulfan_parameters
+
+    template = get_kulfan_coordinates(n_points_per_side=n_points_per_side)
+    p = get_kulfan_parameters(
+        stadium_coordinates(template, thickness_ratio),
+        n_weights_per_side=N_CST_WEIGHTS,
+        normalize_coordinates=False,
+    )
+    return np.concatenate([
+        p['lower_weights'],
+        p['upper_weights'],
+        [p['leading_edge_weight']],
+        [p['TE_thickness']]
+    ])
+
+def planform_blend_weights(r, r_hub, r_aero):
+    """
+    Static weights for the blend-zone planform on a concrete radial grid r.
+
+    Stations inboard of r_aero are blended (cosine) from the hub values at r_hub to the values at the
+    anchor, the first station at or outboard of r_aero. Anchoring on a station rather than on r_aero itself
+    keeps the blend from depending on other blended stations.
+
+    Returns (blend, inboard, anchor): blend fraction per station, mask of blended stations, anchor index.
+    """
+    r = np.asarray(r)
+    anchor = int(np.argmax(r >= r_aero))
+    r_anchor = r[anchor]
+
+    fraction = np.clip((r - r_hub) / max(r_anchor - r_hub, 1e-12), 0.0, 1.0)
+    blend = 0.5 * (1.0 - np.cos(np.pi * fraction))
+    inboard = r < r_anchor
+    return blend, inboard, anchor
+
+def apply_planform_blend(c, beta, blend, inboard, anchor, hub_chord, hub_twist):
+    """
+    Replaces chord and twist at the inboard stations with the hub-to-anchor blend (differentiable in c and beta).
+    """
+    c_new = jnp.where(inboard, hub_chord + blend * (c[anchor] - hub_chord), c)
+    beta_new = jnp.where(inboard, hub_twist + blend * (beta[anchor] - hub_twist), beta)
+    return c_new, beta_new
+
+def blend_planform(r, c, beta, r_hub, r_aero, hub_chord, hub_twist):
+    """
+    Convenience wrapper: blend-zone chord and twist for a concrete radial grid r.
+    """
+    blend, inboard, anchor = planform_blend_weights(r, r_hub, r_aero)
+    return apply_planform_blend(c, beta, blend, inboard, anchor, hub_chord, hub_twist)
 
 ### Geometry Transformation functions
 def params_to_le_te(r, c, beta):
@@ -47,30 +218,6 @@ def params_to_le_te(r, c, beta):
     te_points = np.column_stack([x, y_te, z_te])
 
     return le_points, te_points
-
-def get_cst_weights_from_names(airfoil_names):
-    """
-    Converts a list of airfoil strings into a (N_foils, N_CST_weights) array.
-    Outputs a stacked numpy array containing [lower_weights, upper_weights, LE_weight, TE_thickness]
-    for each airfoil, which can be fed directly to JAX.
-    """
-    weights_list = []
-    
-    for name in airfoil_names:
-        # KulfanAirfoil calculates the CST parameterization on instantiation
-        kf = asb.KulfanAirfoil(name)
-        p = kf.kulfan_parameters
-        
-        # Flatten the dictionary into a single 1D array
-        flat_weights = np.concatenate([
-            p['lower_weights'],
-            p['upper_weights'],
-            [p['leading_edge_weight']],
-            [p['TE_thickness']]
-        ])
-        weights_list.append(flat_weights)
-        
-    return np.array(weights_list)
 
 def generate_blade_coordinates(r, r_foils, cst_weights, hub_thickness_ratio=0.1, n_points_per_side=100):
     """
@@ -113,24 +260,7 @@ def generate_blade_coordinates(r, r_foils, cst_weights, hub_thickness_ratio=0.1,
     root_foil = asb.Airfoil(name="Root Aero Airfoil", coordinates=root_coords)
     
     # 2. Generate the Normalized Rounded Rectangle (Stadium) Hub
-    hub_coords = np.zeros_like(root_coords)
-    hub_coords[:, 0] = root_coords[:, 0] # Lock X-coordinates to root foil to prevent twist
-    
-    le_idx = np.argmin(root_coords[:, 0]) 
-    rad = hub_thickness_ratio / 2.0
-    
-    for j, x in enumerate(hub_coords[:, 0]):
-        sign = 1.0 if j <= le_idx else -1.0
-        
-        if x < rad:
-            y_val = np.sqrt(max(0, rad**2 - (rad - x)**2))
-        elif x > 1.0 - rad:
-            y_val = np.sqrt(max(0, rad**2 - (x - (1.0 - rad))**2))
-        else:
-            y_val = rad
-            
-        hub_coords[j, 1] = sign * y_val
-        
+    hub_coords = stadium_coordinates(root_coords, hub_thickness_ratio)
     hub_foil = asb.Airfoil(name="Hub Section", coordinates=hub_coords)
     
     # 3. Initialize output tensor
@@ -155,12 +285,9 @@ def generate_blade_coordinates(r, r_foils, cst_weights, hub_thickness_ratio=0.1,
             blade_coords[i] = blended.coordinates
             
         else:
-            # Zone 3: Aerodynamic Span
-            interp_weights = np.zeros(n_cst)
-            for j in range(n_cst):
-                # Interpolate CST weights based on the slice of aerodynamic stations
-                interp_weights[j] = np.interp(r_i, r_aero_stations, cst_weights[:, j])
-                
+            # Zone 3: Aerodynamic Span (same spanwise CST interpolation as the aerodynamic model)
+            interp_weights = np.asarray(cst_at_stations(jnp.array([r_i]), jnp.asarray(r_aero_stations), jnp.asarray(cst_weights)))[0]
+
             coords = get_kulfan_coordinates(
                 lower_weights=interp_weights[:n_weights_per_side],
                 upper_weights=interp_weights[n_weights_per_side:2*n_weights_per_side],
@@ -238,68 +365,26 @@ def offset_airfoil_profile(foil_x, foil_y, chord, skin_thickness):
 
     return clean_core_x, clean_core_y
 
-def get_cst_weights_from_names(airfoil_names):
-    """
-    Converts a list of airfoil strings into a (N_foils, N_CST_weights) array.
-    Outputs a stacked numpy array containing [lower_weights, upper_weights, LE_weight, TE_thickness]
-    for each airfoil, which can be fed directly to JAX.
-    """
-    weights_list = []
-    
-    for name in airfoil_names:
-        # KulfanAirfoil calculates the CST parameterization on instantiation
-        kf = asb.KulfanAirfoil(name)
-        p = kf.kulfan_parameters
-        
-        # Flatten the dictionary into a single 1D array
-        flat_weights = np.concatenate([
-            p['lower_weights'],
-            p['upper_weights'],
-            [p['leading_edge_weight']],
-            [p['TE_thickness']]
-        ])
-        weights_list.append(flat_weights)
-        
-    return np.array(weights_list)
-
 def overwrite_hub_planform(r, c, beta, r_foils, hub_chord=None, hub_twist=0.0, aero_pitch_axis=0.25):
     """
-    Overwrites the chord and twist arrays in the structural root region to 
+    Overwrites the chord and twist arrays in the structural root region to
     ensure a flat, untwisted hub that smoothly blends into the aerodynamic planform.
+    Uses the same blend as the optimiser (blend_planform), so exported geometry matches the analysed blade.
     Also returns a dynamic pitch_axis array that shifts from 0.5 (hub) to the aero axis.
     """
-    import numpy as np
-    
     r_hub = r_foils[1]
     r_aero = r_foils[2]
-    
-    c_new = np.copy(c)
-    beta_new = np.copy(beta)
-    pitch_axis = np.full_like(r, aero_pitch_axis, dtype=float)
-    
+
     if hub_chord is None:
         hub_chord = c[0]
-    
-    c_aero = np.interp(r_aero, r, c)
-    beta_aero = np.interp(r_aero, r, beta)
-    
-    for i, r_i in enumerate(r):
-        if r_i <= r_hub:
-            # Zone 1: Pure Hub
-            c_new[i] = hub_chord
-            beta_new[i] = hub_twist
-            pitch_axis[i] = 0.5  # Centered structurally
-            
-        elif r_i < r_aero:
-            # Zone 2: Blend Region (Cosine interpolation)
-            linear_fraction = (r_i - r_hub) / (r_aero - r_hub)
-            blend_fraction = 0.5 * (1 - np.cos(np.pi * linear_fraction))
-            
-            c_new[i] = hub_chord + blend_fraction * (c_aero - hub_chord)
-            beta_new[i] = hub_twist + blend_fraction * (beta_aero - hub_twist)
-            pitch_axis[i] = 0.5 + blend_fraction * (aero_pitch_axis - 0.5)
-            
-    return c_new, beta_new, pitch_axis
+
+    blend, inboard, anchor = planform_blend_weights(r, r_hub, r_aero)
+    c_new, beta_new = apply_planform_blend(np.asarray(c), np.asarray(beta), blend, inboard, anchor, hub_chord, hub_twist)
+
+    # Pitch axis moves from the structural centre (0.5) at the hub to the aerodynamic axis
+    pitch_axis = np.where(inboard, 0.5 + blend * (aero_pitch_axis - 0.5), aero_pitch_axis)
+
+    return np.asarray(c_new), np.asarray(beta_new), pitch_axis
 
 def export_to_creo_ibl(r, c, beta, blade_coords, exportname, 
                        pitch_axis=0.25, scale_to_mm=True, skin_thickness=0.0):
@@ -543,15 +628,15 @@ if __name__ == "__main__":
     import numpy as np
     import matplotlib.pyplot as plt
     import pyvista as pv
-    import results 
+    from init import Propeller
 
-    # Load the saved aerodynamic propeller
-    prop_filename = "Currawong_V1" 
-    inputs, params = results.loadprop(prop_filename)
-    
-    r = np.array(params.r)
-    c = np.array(params.c)
-    beta = np.array(params.beta)
+    # Load the saved aerodynamic propeller (r_foils, hub and CST sections come from its BladeSpec)
+    prop = Propeller.load("Currawong_V1")
+    blade = prop.blade
+
+    r = np.array(prop.r)
+    c = np.array(prop.c)
+    beta = np.array(prop.beta)
 
     # Make sure r extends all the way to the origin to prevent center gaps
     if r[0] > 0.001:
@@ -559,25 +644,20 @@ if __name__ == "__main__":
         c = np.insert(c, 0, c[0])
         beta = np.insert(beta, 0, beta[0])
 
-    # Define r_foils =  [r_start, r_hub, r_aero, r_mid..., r_tip]
-    R_hub = 0.015
-    R_aero = 0.05
-    r_foils = np.array([0.0, R_hub, R_aero, r[len(r)//2], r[-1]])
-    
+    # r_foils = [r_start, r_hub, r_aero, r_mid..., r_tip]
+    r_foils = np.array(blade.r_foils)
+
     # Overwrite the structural root on the 3D arrays
-    HUB_CHORD = 0.03
     c, beta, pitch_axis_array = overwrite_hub_planform(
-        r, c, beta, r_foils, 
-        hub_chord=HUB_CHORD, hub_twist=0.0, aero_pitch_axis=0.25
+        r, c, beta, r_foils,
+        hub_chord=blade.hub_chord, hub_twist=np.radians(blade.hub_twist_deg), aero_pitch_axis=0.25
     )
 
-    # Generate Aerodynamic Weights (TEMP FUNCTION. WILL BE MOVED TO INIT WHEN CST OPTIMISATION IS IMPLEMENTED.)
-    # Because r_foils has 5 elements above, we provide 3 airfoil weights.
-    airfoil_names = ["clarky", "clarky", "clarky"] 
-    cst_weights = get_cst_weights_from_names(airfoil_names)
-    
+    # CST sections at the aerodynamic stations r_foils[2:]
+    cst_weights = np.array(prop.cst)
+
     # Generate Coordinates using the simplified function signature
-    blade_coords = generate_blade_coordinates(r, r_foils, cst_weights, hub_thickness_ratio=0.1, n_points_per_side=100)
+    blade_coords = generate_blade_coordinates(r, r_foils, cst_weights, hub_thickness_ratio=blade.hub_thickness_ratio, n_points_per_side=100)
 
     # Plot Airfoil Geometries at the specific r_foils control stations
     plt.figure(figsize=(11, 5))

@@ -25,7 +25,7 @@ from dataclasses import replace
 jax.config.update("jax_enable_x64", True)
 jax.config.update("jax_debug_nans", False)  # keep off for these tests: we WANT to see nan, not crash on it
 
-from init import Inputs
+from init import Inputs, Propeller
 import propmodel
 import airflow
 import airfoil
@@ -74,10 +74,14 @@ def finite_diff_grad(f, x, eps=1e-6):
     return unravel(g)
 
 
-def base_params(n_r=None):
+def base_prop(**inputs_overrides):
     """Build a small, fast default propeller for testing."""
-    inputs = Inputs() if n_r is None else Inputs(n_r=n_r)
-    return propmodel.build_default_propeller(inputs=inputs)
+    return Propeller.default(inputs=Inputs(**inputs_overrides))
+
+
+def base_params(**inputs_overrides):
+    """Params for the first flight condition of the default propeller."""
+    return base_prop(**inputs_overrides).condition(0)
 
 
 # ---------------------------------------------------------------------------
@@ -101,22 +105,32 @@ def test_level0_aero_coeffs():
 def test_level0b_aero_coeffs_parametric_swap():
     """Same as level 0 but forcing the safe/analytic ParametricInterpolator.
     If THIS passes while test_level0 fails, NeuralFoilInterpolator is your bug."""
-    old = Inputs.coeff_method
-    Inputs.coeff_method = 0  # ParametricInterpolator (matches airfoil.py's own __main__ idiom)
-    try:
-        params = base_params()
-        V_i = airflow.inflow_model(params.V_i_0, params)
+    params = base_params(coeff_method=0)  # ParametricInterpolator
+    V_i = airflow.inflow_model(params.V_i_0, params)
 
-        def f(c):
-            p = replace(params, c=c)
-            C_L, C_D, C_M = airfoil.aero_coeffs(V_i, p)
-            return jnp.sum(C_L**2) + jnp.sum(C_D**2)
+    def f(c):
+        p = replace(params, c=c)
+        C_L, C_D, C_M = airfoil.aero_coeffs(V_i, p)
+        return jnp.sum(C_L**2) + jnp.sum(C_D**2)
 
-        val, g = jax.value_and_grad(f)(params.c)
-        print(f"  forward value = {val}")
-        return report("Level 0b: aero_coeffs() d/dc [ParametricInterpolator]", g)
-    finally:
-        Inputs.coeff_method = old
+    val, g = jax.value_and_grad(f)(params.c)
+    print(f"  forward value = {val}")
+    return report("Level 0b: aero_coeffs() d/dc [ParametricInterpolator]", g)
+
+
+def test_level0c_aero_coeffs_cst():
+    """Section shape sensitivity: NeuralFoil coefficients and confidence w.r.t. the CST weights."""
+    params = base_params()
+    V_i = airflow.inflow_model(params.V_i_0, params)
+
+    def f(cst):
+        p = replace(params, cst=cst)
+        C_L, C_D, C_M, conf = airfoil.aero_coeffs(V_i, p, return_confidence=True)
+        return jnp.sum(C_L**2) + jnp.sum(C_D**2) + jnp.sum(conf)
+
+    val, g = jax.value_and_grad(f)(params.cst)
+    print(f"  forward value = {val}")
+    return report("Level 0c: aero_coeffs() d/dcst [NeuralFoil + confidence]", g)
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +157,7 @@ def test_level1_resultant_velocity():
 def test_level2_bemt_residuals():
     params = base_params()
     V_scale = propmodel.get_velocity_scales(params)
-    lambda_0 = params.V_i_0[Inputs.bemt_type] / V_scale
+    lambda_0 = params.V_i_0[params.cfg.solve_rows] / V_scale
 
     def f(c, lam):
         p = replace(params, c=c)
@@ -185,8 +199,8 @@ def test_level4_objectives():
 
     def f(c):
         p = replace(params, c=c)
-        motor_power, thrust, rms_MIL_err, V_i_0 = proptimiser.objectives(p)
-        return motor_power + thrust + rms_MIL_err
+        motor_power, thrust, V_i_0 = proptimiser.objectives(p)
+        return motor_power + thrust
 
     val, g = jax.value_and_grad(f)(params.c)
     print(f"  forward value = {val}")
@@ -210,9 +224,21 @@ def test_level5_condition_cost():
 # Level 6: one real solver.step() through jaxopt.LBFGSB (end-to-end)
 # ---------------------------------------------------------------------------
 
+def test_level5b_total_cost():
+    """Full multi-condition cost (incl. thickness and confidence penalties) w.r.t. every design variable."""
+    solver = proptimiser.LBFGSBSolver(base_prop())
+
+    def f(x):
+        cost, V_i_0 = proptimiser.total_cost(x, solver.params_struct, solver.space)
+        return cost
+
+    val, g = jax.value_and_grad(f)(solver.vars_scaled)
+    print(f"  forward value = {val}")
+    return report("Level 5b: total_cost() d/d(design variables)", g)
+
+
 def test_level6_solver_step():
-    params_base = base_params()
-    solver = proptimiser.LBFGSBSolver(params_base)
+    solver = proptimiser.LBFGSBSolver(base_prop())
     state = solver.init_state()
     vars_scaled, state, V_i_0 = solver.step(solver.vars_scaled, state, solver.params_struct)
 
@@ -229,11 +255,13 @@ def test_level6_solver_step():
 LEVELS = [
     test_level0_aero_coeffs,
     test_level0b_aero_coeffs_parametric_swap,
+    test_level0c_aero_coeffs_cst,
     test_level1_resultant_velocity,
     test_level2_bemt_residuals,
     test_level3_induced_velocity,
     test_level4_objectives,
     test_level5_condition_cost,
+    test_level5b_total_cost,
     test_level6_solver_step,
 ]
 

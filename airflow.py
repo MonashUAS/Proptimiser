@@ -3,9 +3,6 @@ import jax.numpy as jnp
 import jax
 from jax import lax
 
-# Internal Inputs
-from init import Inputs
-
 ##  Dimensionless Constants 
 def calc_mach(V, a):
     ''' 
@@ -26,7 +23,7 @@ def equivelantActuatorDiskEfficiency(T, params):
     Uses general momentum theory to solve for induced velocity v_i, 
     avoiding division by zero at V_x = 0.
     '''
-    R = Inputs.R_tip  # Assuming R_tip is inside params or Inputs
+    R = params.cfg.R_tip
     A_disk = jnp.pi * (R**2)
     
     # Ideal hover induced velocity: v_0 = sqrt(T / (2 * rho * A))
@@ -117,7 +114,7 @@ def pitt_peters(V_i_0, params):
     Output: V_i of shape (3, N_r, N_psi)
     '''
     V_x, V_yz, r, psi = params.V_x, params.V_yz, params.r, params.psi
-    R = Inputs.R_tip
+    R = params.cfg.R_tip
 
     V_ia_0 = V_i_0[0]
     xi = jnp.arctan2(V_yz, V_x + V_ia_0)          # shape (n_r,), local per station
@@ -152,7 +149,7 @@ def inflow_model(V_i_0: jnp.ndarray, params) -> jnp.ndarray:
     Returns:
         Calculated 3D induced velocity field of shape (3, n_r, n_psi).
     '''
-    V_i = lax.switch(Inputs.inflow_model, [simple_inflow, pitt_peters, peters_he_model], *(V_i_0, params))
+    V_i = lax.switch(params.cfg.inflow_model, [simple_inflow, pitt_peters, peters_he_model], *(V_i_0, params))
     return V_i
 
 
@@ -172,7 +169,7 @@ def prandtl_tip_loss(phi, params):
     eps = 1e-3
     B = params.N
     r = params.r
-    R_tip = Inputs.R_tip * 1.05
+    R_tip = params.cfg.R_tip * 1.05
 
     abs_phi = jnp.abs(phi)
     sin_phi_safe = jnp.maximum(jnp.sin(abs_phi), 1e-3)   #guard low-phi (rotation-dominated) stations
@@ -196,7 +193,7 @@ def prandtl_root_loss(phi, params):
     eps = 1e-2
     B = params.N
     r = params.r
-    R_hub = Inputs.R_hub / 2.0
+    R_hub = params.cfg.R_hub / 2.0
 
     abs_phi = jnp.abs(phi)
     sin_phi_safe = jnp.maximum(jnp.sin(abs_phi), 1e-3)   #guard low-phi (rotation-dominated) stations
@@ -220,8 +217,8 @@ def tip_root_loss_factors(phi, params):
     
     Takes in phi of shape (N_r, N_psi)
     '''
-    tip_loss = lax.switch(Inputs.tip_loss_model, [no_loss, prandtl_tip_loss], phi, params)
-    root_loss = lax.switch(Inputs.root_loss_model, [no_loss, prandtl_root_loss], phi, params)
+    tip_loss = lax.switch(params.cfg.tip_loss_model, [no_loss, prandtl_tip_loss], phi, params)
+    root_loss = lax.switch(params.cfg.root_loss_model, [no_loss, prandtl_root_loss], phi, params)
 
     return tip_loss, root_loss
 
@@ -263,7 +260,7 @@ def high_induction_correction(dT_classical, V_ia, F, params):
     DEPRECIATED
     '''
     return lax.switch(
-        Inputs.high_induction_model,
+        params.cfg.high_induction_model,
         [no_high_induction, buhl_high_induction],
         dT_classical, V_ia, F, params
     )

@@ -3,7 +3,6 @@
 # External Imports
 import numpy as np
 import matplotlib.pyplot as plt
-import jax
 import jax.numpy as jnp
 import equinox as eqx
 from scipy.interpolate import make_interp_spline
@@ -11,8 +10,8 @@ import queue
 
 # Internal Imports
 import propmodel
-import init
-#import geometry
+from init import Inputs, Propeller
+import geometry
 import airfoil
 import airflow
 
@@ -109,28 +108,23 @@ class DraggableSplineEditor:
         # Called after the window is closed to retrieve the final array
         return self._get_spline()
 
-def iterativesmoothing(params):
+def iterativesmoothing(prop):
     '''
-    Opens interactive graphical editors to manually smooth Chord and Beta.
+    Opens interactive graphical editors to manually smooth Chord and Beta; returns the updated Propeller.
     '''
+    r = np.array(prop.r)
+
     print("Opening Interactive Smoother for Chord...")
-    chord_editor = DraggableSplineEditor(params.r, params.c, num_cps=10, name="Chord (c)")
+    chord_editor = DraggableSplineEditor(r, np.array(prop.c), num_cps=10, name="Chord (c)")
     plt.show() # Pauses execution until the user closes the plot window
     new_c = chord_editor.get_final_data()
-    
+
     print("Opening Interactive Smoother for Twist (Beta)...")
-    beta_editor = DraggableSplineEditor(params.r, params.beta, num_cps=10, name="Twist (Beta)")
+    beta_editor = DraggableSplineEditor(r, np.array(prop.beta), num_cps=10, name="Twist (Beta)")
     plt.show()
     new_beta = beta_editor.get_final_data()
-    
-    # Safely inject the modified arrays back into the PyTree
-    params = eqx.tree_at(
-        lambda p: (p.c, p.beta), 
-        params, 
-        (new_c, new_beta)
-    )
-    
-    return params
+
+    return prop.with_state(c=new_c, beta=new_beta)
 
 
 class LivePropPlotter:
@@ -139,13 +133,15 @@ class LivePropPlotter:
     '''
     def __init__(self, params_base):
         # Setup Figure
-        self.fig = plt.figure(figsize=(14, 8))
+        self.fig = plt.figure(figsize=(18, 9))
         self.r = np.array(params_base.r * 1000)  # Radius in mm
         self.r_m = np.array(params_base.r)      # Radius in m
         self.psi = np.array(params_base.psi)
+        self.r_cst = np.array(params_base.r_cst)
+        self.x_foil = geometry.cosine_spacing(80)
 
         # Subplot: Chord & Twist
-        self.ax1 = self.fig.add_subplot(2, 2, 1)
+        self.ax1 = self.fig.add_subplot(2, 3, 1)
         self.line_c, = self.ax1.plot(self.r, np.zeros_like(self.r), 'b-o', label='Chord (mm)')
         self.ax1_twin = self.ax1.twinx()
         self.line_beta, = self.ax1_twin.plot(self.r, np.zeros_like(self.r), 'r-o', label='Beta (deg)')
@@ -158,7 +154,7 @@ class LivePropPlotter:
         self.ax1.grid(True, alpha=0.3)
 
         # Subplot 2: Convergence
-        self.ax2 = self.fig.add_subplot(2, 2, 2)
+        self.ax2 = self.fig.add_subplot(2, 3, 2)
         self.line_err, = self.ax2.plot([], [], 'orange', marker='o', label='State Error')
         self.ax2.set_title("Solver Convergence History")
         self.ax2.set_xlabel("Iteration")
@@ -166,19 +162,31 @@ class LivePropPlotter:
         self.ax2.set_yscale('log') 
         self.ax2.grid(True, which="both", alpha=0.3)
 
+        # Subplot 3: CST sections at the hub and aerodynamic stations
+        self.ax_foil = self.fig.add_subplot(2, 3, 3)
+        self.lines_foil = [
+            self.ax_foil.plot([], [], label=f"r = {r_f * 1000:.0f} mm")[0] for r_f in self.r_cst
+        ]
+        self.ax_foil.set_title("Airfoil Sections (r_foils stations)")
+        self.ax_foil.set_xlabel("x/c")
+        self.ax_foil.set_ylabel("y/c")
+        self.ax_foil.set_aspect("equal", adjustable="datalim")
+        self.ax_foil.legend(loc="upper right", fontsize=8)
+        self.ax_foil.grid(True, alpha=0.3)
+
         dummy_V_i_a = np.zeros((len(self.r), len(self.psi)))
         # Wrap data periodically for 360-degree polar contouring
         psi_plot = np.append(self.psi, 2 * np.pi)
         dummy_V_i_a = np.hstack([dummy_V_i_a, dummy_V_i_a[:, :1]])
 
-        # Subplot 3: Polar Map (Induced Velocity+swirl vectors)
-        self.ax3 = self.fig.add_subplot(2, 2, 3, projection="polar")
+        # Subplot 4: Polar Map (Induced Velocity+swirl vectors)
+        self.ax3 = self.fig.add_subplot(2, 3, 4, projection="polar")
         self.ax3.set_title("Induced Velocity Map [m/s]\n", pad=15)
         self.contour = self.ax3.contourf(psi_plot, self.r_m, dummy_V_i_a, cmap='viridis')
         self.cbar = self.fig.colorbar(self.contour, ax=self.ax3, pad=0.1)
 
-        # Subplot 4: Induced Velocity Profile & Loss Metrics
-        self.ax4 = self.fig.add_subplot(2, 2, 4)
+        # Subplot 5: Induced Velocity Profile & Loss Metrics
+        self.ax4 = self.fig.add_subplot(2, 3, 5)
         self.line_via_avg, = self.ax4.plot(self.r, np.zeros_like(self.r), 'g-', linewidth=2, label=r'Avg $V_{i,a}$ [m/s]')
         self.line_vit_avg, = self.ax4.plot(self.r, np.zeros_like(self.r), 'c-', linewidth=2, label=r'Avg $V_{i,t}$ [m/s]')
 
@@ -195,6 +203,16 @@ class LivePropPlotter:
         lines = [self.line_via_avg, self.line_vit_avg, self.line_loss]
         labels = [l.get_label() for l in lines]
         self.ax4.legend(lines, labels, loc='upper right')
+
+        # Subplot 6: Section thickness along the span
+        self.ax_tc = self.fig.add_subplot(2, 3, 6)
+        self.line_tc, = self.ax_tc.plot(self.r, np.zeros_like(self.r), 'k-o', label='t/c at BEMT stations')
+        self.points_tc, = self.ax_tc.plot(self.r_cst * 1000, np.zeros_like(self.r_cst), 'rs', label='r_foils stations')
+        self.ax_tc.set_title("Section Thickness Distribution")
+        self.ax_tc.set_xlabel("Radius (mm)")
+        self.ax_tc.set_ylabel("Max t/c")
+        self.ax_tc.legend(loc="upper right")
+        self.ax_tc.grid(True, alpha=0.3)
 
         plt.tight_layout()
 
@@ -228,6 +246,17 @@ class LivePropPlotter:
         iters = np.arange(len(error_log))
         self.line_err.set_data(iters, error_log)
 
+        # Update Subplot 3 Lines (CST sections, closed TE -> LE -> TE outlines)
+        y_upper, y_lower = geometry.kulfan_coordinates(latest_params.cst, self.x_foil)
+        x_loop = np.concatenate([self.x_foil[::-1], self.x_foil[1:]])
+        for line, y_u, y_l in zip(self.lines_foil, np.array(y_upper), np.array(y_lower)):
+            line.set_data(x_loop, np.concatenate([y_u[::-1], y_l[1:]]))
+
+        # Update Subplot 6 Lines (Thickness)
+        kulfan_r = geometry.cst_at_stations(latest_params.r, latest_params.r_cst, latest_params.cst)
+        self.line_tc.set_ydata(geometry.max_thickness(kulfan_r))
+        self.points_tc.set_ydata(geometry.max_thickness(latest_params.cst))
+
         # Update Subplot 4 Lines (Induced Velocity Profile & Losses)
         V_ia = V_i[0]
         V_it = V_i[1]
@@ -245,7 +274,7 @@ class LivePropPlotter:
         # Dynamically Re-scale XY Cartesian Axes limits
         self.ax4.set_autoscaley_on(True)
         
-        for ax in [self.ax1, self.ax1_twin, self.ax2, self.ax4]:
+        for ax in [self.ax1, self.ax1_twin, self.ax2, self.ax_foil, self.ax4, self.ax_tc]:
             ax.relim()
             ax.autoscale_view()
             
@@ -390,162 +419,39 @@ def debug_diagnostics_plot(params, cond_idx, show=True):
             plt.show(block=False) # Non-blocking so all windows open together
         return fig
 
-def is_serialisable_leaf(x):
+def propgeomblender(prop_names, weights):
     '''
-    Determines if a PyTree leaf is a data type that Equinox serialises by default.
+    Weighted average of chord, beta and CST sections across several saved propellers,
+    returned on the last propeller's Inputs and BladeSpec.
     '''
-    if isinstance(x, (jax.Array, np.ndarray, bool, int, float, complex)):
-        return True
-    return False
+    props = [Propeller.load(name) for name in prop_names]
+    base = props[-1]
+    for name, prop in zip(prop_names, props):
+        if prop.c.shape != base.c.shape or prop.cst.shape != base.cst.shape:
+            raise ValueError(f"{name} has a different radial grid or number of CST stations to {prop_names[-1]}")
 
-def load_perfect_skeleton(filename, base_skeleton):
-    '''
-    Reads an .eqx file to discover the exact shapes and data types of stored arrays,
-    then updates a dummy base_skeleton PyTree to match perfectly,
-    skipping non-serialisable configuration fields like strings or functions.
-    '''
-    if not filename.endswith(".eqx"):
-        filename += ".eqx"
-        
-    # Read all array/scalar shapes and dtypes sequentially from the binary file stream
-    file_shapes = []
-    file_dtypes = []
-    with open("propellers/"+filename, "rb") as f:
-        while True:
-            try:
-                # np.load automatically advances the file pointer across saved entries
-                arr = np.load(f)
-                file_shapes.append(arr.shape)
-                file_dtypes.append(arr.dtype)
-            except Exception:
-                break
-
-    # Flatten the dummy skeleton to get its structural blueprint
-    dummy_leaves, treedef = jax.tree_util.tree_flatten(base_skeleton)
-
-    # Match file shapes AND dtypes ONLY to fields Equinox actually serialises
-    perfect_leaves = []
-    file_idx = 0
-    
-    for leaf in dummy_leaves:
-        if is_serialisable_leaf(leaf):
-            if file_idx >= len(file_shapes):
-                raise RuntimeError(
-                    f"Structure mismatch for {filename}: the file contains fewer serialized items "
-                    f"({len(file_shapes)}) than the class definition expects."
-                )
-            shape = file_shapes[file_idx]
-            dtype = file_dtypes[file_idx]
-            file_idx += 1
-            
-            # For 0D scalar shapes, use the saved dtype to cast a 0 into the correct 
-            # native Python primitive (int, float, bool)
-            if shape == () and isinstance(leaf, (bool, int, float, complex)) and not isinstance(leaf, jax.Array):
-                # .item() safely casts a 0D numpy scalar to the nearest Python type
-                perfect_leaves.append(np.zeros((), dtype=dtype).item())
-            else:
-                # Use the extracted dtype for the dummy JAX array
-                perfect_leaves.append(jnp.zeros(shape, dtype=dtype))
-        else:
-            # Leave non-serialisable elements (strings, functions) completely untouched
-            perfect_leaves.append(leaf)
-
-    if file_idx != len(file_shapes):
-        raise RuntimeError(
-            f"Structure mismatch for {filename}: the file contains {len(file_shapes)} serialised items, "
-            f"but the skeleton layout identified {file_idx} serialisable fields."
-        )
-    perfect_skeleton = jax.tree_util.tree_unflatten(treedef, perfect_leaves)
-    return perfect_skeleton
-
-
-def loadprop(prop_timestamp):
-    '''
-    Load and plot a propeller from saved files using just the timestamp.
-    Automatically detects and handles all array dimensions (including dynamic logs).
-    '''
-    inputs_filename = f"prop_inputs_{prop_timestamp}"
-    params_filename = f"prop_params_{prop_timestamp}"
-
-    # Load Inputs
-    print(f"Loading {inputs_filename}.eqx...")
-    dummy_inputs = init.Inputs()
-    perfect_inputs_skeleton = load_perfect_skeleton(inputs_filename, dummy_inputs)
-    inputs = perfect_inputs_skeleton.load_state(inputs_filename)
-
-    # Load Params
-    print(f"Loading {params_filename}.eqx...")
-    
-    # Define a fast dummy airfoil interpolator to bypass slow loading & NaN errors
-    airfoil_interp = airfoil.load_airfoil_data("arad10")
-
-    # Initialize a baseline structure using generic 0D scalar arrays
-    dummy_scalar = jnp.array(0.0)
-    base_params = init.Params(
-        airfoil="arad10",
-        airfoil_interp=airfoil_interp,
-        N=2,
-        c=dummy_scalar, beta=dummy_scalar,
-        r=dummy_scalar, dr=dummy_scalar, psi=dummy_scalar, dpsi=dummy_scalar,
-        V_x=dummy_scalar, V_yz=dummy_scalar, 
-        omega=dummy_scalar, omega_max=0.0,
-        tilt=dummy_scalar, tilt_scale=0.0,
-        V_i_0=dummy_scalar, c_scale=0.0, beta_scale=0.0,
-        error_log=dummy_scalar, time_log=dummy_scalar,
-        objective_thrust=dummy_scalar, objective_MIL=dummy_scalar, objective_power=int(1),
-        objective_weight=dummy_scalar, thrust_target=dummy_scalar,
-    )
-
-    # Automatically adapt the base_params structure to match the file's exact shapes
-    perfect_params_skeleton = load_perfect_skeleton(params_filename, base_params)
-    params = perfect_params_skeleton.load_state(params_filename)
-
-    return inputs, params
-
-
-def propgeomblender(timestamps, weights):
-    '''
-    Averages chord and beta across multiple timestamps, 
-    returning params with the updated geometry.
-    '''
-    # Collect data into arrays of shape (len(timestamps), N_radial_stops)
-    all_c = []
-    all_beta = []
-    
-    for ts in timestamps:
-        inputs, params = loadprop(ts)
-        all_c.append(params.c)
-        all_beta.append(params.beta)
-    
-    C_matrix = np.array(all_c)
-    Beta_matrix = np.array(all_beta)
-    
-    avg_c = weights.dot(C_matrix)
-    avg_beta = weights.dot(Beta_matrix)
-
-    params = eqx.tree_at(
-    lambda p: (p.c, p.beta), 
-    params, 
-    (avg_c, avg_beta)
-    )
-    return inputs, params
+    weights = np.asarray(weights)
+    avg = {
+        k: jnp.tensordot(weights, jnp.stack([getattr(prop, k) for prop in props]), axes=1)
+        for k in ("c", "beta", "cst")
+    }
+    return base.with_state(**avg)
 
 if __name__ == "__main__":
 
     import proptimiser
     from matplotlib.animation import FuncAnimation
 
-    # pass the base name/timestamp
-    timestamps = ["Currawong_V1.eqx"]
+    # propellers/<name>.json to evaluate, blended by weight
+    prop_names = ["Currawong_V1"]
     weights = np.array([1.0])
     # unit test propeller
-    #inputs, params_base, _, _ = propmodel.apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0", plot=False)
-    inputs = init.Inputs() # comment out to use flight conditions from propeller file
-    inputs.save_state("prop_inputs_Currawong_V1")
+    #prop, _, _, _ = propmodel.apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0", plot=False)
     # geometry blend of n propellers
-    inputs, params_base = propgeomblender(timestamps, weights) 
+    prop = propgeomblender(prop_names, weights)
+    # prop = prop.with_inputs(Inputs())  # uncomment to evaluate at the flight conditions in init.py instead of the saved ones
 
-    print(f"--- Evaluating {inputs.n_cond} Flight Conditions ---")
+    print(f"--- Evaluating {prop.inputs.n_cond} Flight Conditions ---")
 
     # Execution & Processing Loop
     exit_input = "n"
@@ -553,18 +459,9 @@ if __name__ == "__main__":
         evaluated_conditions = []
 
         print("\nResolving Induced Velocity Field for all conditions...")
-        for idx in range(inputs.n_cond):
-            # Unpack unique operating points and batched variables
-            cond_omega = inputs.omega[idx] # manually input omega in init.py
-            cond_Vx = inputs.V_x[idx]
-            cond_Vyz = inputs.V_yz[idx]
-
+        for idx in range(prop.inputs.n_cond):
             # Evaluate at operating conditons
-            params_cond = eqx.tree_at(
-                lambda p: (p.omega, p.V_x, p.V_yz), 
-                params_base, 
-                (jnp.squeeze(cond_omega), jnp.squeeze(cond_Vx), jnp.squeeze(cond_Vyz))
-            )
+            params_cond = prop.condition(idx)
             
             # This guarantees that geometry changes (e.g. from smoothing) propagate into V_i.
             _, V_i_0_solved = propmodel.induced_velocity(params_cond)
@@ -579,9 +476,11 @@ if __name__ == "__main__":
             evaluated_conditions.append(params_cond)
             
             # Extract and print objective metrics
-            pwr, thr, mil, _ = proptimiser.objectives(params_cond)
-            cond_omega, pwr, thr, mil = jnp.squeeze(cond_omega), jnp.squeeze(pwr), jnp.squeeze(thr), jnp.squeeze(mil)
-            print(f"Cond: {idx:<3} | Omega: {float(cond_omega):<6.2f} | Motor Pwr: {float(pwr):<8.4f} | Thrust: {float(thr):<8.4f} | MIL RMS: {float(mil):<10.4f}")
+            pwr, thr, _ = proptimiser.objectives(params_cond)
+            print(f"Cond: {idx:<3} | Omega: {float(params_cond.omega):<6.2f} | Motor Pwr: {float(pwr):<8.4f} | Thrust: {float(thr):<8.4f}")
+
+        # Keep the solved induced velocity as the warm start for the next pass (and for saving)
+        prop = prop.with_state(V_i_0=jnp.stack([p.V_i_0 for p in evaluated_conditions]))
 
         # Post-Processing User Directives
         user_input = input("\nWould you like to plot solver outputs? (y/n): ")
@@ -616,18 +515,18 @@ if __name__ == "__main__":
 
         user_input = input("\nDoes your propeller need control-point based smoothing? (y/n): ")
         if user_input.lower() == 'y':
-            # Smoothing modifies the global underlying geometry skeleton
-            params_base = iterativesmoothing(params_base)
+            # Smoothing modifies the underlying geometry; conditions are rebuilt from it on the next pass
+            prop = iterativesmoothing(prop)
             print("Geometry updated. Induced velocity fields will automatically refresh on the next loop pass.")
-            # TODO: implement induced velocity update/refresh
-            # Save Results/Export Geometry if Required
+
+        # Save Results/Export Geometry if Required
         user_input = input('Save Propeller? (y/n): ')
         if user_input.lower() == 'y':
             propname = input('Input Prop Name: ')
-            paramsfile = "prop_params_" + propname
-            inputsfile = "prop_inputs_" + propname
-            print(f'Saving Propeller Inputs/Parameters to {paramsfile} and {inputsfile}')
-            params_base.save_state(paramsfile)
-            inputs.save_state(inputsfile)
+            try:
+                prop.save(propname)
+            except FileExistsError:
+                if input(f"{propname} already exists. Overwrite? (y/n): ").lower() == 'y':
+                    prop.save(propname, overwrite=True)
 
         exit_input = input('\nExit post-processing loop completely? (y/n): ')

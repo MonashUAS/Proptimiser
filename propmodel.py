@@ -9,7 +9,7 @@ import jaxopt
 import matplotlib.pyplot as plt
 
 # Internal Libraries
-from init import build_default_propeller, Inputs, Params
+from init import Inputs, BladeSpec, Params, Propeller
 from airfoil import aero_coeffs
 from airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskEfficiency, resultantVelocityComponents, high_induction_correction
 
@@ -76,7 +76,7 @@ def dT_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
     # Average thrust in each annulus over one rotation
     dT_blade_ave = N / (2 * jnp.pi) * jnp.trapezoid(dT_blade_instantaneous, x=psi, axis=1)
 
-    if Inputs.verbose>1:
+    if params.cfg.verbose>1:
         jax.debug.print("dT_blade: {dT_blade_ave}", dT_blade_ave=dT_blade_ave)
     
     return dT_blade_ave
@@ -313,7 +313,7 @@ def bemt_residuals(lambda_i_0_guess, params):
     V_i_0_guess_dim = lambda_i_0_guess * V_scale
 
     # Introduce zero for non-solved components to maintain shape (3, n_r)
-    V_i_0_guess_dim = jnp.zeros_like(params.V_i_0).at[Inputs.bemt_type].set(V_i_0_guess_dim)
+    V_i_0_guess_dim = jnp.zeros_like(params.V_i_0).at[params.cfg.solve_rows].set(V_i_0_guess_dim)
 
     # Expand to 3D grid
     V_i = inflow_model(V_i_0_guess_dim, params)
@@ -329,13 +329,13 @@ def bemt_residuals(lambda_i_0_guess, params):
     dQ_res_physical = torque_residual(V_i, params)
 
     # Scale by an approximate ideal torque to make O(1)
-    Q_ref = params.thrust_target * Inputs.R_tip 
+    Q_ref = params.thrust_target * params.cfg.R_tip 
     dQ_res = dQ_res_physical / Q_ref
 
     res_components = {0: dT_res, 1: dQ_res, 2: dR_res}
     res = jnp.stack([res_components[i] for i in range(3)], axis=0)
     # filter out non-solved components
-    res_filtered = res[Inputs.bemt_type]
+    res_filtered = res[params.cfg.solve_rows]
     
     return res_filtered
 
@@ -345,7 +345,8 @@ def get_velocity_scales(params):
     to act as a diagonal preconditioner for the Broyden solver.
     Returns: V_scale -> shape (3, 1) for broadcasting against (3, n_r) arrays.
     """
-    A_disk = jnp.pi * (Inputs.R_tip ** 2)
+    R_tip = params.cfg.R_tip
+    A_disk = jnp.pi * (R_tip ** 2)
     
     # Axial Scale: Mean Momentum Inflow
     v_h = jnp.sqrt(params.thrust_target / (2.0 * params.rho * A_disk))
@@ -354,14 +355,14 @@ def get_velocity_scales(params):
     # Tangential Scale: Ideal Mean Swirl
     P_ideal = params.thrust_target * (params.V_x + V_ia_mean)
     Q_ideal = P_ideal / params.omega
-    V_it_mean = Q_ideal / (params.rho * A_disk * (params.V_x + V_ia_mean) * Inputs.R_tip)
+    V_it_mean = Q_ideal / (params.rho * A_disk * (params.V_x + V_ia_mean) * R_tip)
     
     # Radial Scale: Tip Speed (Centrifugal reference)
-    V_tip = params.omega * Inputs.R_tip
+    V_tip = params.omega * R_tip
 
     # Stack and reshape to (3, 1) so it broadcasts perfectly with (3, n_r)
     V_scale = jnp.array([V_ia_mean, V_it_mean, V_tip])[:, None]
-    V_scale = V_scale[Inputs.bemt_type]  # Only keep the components that are being solved for
+    V_scale = V_scale[params.cfg.solve_rows]  # Only keep the components that are being solved for
     return V_scale
 
 @jax.jit
@@ -372,7 +373,7 @@ def induced_velocity(params):
     V_i_0_guess_physical = params.V_i_0
 
     # Apply Induced Velocity Solver Type (remove non-solve components)
-    V_i_0_guess_physical = V_i_0_guess_physical[Inputs.bemt_type]
+    V_i_0_guess_physical = V_i_0_guess_physical[params.cfg.solve_rows]
 
     # Non-Dimensionalise Initial Guess Component-Wise
     V_scale = get_velocity_scales(params)
@@ -381,12 +382,12 @@ def induced_velocity(params):
     # Broyden Solver Call
     solver = jaxopt.Broyden(
         fun=bemt_residuals, 
-        maxiter=Inputs.V_i_0_max_iter, 
-        tol=Inputs.V_i_0_eps,
+        maxiter=params.cfg.V_i_0_max_iter, 
+        tol=params.cfg.V_i_0_eps,
         implicit_diff=True,
         implicit_diff_solve=jaxopt.linear_solve.solve_lu,
         jit = True,
-        verbose = Inputs.verbose
+        verbose = params.cfg.verbose
     )
     
     (lambda_i_0, info) = solver.run(initial_guess_lambda, params)
@@ -395,9 +396,9 @@ def induced_velocity(params):
     V_i_0 = lambda_i_0 * V_scale
 
     # re-add non solver components to the solution vector
-    V_i_0 = jnp.zeros_like(params.V_i_0).at[Inputs.bemt_type].set(V_i_0)
+    V_i_0 = jnp.zeros_like(params.V_i_0).at[params.cfg.solve_rows].set(V_i_0)
 
-    if Inputs.verbose:
+    if params.cfg.verbose:
         final_res = bemt_residuals(lambda_i_0, params)
         jax.debug.print("Final Residuals: {res}", res=final_res)
 
@@ -471,7 +472,7 @@ def actuator_disk_power(T, params):
     T is from momentum theory, 
     '''
     rho = params.rho
-    R   = Inputs.R_tip
+    R   = params.cfg.R_tip
     V_x = params.V_x # freestream velocity
 
     A = jnp.pi*R**2 # disc area
@@ -483,26 +484,23 @@ def single(c, beta, N, plot=False):
     '''
     Single Annulus Solve
     '''
-    inputs = Inputs(
-        n_r=1
-    )
-    # Build the default propeller profile
+    # Build the default propeller profile, then cut it down to one annulus
     beta_deg = float(jnp.degrees(beta))
-    params = build_default_propeller(c=c, beta=beta_deg, inputs=inputs)
+    params = Propeller.default(inputs=Inputs(n_r=2), blade=BladeSpec(N=N), c=c, beta_deg=beta_deg).condition(0)
 
     # Match the specific geometry overrides from your original test case
     params = eqx.tree_at(
-        lambda p: (p.r, p.dr, p.N, p.V_ia_0),
+        lambda p: (p.r, p.dr, p.c, p.beta, p.V_i_0),
         params,
-        (jnp.array([0.3]), jnp.array([0.05]), jnp.array([N]), jnp.full((1,), 1.0))
+        (jnp.array([0.3]), jnp.array([0.05]), params.c[:1], params.beta[:1], params.V_i_0[:, :1])
     )
 
     # Solve Induced Velocity
-    V_ia, _ = induced_velocity(params)
+    V_i, _ = induced_velocity(params)
 
     if plot:
-        # FIX: Changed V_ia[1] to V_ia[0] since there is only 1 radial node
-        plt.plot(jnp.degrees(params.psi), V_ia[0])
+        # Axial component at the single radial node
+        plt.plot(jnp.degrees(params.psi), V_i[0, 0])
         plt.title("Induced Velocity Distribution around Propeller Annulus")
         plt.xlabel("Angle (degrees)")
         plt.ylabel("Induced Velocity (m/s)")
@@ -520,15 +518,8 @@ def flatblade(c, beta, N, plot=False):
     '''
 
     # Utilize your factory function to build the base configuration
-    params = build_default_propeller(c=c, beta=beta)
+    params = Propeller.default(blade=BladeSpec(N=N), c=c, beta_deg=beta).condition(0)
 
-    # Override remaining parameter states cleanly for JAX
-    params = eqx.tree_at(
-        lambda p: (p.N),
-        params,
-        (jnp.array([N]))
-    )
-    
     import os
     import jax.profiler
 
@@ -567,52 +558,19 @@ def flatblade(c, beta, N, plot=False):
 
 def apc_model(filepath, plot=True):
     '''
-    Loads an APC propeller geometry from a .PE0 file, interpolates it onto the 
+    Loads an APC propeller geometry from a .PE0 file, interpolates it onto the
     solver's computational grid, solves the induced velocity, and plots the results.
+
+    Returns (prop, params, V_i_0, T) where prop is the Propeller built from the APC file.
     '''
     import queue
     import results
-    import apcpropanalysis
     from matplotlib.animation import FuncAnimation
 
     print(f"Loading APC Propeller geometry from: {filepath}")
-    
-    # Load raw APC Data dictionary
-    apc_geom = apcpropanalysis.parse_apc_pe0(filepath)
-    
-    # Unpack the specific geometry fields needed
-    r_apc_in = apc_geom["r"]
-    c_apc_in = apc_geom["chord"]
-    beta_apc_deg = apc_geom["twist_deg"]
-    airfoil_apc = "arad10"
-    
-    # Convert inches to meters and degrees to radians to match JAX solver SI units
-    r_apc_m = jnp.array(r_apc_in) * 0.0254
-    c_apc_m = jnp.array(c_apc_in) * 0.0254
-    beta_apc_rad = jnp.radians(jnp.array(beta_apc_deg))
+    prop = Propeller.from_apc(filepath)
+    params = prop.condition(0)
 
-    # Configure default inputs to match the physical boundaries of the APC prop
-    inputs = Inputs()
-    inputs = eqx.tree_at(
-        lambda i: (i.R_hub, i.R_tip), 
-        inputs, 
-        (r_apc_m.min(), r_apc_m.max())
-    )
-    
-    # Build baseline structure
-    params = build_default_propeller(inputs=inputs, airfoil_name=airfoil_apc)
-
-    # Interpolate APC geometry onto the solver's discretized radial array
-    c_interp = jnp.interp(params.r, r_apc_m, c_apc_m)
-    beta_interp = jnp.interp(params.r, r_apc_m, beta_apc_rad)
-
-    # Inject the mapped geometry into the Params tree
-    params = eqx.tree_at(
-        lambda p: (p.c, p.beta),
-        params,
-        (c_interp, beta_interp)
-    )
-    
     # Solve Induced Velocity
     V_i, V_i_0 = induced_velocity(params)
     
@@ -645,7 +603,7 @@ def apc_model(filepath, plot=True):
 
         dummy = input("Done with plots?")
 
-    return inputs, params, V_i_0, T
+    return prop, params, V_i_0, T
 
 if __name__ == "__main__":
-    inputs, params, V_i_0, T = apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0", plot=True)
+    prop, params, V_i_0, T = apc_model("apc_prop_data/propgeom_data/20x8-PERF.PE0", plot=True)
