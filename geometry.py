@@ -14,6 +14,7 @@ import aerosandbox as asb
 N_CST_WEIGHTS = 8
 N_CST = 2 * N_CST_WEIGHTS + 2
 AIRFOIL_DIR = Path(__file__).resolve().parent / "airfoils"
+EXPORT_DIR = Path(__file__).resolve().parent / "exports"
 
 ### Integrand Functions
 def radial_stops(R, r_hub, n_r):
@@ -387,10 +388,11 @@ def overwrite_hub_planform(r, c, beta, r_foils, hub_chord=None, hub_twist=0.0, a
     return np.asarray(c_new), np.asarray(beta_new), pitch_axis
 
 def export_to_creo_ibl(r, c, beta, blade_coords, exportname, 
-                       pitch_axis=0.25, scale_to_mm=True, skin_thickness=0.0):
+                       pitch_axis=0.25, scale_to_mm=True, skin_thickness=0.0, out_dir=EXPORT_DIR):
     """
     Generates a Creo .ibl file with support for a dynamic pitch_axis array.
     Forces coordinate loops to close at the trailing edge for solid CAD imports.
+    Writes <out_dir>/<exportname>.ibl and returns its path.
     """
     import numpy as np
     import aerosandbox as asb
@@ -401,7 +403,9 @@ def export_to_creo_ibl(r, c, beta, blade_coords, exportname,
     if np.isscalar(pitch_axis):
         pitch_axis = np.full(n_r, pitch_axis)
 
-    with open(f"exports/{exportname}.ibl", "w") as f:
+    path = Path(out_dir) / f"{exportname}.ibl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
         # Note: 'Open' here refers to the loft trajectory (spanwise), not the cross-sections
         f.write("Open\nArclength\n") 
         
@@ -437,13 +441,15 @@ def export_to_creo_ibl(r, c, beta, blade_coords, exportname,
                 
     part_type = "Core Insert" if skin_thickness > 0 else "Aerodynamic Skin"
     print(f"Successfully generated Creo geometry: {exportname}.ibl ({n_r} sections) - {part_type}")
+    return path
 
 def export_parting_surface_ibl(r, c, beta, blade_coords, r_foils, exportname, 
                                pitch_axis=0.25, scale_to_mm=True, 
-                               x_margin=5.0, y_margin=5.0, n_camber_points=10):
+                               x_margin=5.0, y_margin=5.0, n_camber_points=10, out_dir=EXPORT_DIR):
     """
     Generates a 3-zone parting surface sheet exported as a single Creo .ibl file.
     Isolates the flat extensions into distinct curve blocks to eliminate all ripples.
+    Writes <out_dir>/<exportname>.ibl and returns its path.
     """    
     n_r, n_foil, _ = blade_coords.shape
     scale = 1000.0 if scale_to_mm else 1.0
@@ -555,7 +561,9 @@ def export_parting_surface_ibl(r, c, beta, blade_coords, r_foils, exportname,
     sections.append(build_zoned_section(y_tip_ext, station_data[-1]))
 
     # Write out the multi-curve IBL file
-    with open(f"exports/{exportname}.ibl", "w") as f:
+    path = Path(out_dir) / f"{exportname}.ibl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
         f.write("Open\n")
         f.write("Arclength\n") 
         
@@ -578,6 +586,41 @@ def export_parting_surface_ibl(r, c, beta, blade_coords, r_foils, exportname,
                 f.write(f"{pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f}\n")
                 
     print(f"Successfully generated 3-zone sharp parting surface: {exportname}.ibl")
+    return path
+
+def blade_export_geometry(prop, n_points_per_side=100):
+    """
+    Blade geometry for CAD export and 3D meshing from a Propeller: the radial grid extended to the spin
+    centre, chord and twist with the structural hub planform applied, the pitch-axis position (x/c) at
+    each station and the section coordinates (n_r, n_points, 2).
+
+    Returns (r, c, beta, pitch_axis, blade_coords).
+    """
+    blade = prop.blade
+    r = np.array(prop.r)
+    c = np.array(prop.c)
+    beta = np.array(prop.beta)
+
+    # Make sure r extends all the way to the origin to prevent center gaps
+    if r[0] > 0.001:
+        r = np.insert(r, 0, 0.0)
+        c = np.insert(c, 0, c[0])
+        beta = np.insert(beta, 0, beta[0])
+
+    # r_foils = [r_start, r_hub, r_aero, r_mid..., r_tip]
+    r_foils = np.array(blade.r_foils)
+
+    # Overwrite the structural root on the 3D arrays
+    c, beta, pitch_axis = overwrite_hub_planform(
+        r, c, beta, r_foils,
+        hub_chord=blade.hub_chord, hub_twist=np.radians(blade.hub_twist_deg), aero_pitch_axis=0.25
+    )
+
+    # Section coordinates from the CST sections at the aerodynamic stations r_foils[2:]
+    blade_coords = generate_blade_coordinates(
+        r, r_foils, np.array(prop.cst), hub_thickness_ratio=blade.hub_thickness_ratio, n_points_per_side=n_points_per_side
+    )
+    return r, c, beta, pitch_axis, blade_coords
 
 def build_propeller_mesh(r, c, beta, blade_coords, pitch_axis=0.25, num_blades=2):
     """
@@ -632,32 +675,10 @@ if __name__ == "__main__":
 
     # Load the saved aerodynamic propeller (r_foils, hub and CST sections come from its BladeSpec)
     prop = Propeller.load("Currawong_V1")
-    blade = prop.blade
+    r_foils = np.array(prop.blade.r_foils)
 
-    r = np.array(prop.r)
-    c = np.array(prop.c)
-    beta = np.array(prop.beta)
-
-    # Make sure r extends all the way to the origin to prevent center gaps
-    if r[0] > 0.001:
-        r = np.insert(r, 0, 0.0)
-        c = np.insert(c, 0, c[0])
-        beta = np.insert(beta, 0, beta[0])
-
-    # r_foils = [r_start, r_hub, r_aero, r_mid..., r_tip]
-    r_foils = np.array(blade.r_foils)
-
-    # Overwrite the structural root on the 3D arrays
-    c, beta, pitch_axis_array = overwrite_hub_planform(
-        r, c, beta, r_foils,
-        hub_chord=blade.hub_chord, hub_twist=np.radians(blade.hub_twist_deg), aero_pitch_axis=0.25
-    )
-
-    # CST sections at the aerodynamic stations r_foils[2:]
-    cst_weights = np.array(prop.cst)
-
-    # Generate Coordinates using the simplified function signature
-    blade_coords = generate_blade_coordinates(r, r_foils, cst_weights, hub_thickness_ratio=blade.hub_thickness_ratio, n_points_per_side=100)
+    # Hub planform, pitch axis and section coordinates along the full span
+    r, c, beta, pitch_axis_array, blade_coords = blade_export_geometry(prop, n_points_per_side=100)
 
     # Plot Airfoil Geometries at the specific r_foils control stations
     plt.figure(figsize=(11, 5))
@@ -680,7 +701,7 @@ if __name__ == "__main__":
     # 3D Model of Propeller
     prop_mesh = build_propeller_mesh(
         r, c, beta, blade_coords, 
-        pitch_axis=pitch_axis_array, num_blades=2
+        pitch_axis=pitch_axis_array, num_blades=prop.blade.N
     )
     
     # Export to Creo .ibl files

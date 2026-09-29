@@ -1,6 +1,7 @@
 # External Imports
 import jax
 import time
+from dataclasses import dataclass
 import sys
 import signal
 import threading
@@ -268,11 +269,123 @@ class DesignSpace(eqx.Module):
         return self.w_thickness * jnp.sum(jax.nn.relu((self.min_tc - t_over_c) / self.min_tc) ** 2)
 
 
+@dataclass
+class Progress:
+    '''
+    State of an optimisation, reported every Inputs.opt_print_every iterations and once more when solve() ends.
+    Per-condition fields are numpy arrays of shape (n_cond,).
+    '''
+    iteration: int              # iterations completed
+    max_iter: int
+    cost: float                 # total cost of the current design
+    error: float                # solver stopping criterion (projected gradient norm for L-BFGS-B)
+    elapsed: float              # seconds since solve() started
+    status: str                 # "running", "converged", "stopped" or "max_iter"
+    omega: np.ndarray
+    thrust: np.ndarray
+    thrust_target: np.ndarray
+    power: np.ndarray           # motor power (W)
+    cost_terms: dict            # unweighted per-condition cost terms: "thrust", "power", "confidence"
+    thickness_penalty: float
+    error_log: np.ndarray       # stopping criterion at the seed and after every iteration
+    params_struct: object       # batched Params of the current design
+
+    @property
+    def thrust_err_pct(self) -> np.ndarray:
+        return 100.0 * (self.thrust - self.thrust_target) / self.thrust_target
+
+    def condition(self, idx: int = 0):
+        '''
+        Params of flight condition idx at the current design, carrying the optimiser error log.
+        '''
+        params = jax.tree_util.tree_map(
+            lambda leaf: leaf[idx] if hasattr(leaf, 'ndim') and leaf.ndim > 0 else leaf,
+            self.params_struct
+        )
+        return eqx.tree_at(lambda p: p.error_log, params, jnp.asarray(self.error_log))
+
+
+class ProgressPrinter:
+    '''
+    Prints optimisation progress as an aligned table (ASCII only, so any console encoding can show it).
+
+    verbose 0: banner and final summary, 1: + one row group per report, 2: + cost terms of every condition.
+    '''
+    HEADER_EVERY = 20       # reports between repeated headers
+
+    def __init__(self, verbose: int = 1, error_name: str = "OptErr"):
+        self.verbose = verbose
+        self.error_name = error_name
+        self.n_reports = 0
+        self.tol = None
+
+    def banner(self, solver_name, space, n_cond, max_iter, tol):
+        self.tol = tol
+        counts = [f"{name} {len(idx)}" for name, idx in space.free]
+        total = sum(len(idx) for _, idx in space.free)
+        print(f"\n{solver_name} | design variables: {', '.join(counts)} ({total} total) | "
+              f"{n_cond} flight condition{'s' if n_cond != 1 else ''} | max {max_iter} iterations, tol {tol:.1e}", flush=True)
+
+    def note(self, text):
+        print(text, flush=True)
+
+    def report(self, progress: Progress):
+        if self.verbose < 1:
+            return
+        if self.n_reports % self.HEADER_EVERY == 0:
+            self._header()
+        self.n_reports += 1
+        self._rows(progress)
+
+    def summary(self, progress: Progress):
+        n = progress.iteration
+        if progress.status == "converged":
+            reason = f"Converged at iteration {n}: {self.error_name} {progress.error:.2e} < tol {self.tol:.1e}"
+        elif progress.status == "stopped":
+            reason = f"Stopped by user after {n} iteration{'s' if n != 1 else ''}"
+        else:
+            reason = f"Reached the iteration limit ({n}) without converging: {self.error_name} {progress.error:.2e} > tol {self.tol:.1e}"
+        per_iter = f" ({progress.elapsed / n:.2f} s/iteration)" if n else ""
+
+        print(f"\n{reason}\n{n} iterations in {progress.elapsed:.1f} s{per_iter}\nFinal design:")
+        self._header()
+        self._rows(progress)
+        print(flush=True)
+
+    def _header(self):
+        names = f"{'Iter':>6}  {'Cost':>11}  {self.error_name:>9} | {'Cond':>4}  {'Omega':>8}  {'Thrust':>8}  {'Target':>8}  {'T-Err':>7}  {'Power':>8} | {'Time':>7}"
+        units = f"{'':>6}  {'':>11}  {'':>9} | {'':>4}  {'[rad/s]':>8}  {'[N]':>8}  {'[N]':>8}  {'[%]':>7}  {'[W]':>8} | {'[s]':>7}"
+        print(f"\n{names}\n{units}\n{'-' * len(names)}")
+
+    def _rows(self, p: Progress):
+        blank = " " * 30      # width of the Iter/Cost/error columns
+        err_pct = p.thrust_err_pct
+        for idx in range(len(p.omega)):
+            lead = f"{p.iteration:>6}  {p.cost:>11.4e}  {p.error:>9.2e}" if idx == 0 else blank
+            time_col = f"{p.elapsed:>7.1f}" if idx == 0 else ""
+            print(f"{lead} | {'C' + str(idx):>4}  {p.omega[idx]:>8.1f}  {p.thrust[idx]:>8.3f}  {p.thrust_target[idx]:>8.3f}  "
+                  f"{err_pct[idx]:>+7.2f}  {p.power[idx]:>8.1f} | {time_col}".rstrip())
+            if self.verbose >= 2:
+                terms = "  ".join(f"{name} {values[idx]:.2e}" for name, values in p.cost_terms.items())
+                print(f"{blank} |       cost terms: {terms}")
+        if self.verbose >= 2:
+            print(f"{blank} |       thickness penalty: {p.thickness_penalty:.2e}")
+        sys.stdout.flush()
+
+
 class BaseSolver(ABC):
-    def __init__(self, prop, update_queue=None):
+    name = "Solver"
+    error_name = "OptErr"       # label of the solver's stopping criterion (state.error)
+
+    def __init__(self, prop, callback=None, stop_event=None):
+        '''
+        callback(progress) receives a Progress at every report and when solve() ends.
+        stop_event, when set, ends solve() after the current iteration (defaults to the Ctrl+C event).
+        '''
         self.prop = prop
         self.inputs = prop.inputs
-        self.update_queue = update_queue
+        self.callback = callback
+        self.stop_event = _stop_event if stop_event is None else stop_event
         self.space, self.params_struct, self.vars_scaled, self.bounds = self._prepare_problem()
 
     def _prepare_problem(self):
@@ -301,27 +414,31 @@ class BaseSolver(ABC):
 
     def solve(self):
         """The main optimization loop returning the optimised Propeller."""
-        # Reset the stop event at the beginning of each solve to ensure clean state
-        _stop_event.clear()
+        if self.stop_event is _stop_event:
+            # The shared Ctrl+C event may still be set by a previous solve; a caller's own event is left alone
+            _stop_event.clear()
 
+        inputs = self.inputs
+        printer = ProgressPrinter(inputs.opt_verbose, self.error_name)
+        printer.banner(self.name, self.space, inputs.n_cond, inputs.opt_max_iter, inputs.opt_tol)
+        printer.note("Compiling the solver (the first iteration can take a while)...")
+
+        start_time = time.time()
         state = self.init_state()
         vars_scaled = self.vars_scaled
         params_struct = self.params_struct
 
-        start_time = time.time()
-        iter_time = start_time + 10
-        print_time = iter_time
-        error_log = jnp.array([1.0])
-        time_log = jnp.array([0])
+        error_log = [float(getattr(state, 'error', 1.0))]
+        time_log = [0.0]
+        last_report = time.time()
+        status = "max_iter"
 
-        print(f"{'Iter':<6} | {'Cond':<5} | {'Omega':<10} | {'Power':<12} | {'Thrust':<12} | {'T-Err':<12} | {'OptErr':<11} | {'Time'}")
-        print("-" * 90)
-
-        for i in range(self.inputs.opt_max_iter):
-            if _stop_event.is_set():
-                # Stop event check
-                print(f"\nStopping: interrupted by user at step {i}", flush=True)
+        for i in range(inputs.opt_max_iter):
+            if self.stop_event.is_set():
+                status = "stopped"
                 break
+
+            iter_start = time.time()
 
             # Step delegated to the specific solver
             vars_scaled, state, V_i_0 = self.step(vars_scaled, state, params_struct)
@@ -329,73 +446,27 @@ class BaseSolver(ABC):
             # Update and rescale params
             params_struct = self.space.from_unit(vars_scaled, params_struct)
 
+            # Keep the solved induced velocity as the warm start for the next step
             V_i_0 = jnp.where(jnp.isfinite(V_i_0), V_i_0, params_struct.V_i_0)
-            # Update the V_i_0 field
-            params_struct = eqx.tree_at(
-                lambda p: (p.V_i_0),
-                params_struct,
-                (V_i_0)
-            )
+            params_struct = eqx.tree_at(lambda p: p.V_i_0, params_struct, V_i_0)
 
-            is_terminal = getattr(state, 'error', 1.0) < self.inputs.opt_tol
-            is_checkpoint = (time.time() - print_time > 5) or (i % 5 == 0)
+            error_log.append(float(getattr(state, 'error', 1.0)))
+            time_log.append(time.time() - iter_start)
 
-            if is_terminal or is_checkpoint:
-                # Calculate State for Printing
-                (thrust_terms, power_terms, confidence_terms), (powers, thrusts, _) = evaluate_all_conditions(params_struct)
-
-                # Vectorized array math for errors
-                t_errs = thrusts - params_struct.thrust_target
-
-                # Extract omega
-                omegas = params_struct.omega
-
-                # Clean zip over the pre-calculated batched arrays
-                for idx, (pwr, thr, t_err, om, c_T, c_P, c_C) in enumerate(zip(
-                    powers, thrusts, t_errs, omegas, thrust_terms, power_terms, confidence_terms
-                )):
-                    # Only print iteration metadata on the first condition row
-                    iter_info = f"{i:<6} |" if idx == 0 else f"{'':<6} |"
-                    opt_err = f"{state.error:<11.3f}" if idx == 0 else f"{'':<11}"
-                    timing = f"{time.time() - iter_time:<4.1f}s" if idx == 0 else ""
-
-                    print(f"{iter_info} C{idx:<3} | {om:<10.2f} | {pwr:<12.4f} | {thr:<12.4f} | {t_err:<12.4f} | {opt_err} | {timing}")
-                    print(f"Cond {idx} Cost Terms -> Thrust: {float(c_T):.4e} | Power: {float(c_P):.4e} | Confidence: {float(c_C):.4e}")
-                if self.space.cst_active:
-                    print(f"Airfoil thickness penalty: {float(self.space.thickness_penalty(params_struct)):.4e}")
-                print_time = time.time()
-
-                ## Plotting Thread Update
-                if self.update_queue is not None:
-                    # Extract Condition 0 (params_hover) from the batched PyTree
-                    params_hover = jax.tree_util.tree_map(
-                        lambda leaf: leaf[0] if hasattr(leaf, 'ndim') and leaf.ndim > 0 else leaf,
-                        params_struct
-                    )
-
-                    # Inject the current error log into the params object
-                    params_hover = eqx.tree_at(
-                        lambda p: p.error_log,
-                        params_hover,
-                        error_log
-                    )
-
-                    # params object to queue
-                    self.update_queue.put(params_hover)
-
-                if is_terminal:
-                    print(f"\nStopping: Convergence reached at step {i}",flush=True)
-                    break
-
-            error_log = jnp.append(error_log, getattr(state, 'error', 1.0))
-            time_log = jnp.append(time_log, time.time() - iter_time)
-            iter_time = time.time()
-
-            if is_terminal:
-                print(f"\nStopping: Convergence reached at step {i}",flush=True)
+            if error_log[-1] < inputs.opt_tol:
+                status = "converged"
                 break
 
-        print(f"\nTotal Solve Time: {time.time() - start_time:.2f} seconds", flush=True)
+            iteration = i + 1
+            if iteration == 1 or iteration % inputs.opt_print_every == 0 or time.time() - last_report > 10.0:
+                progress = self._progress(iteration, state, params_struct, error_log, start_time, "running")
+                printer.report(progress)
+                self._notify(progress)
+                last_report = time.time()
+
+        final = self._progress(len(error_log) - 1, state, params_struct, error_log, start_time, status)
+        printer.summary(final)
+        self._notify(final)
 
         # Geometry is shared by every condition; operating state is kept per condition
         return self.prop.with_state(
@@ -405,23 +476,50 @@ class BaseSolver(ABC):
             omega=params_struct.omega,
             tilt=params_struct.tilt,
             V_i_0=params_struct.V_i_0,
-            error_log=error_log,
-            time_log=time_log,
+            error_log=jnp.array(error_log),
+            time_log=jnp.array(time_log),
         )
 
+    def _progress(self, iteration, state, params_struct, error_log, start_time, status) -> Progress:
+        # Calculate the per-condition objectives of the current design
+        (thrust_terms, power_terms, confidence_terms), (powers, thrusts, _) = evaluate_all_conditions(params_struct)
+        as_np = lambda a: np.asarray(a, dtype=float)
+        return Progress(
+            iteration=iteration,
+            max_iter=self.inputs.opt_max_iter,
+            cost=float(getattr(state, 'value', np.nan)),
+            error=error_log[-1],
+            elapsed=time.time() - start_time,
+            status=status,
+            omega=as_np(params_struct.omega),
+            thrust=as_np(thrusts),
+            thrust_target=as_np(params_struct.thrust_target),
+            power=as_np(powers),
+            cost_terms=dict(thrust=as_np(thrust_terms), power=as_np(power_terms), confidence=as_np(confidence_terms)),
+            thickness_penalty=float(self.space.thickness_penalty(params_struct)),
+            error_log=np.asarray(error_log),
+            params_struct=params_struct,
+        )
+
+    def _notify(self, progress):
+        if self.callback is not None:
+            self.callback(progress)
+
 class LBFGSBSolver(BaseSolver):
-    def __init__(self, prop, update_queue=None):
-        super().__init__(prop, update_queue)
+    name = "L-BFGS-B"
+    error_name = "ProjGrad"
+
+    def __init__(self, prop, callback=None, stop_event=None):
+        super().__init__(prop, callback, stop_event)
         self.solver = jaxopt.LBFGSB(
             fun=total_cost,
             has_aux=True,
             implicit_diff=True,
             jit=True,
-            verbose=1
+            verbose=self.inputs.opt_verbose >= 2
         )
 
     def init_state(self):
-        print("Initialising L-BFGS-B Solver...")
         return self.solver.init_state(
             init_params=self.vars_scaled,
             bounds=self.bounds,
@@ -441,17 +539,31 @@ class LBFGSBSolver(BaseSolver):
         V_i_0 = state.aux
         return vars_scaled, state, V_i_0
 
-def run_optimization(prop, update_queue=None):
+# Outer-loop solvers selectable through Inputs.opt_solver
+SOLVERS = {"L-BFGS-B": LBFGSBSolver}
+
+def run_optimization(prop, update_queue=None, callback=None, stop_event=None):
     '''
     Optimises the propeller's design variables for its Inputs; returns the optimised Propeller.
+
+    callback(progress) receives a Progress at every report and when the solve ends. update_queue (for the
+    matplotlib live plot) receives the Params of condition 0 at the same points. stop_event, when set,
+    ends the solve after the current iteration (defaults to the Ctrl+C event).
     '''
-    if prop.inputs.opt_solver == "L-BFGS-B":
-        solver = LBFGSBSolver(prop, update_queue)
-    else:
+    solver_cls = SOLVERS.get(prop.inputs.opt_solver)
+    if solver_cls is None:
         raise ValueError(f"Solver {prop.inputs.opt_solver} not implemented.")
 
-    prop_solved = solver.solve()
-    return prop_solved
+    if update_queue is not None:
+        user_callback = callback
+
+        def callback(progress):
+            update_queue.put(progress.condition(0))
+            if user_callback is not None:
+                user_callback(progress)
+
+    solver = solver_cls(prop, callback=callback, stop_event=stop_event)
+    return solver.solve()
 
 if __name__ == "__main__":
     ## Testing of optimiser functions

@@ -76,8 +76,8 @@ def dT_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
     # Average thrust in each annulus over one rotation
     dT_blade_ave = N / (2 * jnp.pi) * jnp.trapezoid(dT_blade_instantaneous, x=psi, axis=1)
 
-    if params.cfg.verbose>1:
-        jax.debug.print("dT_blade: {dT_blade_ave}", dT_blade_ave=dT_blade_ave)
+    if params.cfg.V_i_0_verbose >= 2:
+        jax.debug.print("  [BEMT] dT_blade: {dT_blade_ave}", dT_blade_ave=dT_blade_ave)
     
     return dT_blade_ave
 
@@ -387,9 +387,9 @@ def induced_velocity(params):
         implicit_diff=True,
         implicit_diff_solve=jaxopt.linear_solve.solve_lu,
         jit = True,
-        verbose = params.cfg.verbose
+        verbose = params.cfg.V_i_0_verbose >= 2
     )
-    
+
     (lambda_i_0, info) = solver.run(initial_guess_lambda, params)
 
     # Re-dimensionalise the converged solution
@@ -398,9 +398,11 @@ def induced_velocity(params):
     # re-add non solver components to the solution vector
     V_i_0 = jnp.zeros_like(params.V_i_0).at[params.cfg.solve_rows].set(V_i_0)
 
-    if params.cfg.verbose:
-        final_res = bemt_residuals(lambda_i_0, params)
-        jax.debug.print("Final Residuals: {res}", res=final_res)
+    if params.cfg.V_i_0_verbose >= 1:
+        jax.debug.print(
+            "  [BEMT] T_target {t:7.2f} N | omega {w:7.1f} rad/s | Broyden iters {n:4d} | residual {e:.2e}",
+            t=params.thrust_target, w=params.omega, n=info.iter_num, e=info.error,
+        )
 
     # Expand to 3D inflow grid
     V_i = inflow_model(V_i_0, params)

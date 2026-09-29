@@ -2,7 +2,8 @@
 test_propeller_setup.py
 
 Checks for the run-setup refactor: JSON propeller files, Inputs reaching the physics,
-spanwise CST sections, the NeuralFoil port and the optimiser design space (radial mask + blend zone).
+spanwise CST sections, the NeuralFoil port, the optimiser design space (radial mask + blend zone),
+live plotting of the seed state, verbosity settings and optimiser progress reporting.
 
     python test_propeller_setup.py
 
@@ -196,6 +197,65 @@ def test_total_cost_gradients_are_finite():
     grads = jax.grad(lambda x: proptimiser.total_cost(x, solver.params_struct, solver.space)[0])(solver.vars_scaled)
     for name, g in grads.items():
         assert bool(jnp.all(jnp.isfinite(g))), name
+
+
+# ---------------------------------------------------------------------------
+# Live plotting, verbosity and solver reporting
+# ---------------------------------------------------------------------------
+
+def test_contour_levels_are_strictly_increasing():
+    import results
+
+    for values in (np.full((4, 5), 2.5), np.zeros((3, 3)), np.array([[np.nan, 1.0], [1.0, np.nan]]),
+                   np.full((2, 2), np.nan), np.linspace(-3.0, 4.0, 12).reshape(3, 4)):
+        assert np.all(np.diff(results._contour_levels(values)) > 0), values
+
+
+def test_live_plot_draws_the_uniform_seed_field():
+    # The momentum-theory seed gives a uniform V_ia field, which used to crash the first animation frame
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    import results
+
+    params = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6)).condition(0)
+    fig = Figure()
+    FigureCanvasAgg(fig)
+    plotter = results.LivePropPlotter(params, fig=fig)
+    plotter.draw(results.plot_snapshot(params))
+    plotter.draw(results.plot_snapshot(params))
+    fig.canvas.draw()
+
+
+def test_legacy_verbose_key_maps_to_bemt_verbosity():
+    data = Propeller.default().to_dict()
+    del data["inputs"]["V_i_0_verbose"]
+    data["inputs"]["verbose"] = True
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        prop = Propeller.from_dict(data)
+    assert prop.inputs.V_i_0_verbose == 1
+    assert not any("verbose" in str(w.message) for w in caught)
+
+
+def test_solver_reports_progress_and_stops():
+    import threading
+
+    prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6, opt_max_iter=2, opt_print_every=1, opt_verbose=0))
+    reports = []
+    result = proptimiser.run_optimization(prop, callback=reports.append, stop_event=threading.Event())
+    assert reports and all(isinstance(p, proptimiser.Progress) for p in reports)
+    assert reports[-1].status == "max_iter" and reports[-1].iteration == 2
+    assert len(result.error_log) == 3 and len(result.time_log) == 3
+    assert reports[-1].condition(1).omega == prop.omega[1]
+
+    stop = threading.Event()
+    stop.set()
+    reports = []
+    result = proptimiser.run_optimization(prop, callback=reports.append, stop_event=stop)
+    assert reports[-1].status == "stopped" and reports[-1].iteration == 0
+    assert result.c.shape == prop.c.shape
 
 
 TESTS = [value for name, value in list(globals().items()) if name.startswith("test_")]

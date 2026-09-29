@@ -45,10 +45,13 @@ class Inputs:
     opt_solver: str = "L-BFGS-B"
     opt_max_iter: int = 2000
     opt_tol: float = 1e-4
+    opt_verbose: int = 1            # 0: start/end summary only, 1: iteration table, 2: + cost terms and jaxopt line-search info
+    opt_print_every: int = 5        # iterations between table rows (a row is also printed after 10 s without one)
 
     # Induced Velocity Settings
     V_i_0_max_iter: int = 1000
     V_i_0_eps: float = 5e-2
+    V_i_0_verbose: int = 0          # 0: silent, 1: one line per BEMT solve, 2: + every Broyden iteration and sectional thrust
 
     # Solver Type
     bemt_type: tuple = (True, True, False) # (V_ia,V_it,V_ir)
@@ -58,7 +61,6 @@ class Inputs:
     n_psi: int = 12
 
     # Diagnostics
-    verbose: bool = False
     jax_tracing: bool = False
 
     # Flight Conditions (one entry per condition)
@@ -93,6 +95,8 @@ class Inputs:
     high_induction_model: int = 0 # (0: Classical Momentum, 1: Buhl Correction) NOT USEFUL FOR REGULAR FLIGHT
 
     def __post_init__(self):
+        self.opt_verbose, self.V_i_0_verbose = int(self.opt_verbose), int(self.V_i_0_verbose)
+        self.opt_print_every = max(1, int(self.opt_print_every))
         self.bemt_type = tuple(bool(b) for b in self.bemt_type)
         if len(self.bemt_type) != 3 or not any(self.bemt_type):
             raise ValueError(f"bemt_type must select at least one of (V_ia, V_it, V_ir), got {self.bemt_type}")
@@ -210,7 +214,7 @@ class ModelConfig:
     solve_idx: tuple                # induced-velocity components solved for (from Inputs.bemt_type)
     V_i_0_max_iter: int
     V_i_0_eps: float
-    verbose: bool
+    V_i_0_verbose: int
     inflow_model: int
     coeff_method: int
     tip_loss_model: int
@@ -404,7 +408,11 @@ class Propeller:
         if version != FORMAT_VERSION:
             raise ValueError(f"Unsupported propeller file format_version {version} (expected {FORMAT_VERSION})")
 
-        inputs = _dataclass_from_dict(Inputs, data["inputs"], "inputs")
+        inputs_data = dict(data["inputs"])
+        if "verbose" in inputs_data:
+            # Files saved before the per-solver verbosity levels: the old flag drove the induced velocity solver
+            inputs_data.setdefault("V_i_0_verbose", int(inputs_data.pop("verbose")))
+        inputs = _dataclass_from_dict(Inputs, inputs_data, "inputs")
         blade = _dataclass_from_dict(BladeSpec, data["blade"], "blade")
 
         state = data["state"]
