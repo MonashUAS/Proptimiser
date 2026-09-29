@@ -1,6 +1,7 @@
 ### Establish Coefficients for Given Airfoil
 import glob
 import re
+from functools import lru_cache
 import numpy as np
 
 import jax
@@ -10,12 +11,632 @@ import matplotlib.pyplot as plt
 import interpax
 from scipy.ndimage import gaussian_filter
 import neuralfoil as nf
-import aerosandbox as asb
 from pathlib import Path
 
-# Note: Assuming init.py and airflow.py contain the necessary structures
-from init import Inputs
 from airflow import resultantVelocityComponents, calc_reynolds
+from geometry import N_CST, cst_at_stations, max_thickness
+
+from aerosandbox.geometry.airfoil.airfoil_families import (
+    get_kulfan_parameters,
+    get_kulfan_coordinates
+)
+
+### HELPTER UTILITIES
+
+def fit_and_plot_kulfan(image_path: str, n_weights: int = 8, plot: bool = True):
+    """
+    Reads an airfoil image, downsamples the boundary using linear bin averaging,
+    and fits Kulfan (CST) parameters using AeroSandbox. Plots all Kulfan 
+    components on a single standard matplotlib axis.
+    
+    Parameters:
+        image_path (str): Path to the image file.
+        n_weights (int): Number of Kulfan weights per side (default: 8).
+        plot (bool): If True, plots the airfoil and all Kulfan modes on one axis.
+        
+    Returns:
+        dict: The Kulfan parameters required by NeuralFoil.
+    """
+    # Load and binarize the image
+    arr = plt.imread(image_path)
+    if arr.ndim >= 3:
+        arr = np.mean(arr[..., :3], axis=2)
+        
+    binary = arr < np.mean(arr)
+    rows, cols = np.where(binary)
+    
+    if len(cols) == 0:
+        raise ValueError("No airfoil shape detected in the image.")
+        
+    # Extract raw boundaries (one min/max per pixel column)
+    x_unique = np.unique(cols)
+    y_upper_raw = np.array([rows[cols == x].min() for x in x_unique], dtype=float)
+    y_lower_raw = np.array([rows[cols == x].max() for x in x_unique], dtype=float)
+    
+    # Normalize X domain
+    x_min, x_max = x_unique.min(), x_unique.max()
+    chord = float(x_max - x_min)
+    x_norm = (x_unique - x_min) / chord
+    
+    # Set Y origin to LE center and normalize
+    le_idx = np.argmin(x_norm)
+    y_center = (y_upper_raw[le_idx] + y_lower_raw[le_idx]) / 2.0
+    y_u_norm = -(y_upper_raw - y_center) / chord
+    y_l_norm = -(y_lower_raw - y_center) / chord
+
+    # Downsample to ~60 linearly spaced averaged elements
+    num_elements = 80
+    bins = np.linspace(0, 1, num_elements + 1)
+    x_sampled = 0.5 * (bins[:-1] + bins[1:])  # Bin centers
+    
+    y_u_sampled = np.zeros(num_elements)
+    y_l_sampled = np.zeros(num_elements)
+    
+    for i in range(num_elements):
+        mask = (x_norm >= bins[i]) & (x_norm <= bins[i+1])
+        if np.any(mask):
+            y_u_sampled[i] = np.mean(y_u_norm[mask])
+            y_l_sampled[i] = np.mean(y_l_norm[mask])
+        else:
+            # Fallback to interpolation if a bin is empty 
+            y_u_sampled[i] = np.interp(x_sampled[i], x_norm, y_u_norm)
+            y_l_sampled[i] = np.interp(x_sampled[i], x_norm, y_l_norm)
+    
+    # Construct ordered Counter-Clockwise (CCW) array: TE -> LE -> TE
+    x_upper_ccw = x_sampled[::-1]
+    y_upper_ccw = y_u_sampled[::-1]
+    x_lower_ccw = x_sampled[1:] 
+    y_lower_ccw = y_l_sampled[1:]
+    
+    coords = np.column_stack((
+        np.concatenate([x_upper_ccw, np.array([0]), x_lower_ccw]),
+        np.concatenate([y_upper_ccw, np.array([0]), y_lower_ccw])
+    ))
+
+    # Fit Kulfan parameters via AeroSandbox
+    params = get_kulfan_parameters(
+        coordinates=coords,
+        n_weights_per_side=n_weights
+    )
+
+    # Plotting on a single axis
+    if plot:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        
+        # Plot the Averaged Image Points
+        ax.scatter(coords[:, 0], coords[:, 1], color='black', s=15, 
+                   label='Averaged Extracted Points', zorder=5)
+        
+        # Plot the Final Reconstructed Airfoil
+        base_airfoil = get_kulfan_coordinates(
+            lower_weights=params["lower_weights"],
+            upper_weights=params["upper_weights"],
+            leading_edge_weight=params["leading_edge_weight"],
+            TE_thickness=params["TE_thickness"],
+            n_points_per_side=200
+        )
+        ax.plot(base_airfoil[:, 0], base_airfoil[:, 1], color='black', 
+                linewidth=2, label='Full Kulfan Fit', zorder=4)
+    
+        # Plot Upper Modes
+        for i in range(n_weights):
+            w_u = np.zeros(n_weights)
+            w_u[i] = params["upper_weights"][i]
+            mode_u = get_kulfan_coordinates(
+                lower_weights=np.zeros(n_weights), upper_weights=w_u,
+                leading_edge_weight=0.0, TE_thickness=0.0, n_points_per_side=200
+            )
+            label = 'Upper Modes' if i == 0 else None
+            ax.plot(mode_u[:, 0], mode_u[:, 1], color='tab:orange', alpha=0.5, label=label, zorder=2)
+
+        # Plot Lower Modes
+        for i in range(n_weights):
+            w_l = np.zeros(n_weights)
+            w_l[i] = params["lower_weights"][i]
+            mode_l = get_kulfan_coordinates(
+                lower_weights=w_l, upper_weights=np.zeros(n_weights),
+                leading_edge_weight=0.0, TE_thickness=0.0, n_points_per_side=200
+            )
+            label = 'Lower Modes' if i == 0 else None
+            ax.plot(mode_l[:, 0], mode_l[:, 1], color='tab:blue', alpha=0.5, label=label, zorder=2)
+
+        # Plot LEM
+        mode_lem = get_kulfan_coordinates(
+            lower_weights=np.zeros(n_weights), upper_weights=np.zeros(n_weights),
+            leading_edge_weight=params["leading_edge_weight"], TE_thickness=0.0, n_points_per_side=200
+        )
+        ax.plot(mode_lem[:, 0], mode_lem[:, 1], color='tab:red', linewidth=2, 
+                linestyle='--', label='LE Modification', zorder=3)
+
+        # Plot TE Mode
+        mode_te = get_kulfan_coordinates(
+            lower_weights=np.zeros(n_weights), upper_weights=np.zeros(n_weights),
+            leading_edge_weight=0.0, TE_thickness=params["TE_thickness"], n_points_per_side=200
+        )
+        ax.plot(mode_te[:, 0], mode_te[:, 1], color='tab:green', linewidth=2, 
+                linestyle=':', label='TE Thickness', zorder=3)
+
+        # Axis styling
+        ax.set_title(f"Airfoil Kulfan Fit and Component Breakdown ({n_weights*2 + 2} parameters)")
+        ax.set_xlabel("x/c")
+        ax.set_ylabel("y/c")
+        ax.axis('equal')
+        ax.grid(True, linestyle='--', alpha=0.6)
+        
+        # Format Legend (moving it outside the plot so it doesn't obscure lines)
+        ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=10)
+        
+        plt.tight_layout()
+        plt.show()
+
+    return params
+### Interpolator Classes 
+class ParametricInterpolator:
+    def __init__(self, Cl_alpha=5.7, Cd0=0.035, AoA_0=-10.0, alpha_stall=20.0, k_smooth=30.0):
+        self.Cl_alpha = Cl_alpha
+        self.Cd0 = Cd0
+        self.AoA_0 = jnp.radians(AoA_0)
+        self.alpha_stall = jnp.radians(alpha_stall)
+        self.k_smooth = k_smooth
+
+    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_confidence=False):
+        # Apply the zero-lift offset internally
+        alpha_eff = alpha - self.AoA_0
+        Cd90 = 1.98
+        
+        # Unstalled Regime
+        Cl_lin = self.Cl_alpha * alpha_eff
+        Ct_lin = self.Cd0 * jnp.cos(alpha_eff)
+        Cn_lin = (Cl_lin + Ct_lin * jnp.sin(alpha_eff)) / jnp.cos(alpha_eff)
+        Cd_lin = Cn_lin * jnp.sin(alpha_eff) + Ct_lin * jnp.cos(alpha_eff)
+        
+        # High Angle Regime
+        sin_a = jnp.sin(alpha_eff)
+        Cn_stall = Cd90 * sin_a / (0.56 + 0.44 * jnp.abs(sin_a))
+        Ct_stall = 0.5 * self.Cd0 * jnp.cos(alpha_eff)
+        
+        Cl_stall = Cn_stall * jnp.cos(alpha_eff) - Ct_stall * jnp.sin(alpha_eff)
+        Cd_stall = Cn_stall * jnp.sin(alpha_eff) + Ct_stall * jnp.cos(alpha_eff)
+        
+        # Sigmoid blending
+        transition = 1 / (1 + jnp.exp(-self.k_smooth * (jnp.abs(alpha_eff) - self.alpha_stall)))
+        
+        Cl = (1 - transition) * Cl_lin + transition * Cl_stall
+        Cd = (1 - transition) * Cd_lin + transition * Cd_stall
+        
+        Cn_final = (1 - transition) * Cn_lin + transition * Cn_stall
+        Cm = -Cn_final * (0.25 - 0.175 * (1 - 2 * jnp.abs(alpha_eff) / jnp.pi))
+
+        return _with_confidence((Cl, Cd, Cm), return_confidence)
+
+class AlphaReInterpolator:
+    def __init__(self, airfoilname):
+        files = glob.glob(f"airfoils/{airfoilname}/xfoil/xf-{airfoilname}-il-*.csv")
+        if not files:
+            raise FileNotFoundError(f"No CSVs found for 2D interpolation in airfoils/{airfoilname}/xfoil/")
+
+        alpha_deg = jnp.concatenate([
+            jnp.linspace(-180, -30, 10),
+            jnp.linspace(-29, -12, 8),
+            jnp.linspace(-11, 15, 27),
+            jnp.linspace(16, 35, 10),
+            jnp.linspace(36, 180, 11)
+        ])
+
+        self.alpha_grid = jnp.unique(jnp.radians(alpha_deg))
+        raw_data = []
+        
+        Cd90, Cd0_default = 1.98, 0.015 
+        sin_a, cos_a = jnp.sin(self.alpha_grid), jnp.cos(self.alpha_grid)
+        Cn_fp = Cd90 * sin_a / (0.56 + 0.44 * jnp.abs(sin_a))
+        Ct_fp = 0.5 * Cd0_default * cos_a
+        bg_cl = Cn_fp * cos_a - Ct_fp * sin_a
+        bg_cd = Cn_fp * sin_a + Ct_fp * cos_a
+        bg_cm = -Cn_fp * (0.25 - 0.175 * (1 - 2 * jnp.abs(self.alpha_grid) / jnp.pi))
+
+        for f in files:
+            match = re.search(r'-(\d+)\.csv', f)
+            if match:
+                Re = float(match.group(1))
+                data = np.genfromtxt(f, skip_header=11, delimiter=',')
+                if jnp.isnan(data).any() or len(data) == 0:
+                    continue
+
+                alpha_data = jnp.radians(data[:, 0])
+                x_cl, x_cd, x_cm = jnp.array(data[:, 1]), jnp.array(data[:, 2]), jnp.array(data[:, 4])
+
+                xf_cl_interp = jnp.interp(self.alpha_grid, alpha_data, x_cl, left=jnp.nan, right=jnp.nan)
+                xf_cd_interp = jnp.interp(self.alpha_grid, alpha_data, x_cd, left=jnp.nan, right=jnp.nan)
+                xf_cm_interp = jnp.interp(self.alpha_grid, alpha_data, x_cm, left=jnp.nan, right=jnp.nan)
+
+                min_a, max_a = alpha_data.min(), alpha_data.max()
+                mask_low = 1.0 / (1.0 + jnp.exp(-40.0 * (self.alpha_grid - (min_a + jnp.radians(2.0)))))
+                mask_high = 1.0 / (1.0 + jnp.exp(40.0 * (self.alpha_grid - (max_a - jnp.radians(2.0)))))
+                weight = mask_low * mask_high
+
+                cl_blended = jnp.where(jnp.isnan(xf_cl_interp), bg_cl, weight * xf_cl_interp + (1 - weight) * bg_cl)
+                cd_blended = jnp.where(jnp.isnan(xf_cd_interp), bg_cd, weight * xf_cd_interp + (1 - weight) * bg_cd)
+                cm_blended = jnp.where(jnp.isnan(xf_cm_interp), bg_cm, weight * xf_cm_interp + (1 - weight) * bg_cm)
+                
+                raw_data.append((Re, cl_blended, cd_blended, cm_blended))
+
+        raw_data.sort(key=lambda x: x[0])
+        re_array = jnp.array([x[0] for x in raw_data])
+        
+        cl_array = jnp.stack([x[1] for x in raw_data])
+        cd_array = jnp.stack([x[2] for x in raw_data])
+        cm_array = jnp.stack([x[3] for x in raw_data])
+
+        self.re_grid_log = jnp.linspace(jnp.log10(re_array.min()), jnp.log10(re_array.max()), 15)
+        log_re_array = jnp.log10(re_array)
+        interp_vmap = jax.vmap(jnp.interp, in_axes=(None, None, 1))
+
+        # Apply nan_to_num to guarantee safe behavior
+        self.cl_grid = jnp.nan_to_num(interp_vmap(self.re_grid_log, log_re_array, cl_array))
+        self.cd_grid = jnp.nan_to_num(interp_vmap(self.re_grid_log, log_re_array, cd_array))
+        self.cm_grid = jnp.nan_to_num(interp_vmap(self.re_grid_log, log_re_array, cm_array))
+
+    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_confidence=False):
+        input_shape = jnp.shape(alpha)
+        alpha_flat, re_flat, mach_flat = jnp.ravel(alpha), jnp.ravel(re), jnp.ravel(mach)
+
+        alpha_flat = jnp.mod(alpha_flat + jnp.pi, 2 * jnp.pi) - jnp.pi
+        log_re_clipped = jnp.clip(jnp.log10(re_flat), self.re_grid_log.min() + 1e-5, self.re_grid_log.max() - 1e-5)
+        
+        Cl = interpax.interp2d(alpha_flat, log_re_clipped, self.alpha_grid, self.re_grid_log, self.cl_grid, method='linear')
+        Cd = interpax.interp2d(alpha_flat, log_re_clipped, self.alpha_grid, self.re_grid_log, self.cd_grid, method='linear')
+        Cm = interpax.interp2d(alpha_flat, log_re_clipped, self.alpha_grid, self.re_grid_log, self.cm_grid, method='linear')
+        
+        cl_comp, cd_comp, cm_comp = apply_mach_corrections(Cl, Cd, Cm, mach_flat)
+        coeffs = jnp.reshape(cl_comp, input_shape), jnp.reshape(cd_comp, input_shape), jnp.reshape(cm_comp, input_shape)
+        return _with_confidence(coeffs, return_confidence)
+
+class AlphaMachReInterpolator:
+    def __init__(self, airfoilname):
+        files = glob.glob(f"airfoils/{airfoilname}/Polars/*.csv")
+        if not files:
+            raise FileNotFoundError(f"No CSVs found for 3D interpolation in airfoils/{airfoilname}/Polars/")
+
+        alpha_deg = jnp.concatenate([
+            jnp.linspace(-180, -30, 10),
+            jnp.linspace(-29, -12, 8),
+            jnp.linspace(-11, 15, 27),
+            jnp.linspace(16, 35, 10),
+            jnp.linspace(36, 180, 11)
+        ])
+
+        self.alpha_grid = jnp.unique(jnp.radians(alpha_deg))
+        raw_data = []
+
+        Cd90, Cd0_default = 1.98, 0.015 
+        sin_a, cos_a = jnp.sin(self.alpha_grid), jnp.cos(self.alpha_grid)
+        Cn_fp = Cd90 * sin_a / (0.56 + 0.44 * jnp.abs(sin_a))
+        Ct_fp = 0.5 * Cd0_default * cos_a
+        bg_cl = Cn_fp * cos_a - Ct_fp * sin_a
+        bg_cd = Cn_fp * sin_a + Ct_fp * cos_a
+        bg_cm = -Cn_fp * (0.25 - 0.175 * (1 - 2 * jnp.abs(self.alpha_grid) / jnp.pi))
+
+        for f in files:
+            match = re.search(r'Re([\d\.]+)_M([\d\.]+)', f)
+            if match:
+                Re = float(match.group(1)) * 1e6 
+                Mach = float(match.group(2))
+                
+                data = np.genfromtxt(f, skip_header=11, delimiter=',')
+                if np.isnan(data).any() or len(data) == 0:
+                    continue
+
+                alpha_data = jnp.radians(jnp.array(data[:, 0]))
+                x_cl, x_cd, x_cm = jnp.array(data[:, 1]), jnp.array(data[:, 2]), jnp.array(data[:, 4])
+
+                xf_cl_interp = jnp.interp(self.alpha_grid, alpha_data, x_cl, left=jnp.nan, right=jnp.nan)
+                xf_cd_interp = jnp.interp(self.alpha_grid, alpha_data, x_cd, left=jnp.nan, right=jnp.nan)
+                xf_cm_interp = jnp.interp(self.alpha_grid, alpha_data, x_cm, left=jnp.nan, right=jnp.nan)
+
+                min_a, max_a = alpha_data.min(), alpha_data.max()
+                mask_low = 1.0 / (1.0 + jnp.exp(-40.0 * (self.alpha_grid - (min_a + jnp.radians(2.0)))))
+                mask_high = 1.0 / (1.0 + jnp.exp(40.0 * (self.alpha_grid - (max_a - jnp.radians(2.0)))))
+                weight = mask_low * mask_high
+
+                cl_blended = jnp.where(jnp.isnan(xf_cl_interp), bg_cl, weight * xf_cl_interp + (1 - weight) * bg_cl)
+                cd_blended = jnp.where(jnp.isnan(xf_cd_interp), bg_cd, weight * xf_cd_interp + (1 - weight) * bg_cd)
+                cm_blended = jnp.where(jnp.isnan(xf_cm_interp), bg_cm, weight * xf_cm_interp + (1 - weight) * bg_cm)
+
+                raw_data.append((Mach, Re, cl_blended, cd_blended, cm_blended))
+
+        mach_points = jnp.array([d[0] for d in raw_data])
+        re_points = jnp.array([d[1] for d in raw_data])
+        log_re_points = jnp.log10(re_points)
+
+        self.mach_grid = jnp.linspace(mach_points.min(), mach_points.max(), 10)
+        self.re_grid_log = jnp.linspace(log_re_points.min(), log_re_points.max(), 15)
+        M_mesh, Re_mesh = jnp.meshgrid(self.mach_grid, self.re_grid_log, indexing='ij')
+
+        points = jnp.column_stack((mach_points, log_re_points))
+        cl_vals_all = jnp.stack([d[2] for d in raw_data], axis=-1)
+        cd_vals_all = jnp.stack([d[3] for d in raw_data], axis=-1)
+        cm_vals_all = jnp.stack([d[4] for d in raw_data], axis=-1)
+
+        cl_grid = jax_idw_3d_grid(points, cl_vals_all, M_mesh, Re_mesh)
+        cd_grid = jax_idw_3d_grid(points, cd_vals_all, M_mesh, Re_mesh)
+        cm_grid = jax_idw_3d_grid(points, cm_vals_all, M_mesh, Re_mesh)
+        
+        # Apply nan_to_num
+        self.cl_grid = jnp.nan_to_num(gaussian_filter(cl_grid, sigma=(1.5, 0.8, 1.0)))
+        self.cd_grid = jnp.nan_to_num(gaussian_filter(cd_grid, sigma=(1.5, 0.8, 1.0)))
+        self.cm_grid = jnp.nan_to_num(gaussian_filter(cm_grid, sigma=(1.5, 0.8, 1.0)))
+
+    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_confidence=False):
+        input_shape = jnp.shape(alpha)
+        alpha_flat, mach_flat, re_flat = jnp.ravel(alpha), jnp.ravel(mach), jnp.ravel(re)
+
+        alpha_flat = jnp.mod(alpha_flat + jnp.pi, 2 * jnp.pi) - jnp.pi
+        log_re_clipped = jnp.clip(jnp.log10(re_flat), self.re_grid_log.min() + 1e-5, self.re_grid_log.max() - 1e-5)
+        mach_clipped = jnp.clip(mach_flat, self.mach_grid.min() + 1e-5, self.mach_grid.max() - 1e-5)
+        
+        Cl = interpax.interp3d(alpha_flat, mach_clipped, log_re_clipped, 
+                               self.alpha_grid, self.mach_grid, self.re_grid_log, 
+                               self.cl_grid, method='cubic')
+        Cd = interpax.interp3d(alpha_flat, mach_clipped, log_re_clipped, 
+                               self.alpha_grid, self.mach_grid, self.re_grid_log, 
+                               self.cd_grid, method='cubic')
+        Cm = interpax.interp3d(alpha_flat, mach_clipped, log_re_clipped,
+                               self.alpha_grid, self.mach_grid, self.re_grid_log,
+                               self.cm_grid, method='cubic')
+        coeffs = Cl.reshape(input_shape), Cd.reshape(input_shape), Cm.reshape(input_shape)
+        return _with_confidence(coeffs, return_confidence)
+
+class NeuralFoilInterpolator:
+    '''
+    A pure-JAX implementation of the NeuralFoil multi-layer perceptron (MLP) for aerodynamic coefficient prediction.
+    By staying in JAX, this interpolator is 100% compatible with JIT compilation and autodiff.
+
+    The section shape is passed on every call as CST vectors [lower x8, upper x8, LE weight, TE thickness]
+    (normalised to unit chord), so each radial station can have its own airfoil and the shape can be optimised.
+
+    Implementation mostly cloned from https://github.com/peterdsharpe/NeuralFoil/blob/master/neuralfoil/main.py
+    '''
+    def __init__(self, model_size="large"):
+        # Load the pre-trained neural network weights and input scaling distributions from the neuralfoil package
+        nn_weights_dir = Path(nf.__file__).parent / "nn_weights_and_biases"
+        self._scaled_input_distribution = {k: jnp.array(v) for k, v in dict(np.load(nn_weights_dir / "scaled_input_distribution.npz")).items()}
+        
+        nn_params_raw = dict(np.load(nn_weights_dir / f"nn-{model_size}.npz"))
+        self.nn_params = {k: jnp.array(v) for k, v in nn_params_raw.items()}
+        
+        self.layer_indices = sorted(list(set([int(key.split(".")[1]) for key in nn_params_raw.keys()])))
+        self.N_inputs = len(self._scaled_input_distribution["mean_inputs_scaled"])
+
+    def raw(self, alpha, re, kulfan):
+        '''
+        Network outputs before flat-plate blending and Mach correction.
+        kulfan (..., N_CST) broadcasts against alpha along a trailing axis.
+
+        Returns CL, CD, CM and the analysis confidence (0-1), each shaped like alpha.
+        '''
+        alpha, re = jnp.broadcast_arrays(alpha, re)
+        alpha_deg = jnp.degrees(alpha)
+        k = jnp.broadcast_to(kulfan, alpha_deg.shape + (N_CST,))
+
+        # 1. Assemble the 25-dimensional input vector along the LAST axis (-1)
+        # NeuralFoil takes the upper surface weights first
+        x = jnp.concatenate([
+            k[..., 8:16],               # upper weights
+            k[..., 0:8],                # lower weights
+            k[..., 16:17],              # leading edge weight
+            k[..., 17:18] * 50,         # TE thickness
+            jnp.stack([
+                jnp.sin(jnp.radians(2 * alpha_deg)),
+                jnp.cos(jnp.radians(alpha_deg)),
+                1 - jnp.cos(jnp.radians(alpha_deg)) ** 2,
+                (jnp.log(re) - 12.5) / 3.5,
+                jnp.zeros_like(alpha_deg), # n_crit scaling
+                jnp.ones_like(alpha_deg),  # forced transition upper
+                jnp.ones_like(alpha_deg),  # forced transition lower
+            ], axis=-1),
+        ], axis=-1) # Shape: (*input_shape, 25)
+        
+        # 2. Leading-dimension safe MLP using jnp.matmul
+        def net(x_in):
+            layer_indices_to_iterate = self.layer_indices.copy()
+            while len(layer_indices_to_iterate) != 0:
+                i = layer_indices_to_iterate.pop(0)
+                w = self.nn_params[f"net.{i}.weight"]
+                b = self.nn_params[f"net.{i}.bias"]
+                
+                # Using jnp.matmul and w.T allows broadcasting across all leading shapes
+                x_in = jnp.matmul(x_in, w.T) + b
+                if len(layer_indices_to_iterate) != 0:
+                    x_in = jax.nn.swish(x_in)
+            return x_in # Shape: (*input_shape, out_features)
+            
+        def sq_mahalanobis(x_in):
+            mean = self._scaled_input_distribution["mean_inputs_scaled"]
+            inv_cov = self._scaled_input_distribution["inv_cov_inputs_scaled"]
+            
+            x_minus_mean = x_in - mean # Broadcasts mean perfectly across trailing axis
+            # Compute Mahalanobis distance strictly focusing on the final feature axis
+            return jnp.sum(jnp.matmul(x_minus_mean, inv_cov) * x_minus_mean, axis=-1)
+
+        # Evaluate the network
+        y = net(x)
+        y = y.at[..., 0].set(y[..., 0] - sq_mahalanobis(x) / (2 * self.N_inputs))
+        
+        # 3. Enforce symmetric consistency using slice syntax (...)
+        x_flipped = x \
+            .at[..., :8].set(x[..., 8:16] * -1) \
+            .at[..., 8:16].set(x[..., :8] * -1) \
+            .at[..., 16].set(-1 * x[..., 16]) \
+            .at[..., 18].set(-1 * x[..., 18]) \
+            .at[..., 23].set(x[..., 24]) \
+            .at[..., 24].set(x[..., 23])
+        
+        y_flipped = net(x_flipped)
+        y_flipped = y_flipped.at[..., 0].set(y_flipped[..., 0] - sq_mahalanobis(x_flipped) / (2 * self.N_inputs))
+        
+        y_unflipped = y_flipped \
+            .at[..., 1].set(y_flipped[..., 1] * -1) \
+            .at[..., 3].set(y_flipped[..., 3] * -1) \
+            .at[..., 4].set(y_flipped[..., 5]) \
+            .at[..., 5].set(y_flipped[..., 4])
+        
+        y_fused = (y + y_unflipped) / 2
+        
+        # Extract coefficients
+        confidence = jax.nn.sigmoid(y_fused[..., 0])
+        CL_raw = y_fused[..., 1] / 2
+        CD_raw = jnp.exp((y_fused[..., 2] - 2) * 2)
+        CM_raw = y_fused[..., 3] / 20
+        return CL_raw, CD_raw, CM_raw, confidence
+
+    def __call__(self, alpha, re, mach, kulfan, t_over_c=0.10, return_confidence=False):
+        # 1. Wrap alpha to [-pi, pi] preserving original shape
+        alpha = jnp.mod(alpha + jnp.pi, 2 * jnp.pi) - jnp.pi
+        
+        # Broadcast arrays together to unify their shapes automatically
+        alpha, re = jnp.broadcast_arrays(alpha, re)
+
+        CL_raw, CD_raw, CM_raw, confidence = self.raw(alpha, re, kulfan)
+        
+        # Flat-Plate Blending
+        alpha_trust_low = jnp.radians(-11.0)
+        alpha_trust_high = jnp.radians(13.0)
+        
+        Cd90 = 1.98
+        Cd0_default = 0.015 
+        sin_a = jnp.sin(alpha)
+        cos_a = jnp.cos(alpha)
+        Cn_fp = Cd90 * sin_a / (0.56 + 0.44 * jnp.abs(sin_a))
+        Ct_fp = 0.5 * Cd0_default * cos_a
+        
+        bg_cl = Cn_fp * cos_a - Ct_fp * sin_a
+        bg_cd = Cn_fp * sin_a + Ct_fp * cos_a
+        bg_cm = -Cn_fp * (0.25 - 0.175 * (1 - 2 * jnp.abs(alpha) / jnp.pi))
+        
+        k_smooth = 40.0 
+        mask_low = 1.0 / (1.0 + jnp.exp(-k_smooth * (alpha - alpha_trust_low)))
+        mask_high = 1.0 / (1.0 + jnp.exp(k_smooth * (alpha - alpha_trust_high)))
+        weight = mask_low * mask_high
+        
+        CL_inc = weight * CL_raw + (1 - weight) * bg_cl
+        CD_inc = weight * CD_raw + (1 - weight) * bg_cd
+        CM_inc = weight * CM_raw + (1 - weight) * bg_cm
+
+        # Apply Mach corrections (which handles shapes smoothly natively)
+        coeffs = apply_mach_corrections(CL_inc, CD_inc, CM_inc, mach, t_over_c)
+        return coeffs + (confidence,) if return_confidence else coeffs
+
+def _with_confidence(coeffs, return_confidence):
+    '''
+    Table and parametric models have no confidence estimate; report full confidence when one is requested.
+    '''
+    return coeffs + (jnp.ones_like(coeffs[0]),) if return_confidence else coeffs
+
+### Data Loading/Grid Utilities
+
+@jax.jit
+def jax_idw_3d_grid(scattered_points, scattered_values, grid_X, grid_Y, power=2.0, eps=1e-8):
+    """
+    Vectorized Inverse Distance Weighting (IDW) interpolation in pure JAX.
+    Interpolates unstructured data onto a structured grid for multiple slices (AoA) simultaneously.
+    """
+    # Normalize coordinates to prevent skewed distance metrics (Mach vs Log(Re) scales)
+    p_min = jnp.min(scattered_points, axis=0)
+    p_max = jnp.max(scattered_points, axis=0)
+    p_scale = jnp.maximum(p_max - p_min, 1e-5)
+
+    norm_points = (scattered_points - p_min) / p_scale
+    norm_grid_X = (grid_X - p_min[0]) / p_scale[0]
+    norm_grid_Y = (grid_Y - p_min[1]) / p_scale[1]
+
+    # Flatten grid for pairwise distance calculation
+    flat_grid = jnp.stack([norm_grid_X.ravel(), norm_grid_Y.ravel()], axis=-1)
+
+    # Calculate squared distances: shape (N_grid_points, N_scattered_points)
+    diff = flat_grid[:, None, :] - norm_points[None, :, :]
+    dist_sq = jnp.sum(diff**2, axis=-1)
+
+    # Calculate weights: shape (N_grid, N_pts)
+    weights = 1.0 / (dist_sq**(power / 2.0) + eps)
+    weights_sum = jnp.sum(weights, axis=-1)
+
+    # Einsum dynamically multiplies weights by values for ALL alpha slices at once:
+    # 'gp' (grid_points) * 'ap' (alpha_points) -> 'ag' (alpha_grid)
+    interp_flat = jnp.einsum('gp,ap->ag', weights, scattered_values) / weights_sum[None, :]
+
+    # Reshape back to (N_alpha, N_Mach, N_Re)
+    return interp_flat.reshape(scattered_values.shape[0], grid_X.shape[0], grid_X.shape[1])
+
+@lru_cache(maxsize=None)
+def load_airfoil_data(coeff_method, airfoilname="arad10"):
+    '''
+    Instantiates the aerodynamic interpolator for coeff_method (0: Parametric, 1: 2D Interp, 2: 3D Interp, 3: NeuralFoil).
+    airfoilname selects the polar tables for methods 1 and 2; NeuralFoil takes section shapes per call instead.
+    Cached, so propellers sharing a configuration share one interpolator (and one jit trace).
+    '''
+    if coeff_method == 0:
+        return ParametricInterpolator() # Relies on default params, can be extended later
+    elif coeff_method == 1:
+        return AlphaReInterpolator(airfoilname)
+    elif coeff_method == 2:
+        return AlphaMachReInterpolator(airfoilname)
+    elif coeff_method == 3:
+        return NeuralFoilInterpolator()
+    else:
+        raise ValueError(f"Incorrect coefficient method {coeff_method} selected in Inputs.")
+
+## AERODYNAMIC CORRECTIONS
+## 3D ROTATIONAL STALL DELAY CORRECTIONS
+
+def no_3d_correction(operands):
+    '''
+    Pass-through function for when rotational_correction == 0.
+    '''
+    C_L_2D, C_D_2D, C_M, V_ia, params = operands
+    return C_L_2D, C_D_2D, C_M
+
+def du_selig_correction(operands):
+    '''
+    Applies the Du-Selig 3D Rotational Stall Delay correction.
+    Modifies C_L and C_D based on local chord-to-radius ratios.
+    '''
+    C_L_2D, C_D_2D, C_M, V_i, params = operands
+    
+    # Extract geometry and prevent division by zero at the exact root
+    c = params.c[:, None]
+    r = params.r[:, None]
+    R = params.cfg.R_tip*1.05
+    
+    r_safe = jnp.maximum(r, 1e-6)
+    c_over_r = c / r_safe
+    r_over_R = r_safe / R
+    
+    # Calculate Effective Angle of Attack (AoA_eff)
+    geometric_angle = params.beta[:, None]
+    _, phi = resultantVelocityComponents(V_i, params)
+    AoA_eff = geometric_angle - phi
+    
+    # Calculate Du-Selig empirical factor (f1 = f2)
+    denominator = 0.1267 * c_over_r + (1 - r_over_R**2) / r_over_R
+    f1 = (1 / (2 * jnp.pi)) * (1.6 * c_over_r) / jnp.maximum(denominator, 1e-6)
+
+    tip_fade = 1.0 - (r_over_R ** 2)
+    f1 = f1 * tip_fade
+    
+    # Correct Lift
+    # C_L_inv is the theoretical 2D inviscid lift (2 * pi * AoA_eff)
+    C_L_inv = 2 * jnp.pi * (AoA_eff + 0.035) # Estimate zero-lift angle
+    C_L_3D = C_L_2D + f1 * (C_L_inv - C_L_2D)
+    
+    # Correct Drag
+    C_D0 = 0.015 # zero-lift drag
+    C_D_3D = C_D_2D - f1 * (C_D_2D - C_D0)
+    
+    # Ensure physical drag bounds (prevents f1 from forcing drag below baseline)
+    C_D_3D = jnp.maximum(C_D_3D, C_D0)
+    
+    return C_L_3D, C_D_3D, C_M
+
 
 def apply_mach_corrections(cl_inc, cd_inc, cm_inc, mach, t_over_c=0.10):
     """
@@ -59,663 +680,45 @@ def apply_mach_corrections(cl_inc, cd_inc, cm_inc, mach, t_over_c=0.10):
     
     return cl_comp, cd_comp, cm_comp
 
-### Interpolator Classes 
-
-class AlphaReInterpolator:
-    def __init__(self, alpha_grid, re_grid_log, cl_grid, cd_grid, cm_grid):
-        self.alpha_grid = jnp.array(alpha_grid)
-        self.re_grid_log = jnp.array(re_grid_log)
-        self.cl_grid = jnp.array(cl_grid)
-        self.cd_grid = jnp.array(cd_grid)
-        self.cm_grid = jnp.array(cm_grid)
-
-    def __call__(self, alpha, re, mach):
-        # Capture original shape to restore later
-        input_shape = jnp.shape(alpha)
-        
-        # Flatten inputs to 1D vectors to satisfy interpax internal logic
-        alpha_flat = jnp.ravel(alpha)
-        re_flat = jnp.ravel(re)
-        mach_flat = jnp.ravel(mach)
-
-        # Wrap alpha to [-pi, pi]
-        alpha_flat = jnp.mod(alpha_flat + jnp.pi, 2 * jnp.pi) - jnp.pi
-        
-        # Clip Reynolds and convert to Log10 (Add eps buffer to prevent boundary gradient NaN/collapse)
-        log_re_flat = jnp.log10(re_flat)
-        eps = 1e-5
-        log_re_clipped = jnp.clip(log_re_flat, self.re_grid_log.min() + eps, self.re_grid_log.max() - eps)
-        
-        # Interpolate using flattened vectors
-        Cl = interpax.interp2d(alpha_flat, log_re_clipped, self.alpha_grid, self.re_grid_log, self.cl_grid, method='linear')
-        Cd = interpax.interp2d(alpha_flat, log_re_clipped, self.alpha_grid, self.re_grid_log, self.cd_grid, method='linear')
-        Cm = interpax.interp2d(alpha_flat, log_re_clipped, self.alpha_grid, self.re_grid_log, self.cm_grid, method='linear')
-        # Apply Compressibility corrections
-        cl_comp, cd_comp, cm_comp = apply_mach_corrections(Cl, Cd, Cm, mach_flat)
-        
-        # Reshape back to original input shape
-        cl_out = jnp.reshape(cl_comp, input_shape)
-        cd_out = jnp.reshape(cd_comp, input_shape)
-        cm_out = jnp.reshape(cm_comp, input_shape)
-        # Reshape back to the original input structure (Nr, Npsi)
-        return cl_out, cd_out, cm_out
-
-class AlphaMachReInterpolator:
+# Aerodynamic Coefficient Pipeline
+def aero_coeffs(V_i, params, return_confidence=False):
     '''
-    Interpolator Class for Alpha, Mach and Re. 
-    Currently set up to work with xflr5 files.
-    '''
-    def __init__(self, alpha_grid, mach_grid, re_grid_log, cl_grid, cd_grid, cm_grid):
-        self.alpha_grid = jnp.array(alpha_grid)
-        self.mach_grid = jnp.array(mach_grid)
-        self.re_grid_log = jnp.array(re_grid_log)
-        
-        # Grids are shape (N_alpha, N_mach, N_re)
-        self.cl_grid = jnp.array(cl_grid)
-        self.cd_grid = jnp.array(cd_grid)
-        self.cm_grid = jnp.array(cm_grid)
+    Universal Aerodynamic pipeline.
 
-    def __call__(self, alpha, re, mach):
-        # Capture original shape to restore later
-        input_shape = jnp.shape(alpha)
-        
-        # Flatten inputs to 1D vectors for interpax
-        alpha_flat = jnp.ravel(alpha)
-        mach_flat = jnp.ravel(mach)
-        re_flat = jnp.ravel(re)
-
-        # Wrap alpha to [-pi, pi]
-        alpha_flat = jnp.mod(alpha_flat + jnp.pi, 2 * jnp.pi) - jnp.pi
-        
-        # Clip inputs to prevent NaNs at extrapolation boundaries
-        eps = 1e-5
-        log_re_flat = jnp.log10(re_flat)
-        log_re_clipped = jnp.clip(log_re_flat, self.re_grid_log.min() + eps, self.re_grid_log.max() - eps)
-        mach_clipped = jnp.clip(mach_flat, self.mach_grid.min() + eps, self.mach_grid.max() - eps)
-        
-        # 3D Interpolation (Alpha, Mach, Reynolds)
-        Cl = interpax.interp3d(alpha_flat, mach_clipped, log_re_clipped, 
-                               self.alpha_grid, self.mach_grid, self.re_grid_log, 
-                               self.cl_grid, method='cubic')
-        Cd = interpax.interp3d(alpha_flat, mach_clipped, log_re_clipped, 
-                               self.alpha_grid, self.mach_grid, self.re_grid_log, 
-                               self.cd_grid, method='cubic')
-        Cm = interpax.interp3d(alpha_flat, mach_clipped, log_re_clipped, 
-                               self.alpha_grid, self.mach_grid, self.re_grid_log, 
-                               self.cm_grid, method='cubic')
-        return Cl.reshape(input_shape), Cd.reshape(input_shape), Cm.reshape(input_shape)
-
-class NeuralFoilInterpolator:
-    '''
-    A pure-JAX implementation of the NeuralFoil multi-layer perceptron (MLP) for aerodynamic coefficient prediction.
-    By staying in JAX, this interpolator is 100% compatible with JIT compilation and autodiff.
-
-    Implementation mostly cloned from https://github.com/peterdsharpe/NeuralFoil/blob/master/neuralfoil/main.py
-    '''
-    def __init__(self, airfoilname, model_size="large"):
-        # Attempt to load the airfoil geometry via aerosandbox (or locally from .dat)
-        try:
-            self.airfoil = asb.Airfoil(airfoilname).normalize()
-        except Exception:
-            try:
-                # Fall back to local .dat file in the airfoils directory
-                files = glob.glob(f"airfoils/{airfoilname}/*.dat")
-                if files:
-                    self.airfoil = asb.Airfoil(coordinates=files[0]).normalize()
-                else:
-                    raise FileNotFoundError(f"Cannot find airfoil {airfoilname}")
-            except Exception as e:
-                raise ValueError(f"Failed to load airfoil {airfoilname}: {e}")
-        
-        # Extract and scale the geometric "Kulfan" parameters, which the neural net uses as shape inputs
-        normalization_outputs = self.airfoil.normalize(return_dict=True)
-        normalized_airfoil = normalization_outputs["airfoil"].to_kulfan_airfoil(
-            n_weights_per_side=8,
-            normalize_coordinates=False, 
-        )
-        self.kulfan_parameters = {k: jnp.array(v) for k, v in normalized_airfoil.kulfan_parameters.items()}
-        self.delta_alpha = jnp.array(normalization_outputs["rotation_angle"])
-        
-        # Calculate coordinate translations to correct the moment coefficient (CM) later
-        self.x_translation_qc = jnp.array(-normalization_outputs["x_translation"] + 0.25 * (1 / normalization_outputs["scale_factor"] * jnp.cos(jnp.radians(normalization_outputs["rotation_angle"]))) - 0.25)
-        self.y_translation_qc = jnp.array(-normalization_outputs["y_translation"] + 0.25 * (1 / normalization_outputs["scale_factor"] * jnp.sin(jnp.radians(-normalization_outputs["rotation_angle"]))))
-        self.scale = jnp.array(normalization_outputs["scale_factor"])
-        
-        # Load the pre-trained neural network weights and input scaling distributions from the neuralfoil package
-        nn_weights_dir = Path(nf.__file__).parent / "nn_weights_and_biases"
-        self._scaled_input_distribution = {k: jnp.array(v) for k, v in dict(np.load(nn_weights_dir / "scaled_input_distribution.npz")).items()}
-        
-        nn_params_raw = dict(np.load(nn_weights_dir / f"nn-{model_size}.npz"))
-        self.nn_params = {k: jnp.array(v) for k, v in nn_params_raw.items()}
-        
-        self.layer_indices = sorted(list(set([int(key.split(".")[1]) for key in nn_params_raw.keys()])))
-        self.N_inputs = len(self._scaled_input_distribution["mean_inputs_scaled"])
-
-    def __call__(self, alpha, re, mach):
-        # 1. Wrap alpha to [-pi, pi] preserving original shape
-        alpha = jnp.mod(alpha + jnp.pi, 2 * jnp.pi) - jnp.pi
-        
-        # Broadcast arrays together to unify their shapes automatically
-        alpha, re = jnp.broadcast_arrays(alpha, re)
-        
-        re_scaled = re / self.scale
-        alpha_deg = jnp.degrees(alpha) + self.delta_alpha
-        
-        k = self.kulfan_parameters
-        
-        # 2. Assemble the 25-dimensional input vector along the LAST axis (-1)
-        # Using jnp.full_like preserves the broadcasted leading dimensions dynamically
-        x = jnp.stack([
-            *[jnp.full_like(alpha_deg, k["upper_weights"][i]) for i in range(8)],
-            *[jnp.full_like(alpha_deg, k["lower_weights"][i]) for i in range(8)],
-            jnp.full_like(alpha_deg, k["leading_edge_weight"]),
-            jnp.full_like(alpha_deg, k["TE_thickness"] * 50),
-            jnp.sin(jnp.radians(2 * alpha_deg)),
-            jnp.cos(jnp.radians(alpha_deg)),
-            1 - jnp.cos(jnp.radians(alpha_deg)) ** 2,
-            (jnp.log(re_scaled) - 12.5) / 3.5,
-            jnp.zeros_like(alpha_deg), # n_crit scaling
-            jnp.ones_like(alpha_deg),  # forced transition upper
-            jnp.ones_like(alpha_deg),  # forced transition lower
-        ], axis=-1) # Shape: (*input_shape, 25)
-        
-        # 3. Leading-dimension safe MLP using jnp.matmul
-        def net(x_in):
-            layer_indices_to_iterate = self.layer_indices.copy()
-            while len(layer_indices_to_iterate) != 0:
-                i = layer_indices_to_iterate.pop(0)
-                w = self.nn_params[f"net.{i}.weight"]
-                b = self.nn_params[f"net.{i}.bias"]
-                
-                # Using jnp.matmul and w.T allows broadcasting across all leading shapes
-                x_in = jnp.matmul(x_in, w.T) + b
-                if len(layer_indices_to_iterate) != 0:
-                    x_in = jax.nn.swish(x_in)
-            return x_in # Shape: (*input_shape, out_features)
-            
-        def sq_mahalanobis(x_in):
-            mean = self._scaled_input_distribution["mean_inputs_scaled"]
-            inv_cov = self._scaled_input_distribution["inv_cov_inputs_scaled"]
-            
-            x_minus_mean = x_in - mean # Broadcasts mean perfectly across trailing axis
-            # Compute Mahalanobis distance strictly focusing on the final feature axis
-            return jnp.sum(jnp.matmul(x_minus_mean, inv_cov) * x_minus_mean, axis=-1)
-
-        # Evaluate the network
-        y = net(x)
-        y = y.at[..., 0].set(y[..., 0] - sq_mahalanobis(x) / (2 * self.N_inputs))
-        
-        # 4. Enforce symmetric consistency using slice syntax (...)
-        x_flipped = x \
-            .at[..., :8].set(x[..., 8:16] * -1) \
-            .at[..., 8:16].set(x[..., :8] * -1) \
-            .at[..., 16].set(-1 * x[..., 16]) \
-            .at[..., 18].set(-1 * x[..., 18]) \
-            .at[..., 23].set(x[..., 24]) \
-            .at[..., 24].set(x[..., 23])
-        
-        y_flipped = net(x_flipped)
-        y_flipped = y_flipped.at[..., 0].set(y_flipped[..., 0] - sq_mahalanobis(x_flipped) / (2 * self.N_inputs))
-        
-        y_unflipped = y_flipped \
-            .at[..., 1].set(y_flipped[..., 1] * -1) \
-            .at[..., 3].set(y_flipped[..., 3] * -1) \
-            .at[..., 4].set(y_flipped[..., 5]) \
-            .at[..., 5].set(y_flipped[..., 4])
-        
-        y_fused = (y + y_unflipped) / 2
-        
-        # Extract coefficients
-        CL_raw = y_fused[..., 1] / 2
-        CD_raw = jnp.exp((y_fused[..., 2] - 2) * 2)
-        CM_raw = y_fused[..., 3] / 20
-        
-        # Coordinate translations
-        extra_CM = -CL_raw * self.x_translation_qc + CD_raw * self.y_translation_qc
-        CM_raw = CM_raw + extra_CM
-        
-        # Flat-Plate Blending
-        alpha_trust_low = jnp.radians(-11.0)
-        alpha_trust_high = jnp.radians(13.0)
-        
-        Cd90 = 1.98
-        Cd0_default = 0.015 
-        sin_a = jnp.sin(alpha)
-        cos_a = jnp.cos(alpha)
-        Cn_fp = Cd90 * sin_a / (0.56 + 0.44 * jnp.abs(sin_a))
-        Ct_fp = 0.5 * Cd0_default * cos_a
-        
-        bg_cl = Cn_fp * cos_a - Ct_fp * sin_a
-        bg_cd = Cn_fp * sin_a + Ct_fp * cos_a
-        bg_cm = -Cn_fp * (0.25 - 0.175 * (1 - 2 * jnp.abs(alpha) / jnp.pi))
-        
-        k_smooth = 40.0 
-        mask_low = 1.0 / (1.0 + jnp.exp(-k_smooth * (alpha - alpha_trust_low)))
-        mask_high = 1.0 / (1.0 + jnp.exp(k_smooth * (alpha - alpha_trust_high)))
-        weight = mask_low * mask_high
-        
-        CL_inc = weight * CL_raw + (1 - weight) * bg_cl
-        CD_inc = weight * CD_raw + (1 - weight) * bg_cd
-        CM_inc = weight * CM_raw + (1 - weight) * bg_cm
-
-        # Apply Mach corrections (which handles shapes smoothly natively)
-        return apply_mach_corrections(CL_inc, CD_inc, CM_inc, mach)
-
-# ==========================================
-# 2. GRID UTILITIES & DATA LOADING
-# ==========================================
-
-@jax.jit
-def jax_idw_3d_grid(scattered_points, scattered_values, grid_X, grid_Y, power=2.0, eps=1e-8):
-    """
-    Vectorized Inverse Distance Weighting (IDW) interpolation in pure JAX.
-    Interpolates unstructured data onto a structured grid for multiple slices (AoA) simultaneously.
-    """
-    # Normalize coordinates to prevent skewed distance metrics (Mach vs Log(Re) scales)
-    p_min = jnp.min(scattered_points, axis=0)
-    p_max = jnp.max(scattered_points, axis=0)
-    p_scale = jnp.maximum(p_max - p_min, 1e-5)
-
-    norm_points = (scattered_points - p_min) / p_scale
-    norm_grid_X = (grid_X - p_min[0]) / p_scale[0]
-    norm_grid_Y = (grid_Y - p_min[1]) / p_scale[1]
-
-    # Flatten grid for pairwise distance calculation
-    flat_grid = jnp.stack([norm_grid_X.ravel(), norm_grid_Y.ravel()], axis=-1)
-
-    # Calculate squared distances: shape (N_grid_points, N_scattered_points)
-    diff = flat_grid[:, None, :] - norm_points[None, :, :]
-    dist_sq = jnp.sum(diff**2, axis=-1)
-
-    # Calculate weights: shape (N_grid, N_pts)
-    weights = 1.0 / (dist_sq**(power / 2.0) + eps)
-    weights_sum = jnp.sum(weights, axis=-1)
-
-    # Einsum dynamically multiplies weights by values for ALL alpha slices at once:
-    # 'gp' (grid_points) * 'ap' (alpha_points) -> 'ag' (alpha_grid)
-    interp_flat = jnp.einsum('gp,ap->ag', weights, scattered_values) / weights_sum[None, :]
-
-    # Reshape back to (N_alpha, N_Mach, N_Re)
-    return interp_flat.reshape(scattered_values.shape[0], grid_X.shape[0], grid_X.shape[1])
-
-def load_airfoil_data(airfoilname):
-    '''
-    Loads airfoil data and constructs interpolator function.
-    '''
-    if Inputs.coeff_method<2:
-        '''
-        Fit 2D Alpha/Reynolds Interpolator
-        '''
-        files = glob.glob(f"airfoils/ARAD10/xfoil/xf-{airfoilname}-il-*.csv")
-        if not files:
-            raise FileNotFoundError(f"No CSVs for {airfoilname}")
-
-        # Define regions of interest (in degrees, then convert to radians)
-        alpha_deg = jnp.concatenate([
-            jnp.linspace(-180, -30, 10),    # Deep negative stall (Coarse)
-            jnp.linspace(-29, -12, 8),     # Negative stall transition (Medium)
-            jnp.linspace(-11, 15, 27),     # Linear lift & Positive Stall (Fine: ~1 deg spacing)
-            jnp.linspace(16, 35, 10),      # Post-stall recovery (Medium)
-            jnp.linspace(36, 180, 11)      # Deep positive stall (Coarse)
-        ])
-
-        # Remove any accidental duplicates at the boundaries and sort
-        alpha_grid = jnp.unique(jnp.radians(alpha_deg))
-        raw_data = []
-        
-        # Analytical Constants
-        Cd90 = 1.98
-        Cd0_default = 0.015 
-
-        # Calculate background model once (independent of Reynolds number)
-        sin_a = jnp.sin(alpha_grid)
-        cos_a = jnp.cos(alpha_grid)
-        Cn_fp = Cd90 * sin_a / (0.56 + 0.44 * jnp.abs(sin_a))
-        Ct_fp = 0.5 * Cd0_default * cos_a
-        bg_cl = Cn_fp * cos_a - Ct_fp * sin_a
-        bg_cd = Cn_fp * sin_a + Ct_fp * cos_a
-        bg_cm = -Cn_fp * (0.25 - 0.175 * (1 - 2 * jnp.abs(alpha_grid) / jnp.pi))
-
-        for f in files:
-            match = re.search(r'-(\d+)\.csv', f)
-            if match:
-                Re = float(match.group(1))
-                data = np.genfromtxt(f, skip_header=11, delimiter=',')
-                
-                # --- DEBUG POINT 1: RAW CSV LOAD ---
-                if jnp.isnan(data).any():
-                    print(f"DEBUG: Found NaNs in raw CSV file: {f}")
-
-                alpha_data = jnp.radians(data[:, 0])
-                x_cl, x_cd, x_cm = jnp.array(data[:, 1]), jnp.array(data[:, 2]), jnp.array(data[:, 4])
-
-                # 1D Interpolation with explicit NaN boundaries
-                xf_cl_interp = jnp.interp(alpha_grid, alpha_data, x_cl, left=jnp.nan, right=jnp.nan)
-                xf_cd_interp = jnp.interp(alpha_grid, alpha_data, x_cd, left=jnp.nan, right=jnp.nan)
-                xf_cm_interp = jnp.interp(alpha_grid, alpha_data, x_cm, left=jnp.nan, right=jnp.nan)
-
-                # Sigmoid Weighting
-                min_a, max_a = alpha_data.min(), alpha_data.max()
-                k = 40.0
-                buffer = jnp.radians(2.0)
-                mask_low = 1.0 / (1.0 + jnp.exp(-k * (alpha_grid - (min_a + buffer))))
-                mask_high = 1.0 / (1.0 + jnp.exp(k * (alpha_grid - (max_a - buffer))))
-                weight = mask_low * mask_high
-
-                # Combine: If weight is 0 or interp is NaN, use background
-                cl_blended = jnp.where(jnp.isnan(xf_cl_interp), bg_cl, weight * xf_cl_interp + (1 - weight) * bg_cl)
-                cd_blended = jnp.where(jnp.isnan(xf_cd_interp), bg_cd, weight * xf_cd_interp + (1 - weight) * bg_cd)
-                cm_blended = jnp.where(jnp.isnan(xf_cm_interp), bg_cm, weight * xf_cm_interp + (1 - weight) * bg_cm)
-
-                # debug check: blended data
-                if jnp.isnan(cl_blended).any():
-                    nan_count = jnp.isnan(cl_blended).sum()
-                    print(f"DEBUG: {nan_count} NaNs propagated into blended Cl for Re={Re}")
-                
-                raw_data.append((Re, cl_blended, cd_blended, cm_blended))
-
-        raw_data.sort(key=lambda x: x[0])
-        re_array = jnp.array([x[0] for x in raw_data])
-        
-        # --- JAX VECTORIZED 2D GRID ASSEMBLY ---
-        # Stack the blended data into (N_re, N_alpha) grids
-        cl_array = jnp.stack([x[1] for x in raw_data])
-        cd_array = jnp.stack([x[2] for x in raw_data])
-        cm_array = jnp.stack([x[3] for x in raw_data])
-
-        re_grid_log = jnp.linspace(jnp.log10(re_array.min()), jnp.log10(re_array.max()), 15)
-        log_re_array = jnp.log10(re_array)
-
-        interp_vmap = jax.vmap(jnp.interp, in_axes=(None, None, 1))
-
-        cl_grid = interp_vmap(re_grid_log, log_re_array, cl_array)
-        cd_grid = interp_vmap(re_grid_log, log_re_array, cd_array)
-        cm_grid = interp_vmap(re_grid_log, log_re_array, cm_array)
-
-        # final grid check/debug
-        if jnp.isnan(cl_grid).any():
-            print("DEBUG: Final CL Grid contains NaNs. Check Reynolds number log-spacing.")
-            
-        return AlphaReInterpolator(alpha_grid, re_grid_log, cl_grid, cd_grid, cm_grid)
-    
-    elif Inputs.coeff_method == 2:
-        '''
-        Create 3D Alpha/Mach/Reynolds interpolator
-        '''
-        files = glob.glob(f"airfoils/{airfoilname}/Polars/*.csv")
-        if not files:
-            raise FileNotFoundError(f"No CSVs found for 3D interpolation in airfoils/{airfoilname}/Polars/")
-
-        # Define regions of interest (in degrees, then convert to radians)
-        alpha_deg = jnp.concatenate([
-            jnp.linspace(-180, -30, 10),    # Deep negative stall (Coarse)
-            jnp.linspace(-29, -12, 8),     # Negative stall transition (Medium)
-            jnp.linspace(-11, 15, 27),     # Linear lift & Positive Stall (Fine: ~1 deg spacing)
-            jnp.linspace(16, 35, 10),      # Post-stall recovery (Medium)
-            jnp.linspace(36, 180, 11)      # Deep positive stall (Coarse)
-        ])
-
-        # Remove any accidental duplicates at the boundaries and sort
-        alpha_grid = jnp.unique(jnp.radians(alpha_deg))
-        raw_data = []
-
-        # Background Analytical Model (Flat Plate)
-        Cd90 = 1.98
-        Cd0_default = 0.015 
-        sin_a = jnp.sin(alpha_grid)
-        cos_a = jnp.cos(alpha_grid)
-        Cn_fp = Cd90 * sin_a / (0.56 + 0.44 * jnp.abs(sin_a))
-        Ct_fp = 0.5 * Cd0_default * cos_a
-        bg_cl = Cn_fp * cos_a - Ct_fp * sin_a
-        bg_cd = Cn_fp * sin_a + Ct_fp * cos_a
-        bg_cm = -Cn_fp * (0.25 - 0.175 * (1 - 2 * jnp.abs(alpha_grid) / jnp.pi))
-
-        for f in files:
-            match = re.search(r'Re([\d\.]+)_M([\d\.]+)', f)
-            if match:
-                Re = float(match.group(1)) * 1e6 
-                Mach = float(match.group(2))
-                
-                # File I/O remains standard NumPy (JAX doesn't read CSVs natively)
-                data = np.genfromtxt(f, skip_header=11, delimiter=',')
-                if np.isnan(data).any() or len(data) == 0:
-                    continue
-
-                alpha_data = jnp.radians(jnp.array(data[:, 0]))
-                x_cl, x_cd, x_cm = jnp.array(data[:, 1]), jnp.array(data[:, 2]), jnp.array(data[:, 4])
-
-                # 1D Interpolation onto unified alpha grid
-                xf_cl_interp = jnp.interp(alpha_grid, alpha_data, x_cl, left=jnp.nan, right=jnp.nan)
-                xf_cd_interp = jnp.interp(alpha_grid, alpha_data, x_cd, left=jnp.nan, right=jnp.nan)
-                xf_cm_interp = jnp.interp(alpha_grid, alpha_data, x_cm, left=jnp.nan, right=jnp.nan)
-
-                # Sigmoid Weighting for Flat-Plate Blending
-                min_a, max_a = alpha_data.min(), alpha_data.max()
-                k = 40.0
-                buffer = jnp.radians(2.0)
-                mask_low = 1.0 / (1.0 + jnp.exp(-k * (alpha_grid - (min_a + buffer))))
-                mask_high = 1.0 / (1.0 + jnp.exp(k * (alpha_grid - (max_a - buffer))))
-                weight = mask_low * mask_high
-
-                cl_blended = jnp.where(jnp.isnan(xf_cl_interp), bg_cl, weight * xf_cl_interp + (1 - weight) * bg_cl)
-                cd_blended = jnp.where(jnp.isnan(xf_cd_interp), bg_cd, weight * xf_cd_interp + (1 - weight) * bg_cd)
-                cm_blended = jnp.where(jnp.isnan(xf_cm_interp), bg_cm, weight * xf_cm_interp + (1 - weight) * bg_cm)
-
-                raw_data.append((Mach, Re, cl_blended, cd_blended, cm_blended))
-
-        if not raw_data:
-            raise ValueError("No valid data extracted from XFLR5 CSVs.")
-
-        # --- JAX-NATIVE 3D GRID ASSEMBLY ---
-        
-        mach_points = jnp.array([d[0] for d in raw_data])
-        re_points = jnp.array([d[1] for d in raw_data])
-        log_re_points = jnp.log10(re_points)
-
-        # Create structured 2D grid boundaries for (Mach, Log_Re)
-        mach_grid = jnp.linspace(mach_points.min(), mach_points.max(), 10)
-        re_grid_log = jnp.linspace(log_re_points.min(), log_re_points.max(), 15)
-        M_mesh, Re_mesh = jnp.meshgrid(mach_grid, re_grid_log, indexing='ij')
-
-        # Unstructured coordinate list (N_pts, 2)
-        points = jnp.column_stack((mach_points, log_re_points))
-
-        # Stack values so they are shape (N_alpha, N_pts)
-        cl_vals_all = jnp.stack([d[2] for d in raw_data], axis=-1)
-        cd_vals_all = jnp.stack([d[3] for d in raw_data], axis=-1)
-        cm_vals_all = jnp.stack([d[4] for d in raw_data], axis=-1)
-
-        # Perform JIT-compiled Inverse Distance Weighting for all Alpha slices simultaneously
-        cl_grid = jax_idw_3d_grid(points, cl_vals_all, M_mesh, Re_mesh)
-        cd_grid = jax_idw_3d_grid(points, cd_vals_all, M_mesh, Re_mesh)
-        cm_grid = jax_idw_3d_grid(points, cm_vals_all, M_mesh, Re_mesh)
-        
-        # Smooth along AoA and Reynolds Axes
-        cl_grid_smooth = gaussian_filter(cl_grid, sigma=(1.5, 0.8, 1.0))
-        cd_grid_smooth = gaussian_filter(cd_grid, sigma=(1.5, 0.8, 1.0))
-        cm_grid_smooth = gaussian_filter(cm_grid, sigma=(1.5, 0.8, 1.0))
-
-        return AlphaMachReInterpolator(alpha_grid, mach_grid, re_grid_log, cl_grid_smooth, cd_grid_smooth, cm_grid_smooth)
-    
-    elif Inputs.coeff_method == 3:
-        '''
-        NeuralFoil implementation using native JAX multi-layer perceptron.
-        '''
-        return NeuralFoilInterpolator(airfoilname)
-
-    else:
-        print("Incorrect coefficient method selected (check Inputs)")
-        return None
-
-# Aerodynamic Methods
-
-def parametric_functions(alpha_rad, 
-                        Cl_alpha=5.7,   # Lift curve slope (1/rad)
-                        Cd0=0.015,      # Zero-lift drag coefficient
-                        alpha_stall= jnp.radians(15), # Stall angle
-                        k_smooth=30):  # Sigmoid sharpness (30-50)
-    """
-    Calculates Cl, Cd, and Cm for a propeller blade section using the 
-    formulation from (M. Nahon, 2015) paper with sigmoid smoothing.
-
-    Valid for Re=60,000
-    """
-    Cd90 = 1.98
-    
-    # Unstalled Regime
-    Cl_lin = Cl_alpha * alpha_rad
-    Ct_lin = Cd0 * jnp.cos(alpha_rad)
-    Cn_lin = (Cl_lin + Ct_lin * jnp.sin(alpha_rad)) / jnp.cos(alpha_rad)
-    Cd_lin = Cn_lin * jnp.sin(alpha_rad) + Ct_lin * jnp.cos(alpha_rad)
-    
-    # High Angle Regime
-    sin_a = jnp.sin(alpha_rad)
-    Cn_stall = Cd90 * sin_a / (0.56 + 0.44 * jnp.abs(sin_a))
-    Ct_stall = 0.5 * Cd0 * jnp.cos(alpha_rad)
-    
-    Cl_stall = Cn_stall * jnp.cos(alpha_rad) - Ct_stall * jnp.sin(alpha_rad)
-    Cd_stall = Cn_stall * jnp.sin(alpha_rad) + Ct_stall * jnp.cos(alpha_rad)
-    
-    # blend Using a sigmoid function to ensure differentiability
-    transition = 1 / (1 + jnp.exp(-k_smooth * (jnp.abs(alpha_rad) - alpha_stall)))
-    
-    Cl = (1 - transition) * Cl_lin + transition * Cl_stall
-    Cd = (1 - transition) * Cd_lin + transition * Cd_stall
-    
-    # Moment Coefficient (same for both formulations)
-    Cn_final = (1 - transition) * Cn_lin + transition * Cn_stall
-    Cm = -Cn_final * (0.25 - 0.175 * (1 - 2 * jnp.abs(alpha_rad) / jnp.pi))
-    
-    return Cl, Cd, Cm
-
-def parametric_coeffs(V_ia, params):
-    '''
-    Calculates aerodynamic coefficients using parametric functions
-    for a given induced velocity and params, including flat-plate estimate.
-    '''
-    # Constants:
-    C_La = 5.7     # Lift curve slope per rad (ARAD10)
-    C_D0 = 0.035    # Zero lift drag coefficient (ARAD10)
-    AoA_0 = jnp.radians(-10) # zero lift angle of attack
-
-    # load relevant data from inputs
-    geometric_angle = params.beta[:, None]
-
-    # calculate aerodynamic incidence
-    _, phi = resultantVelocityComponents(V_ia, params) # get only second output
-
-    # Angle of attack
-    AoA_eff = geometric_angle - phi - AoA_0
-
-    C_L, C_D, C_M = parametric_functions(AoA_eff, 
-                        Cl_alpha=C_La,   # Lift curve slope (1/rad)
-                        Cd0=C_D0,        # Zero-lift drag coefficient
-                        alpha_stall=jnp.radians(20),  # Stall angle (degrees)
-                        k_smooth=30)
-    
-    return C_L, C_D, C_M
-
-def interpolated_coeffs(V_ia, params):
-    '''
-    Aerodynamic coefficients from Xfoil, XFLR5, or NeuralFoil solvers.
-    This unifies the pipeline as the underlying JAX interpolator abstractly handles the method.
+    Each radial station uses its own section, interpolated along the span from the CST sections in params.cst.
+    With return_confidence=True the NeuralFoil analysis confidence (n_r, n_psi) is returned as a 4th output.
     '''
     geometric_angle = params.beta[:, None]
-    V_R, phi = resultantVelocityComponents(V_ia, params) 
-
-    # No zero-lift offset applied to geometric solvers
+    V_R, phi = resultantVelocityComponents(V_i, params)
     AoA_eff = geometric_angle - phi
-    
+
     Re = calc_reynolds(params.rho, jnp.maximum(V_R, 1e-6), params.c[:, None], params.mu)
-    
-    # Calculate Mach number (Assume speed of sound is present in params, fallback to 343.0 m/s)
-    speed_of_sound = getattr(params, 'a', 343.0) 
-    Mach = V_R / speed_of_sound
+    Mach = V_R / params.a
 
-    airfoil_interp = params.airfoil_interp
-    C_L, C_D, C_M = airfoil_interp(AoA_eff, Re, Mach)
-    
-    return C_L, C_D, C_M
+    # Section shape and thickness at each radial station
+    kulfan = cst_at_stations(params.r, params.r_cst, params.cst)
+    t_over_c = max_thickness(kulfan)[:, None]
 
-## 3D ROTATIONAL STALL DELAY CORRECTIONS
+    # Natively calls the instantiated class
+    outputs = params.airfoil_interp(AoA_eff, Re, Mach, kulfan=kulfan[:, None, :], t_over_c=t_over_c,
+                                    return_confidence=return_confidence)
+    C_L_2D, C_D_2D, C_M = outputs[:3]
 
-def no_3d_correction(operands):
-    '''
-    Pass-through function for when rotational_correction == 0.
-    '''
-    C_L_2D, C_D_2D, C_M, V_ia, params = operands
-    return C_L_2D, C_D_2D, C_M
-
-def du_selig_correction(operands):
-    '''
-    Applies the Du-Selig 3D Rotational Stall Delay correction.
-    Modifies C_L and C_D based on local chord-to-radius ratios.
-    '''
-    C_L_2D, C_D_2D, C_M, V_ia, params = operands
-    
-    # Extract geometry and prevent division by zero at the exact root
-    c = params.c[:, None]
-    r = params.r[:, None]
-    R = Inputs.R_tip*1.05
-    
-    r_safe = jnp.maximum(r, 1e-6)
-    c_over_r = c / r_safe
-    r_over_R = r_safe / R
-    
-    # Calculate Effective Angle of Attack (AoA_eff)
-    geometric_angle = params.beta[:, None]
-    _, phi = resultantVelocityComponents(V_ia, params)
-    AoA_eff = geometric_angle - phi
-    
-    # Calculate Du-Selig empirical factor (f1 = f2)
-    denominator = 0.1267 * c_over_r + (1 - r_over_R**2) / r_over_R
-    f1 = (1 / (2 * jnp.pi)) * (1.6 * c_over_r) / jnp.maximum(denominator, 1e-6)
-
-    tip_fade = 1.0 - (r_over_R ** 2)
-    f1 = f1 * tip_fade
-    
-    # Correct Lift
-    # C_L_inv is the theoretical 2D inviscid lift (2 * pi * AoA_eff)
-    C_L_inv = 2 * jnp.pi * (AoA_eff + 0.035) # Estimate zero-lift angle
-    C_L_3D = C_L_2D + f1 * (C_L_inv - C_L_2D)
-    
-    # Correct Drag
-    C_D0 = 0.015 # zero-lift drag
-    C_D_3D = C_D_2D - f1 * (C_D_2D - C_D0)
-    
-    # Ensure physical drag bounds (prevents f1 from forcing drag below baseline)
-    C_D_3D = jnp.maximum(C_D_3D, C_D0)
-    
-    return C_L_3D, C_D_3D, C_M
-
-## jax dispatch pipeline
-
-def aero_coeffs(V_ia, params):
-    # Route to parametric (0) or interpolated (1) based on static config.
-    # Using int() ensures this is a Python-level constant at JIT trace-time,
-    # which is required for lax.switch — a traced jnp.where index would fail.
-    method_idx = int(Inputs.coeff_method > 0)
-    
-    C_L_2D, C_D_2D, C_M = lax.switch(
-        method_idx,
-        [parametric_coeffs, interpolated_coeffs],
-        V_ia, params 
-    )
-    
     # Apply 3D Rotational Corrections
-    operands = (C_L_2D, C_D_2D, C_M, V_ia, params)
+    operands = (C_L_2D, C_D_2D, C_M, V_i, params)
     C_L_final, C_D_final, C_M_final = lax.switch(
-        Inputs.rot_corr_model,
+        params.cfg.rot_corr_model,
         [no_3d_correction, du_selig_correction],
         operands
     )
-    
+
+    if return_confidence:
+        return C_L_final, C_D_final, C_M_final, outputs[3]
     return C_L_final, C_D_final, C_M_final
 
-## Testing and Plotting
 
 if __name__ == "__main__":
-    # mmm pretty LaTeX formatting
+    #mmm pretty plots
     plt.rcParams.update({
         "text.usetex": True,
         "font.family": "serif",
@@ -725,23 +728,24 @@ if __name__ == "__main__":
     })
     
     print("Initializing interpolator architectures...")
-    # Setup plotting domains
+    
     aoa_deg_360 = np.linspace(-180, 180, 400)
     aoa_rad_360 = jnp.radians(aoa_deg_360)
     re_fixed = 1e6
     mach_fixed = 0.2
 
     # Evaluate Parametric
-    cl_param, cd_param, cm_param = parametric_functions(aoa_rad_360)
+    param_interp = load_airfoil_data(0, "arad10")
+    cl_param, cd_param, cm_param = param_interp(aoa_rad_360, re_fixed, mach_fixed)
 
-    # Evaluate XFoil / XFLR5
-    Inputs.coeff_method = 2
-    xfoil_interp = load_airfoil_data("arad10")
+    # Evaluate XFoil 2D
+    xfoil_interp = load_airfoil_data(1, "arad10")
     cl_xf, cd_xf, cm_xf = xfoil_interp(aoa_rad_360, re_fixed, mach_fixed)
 
-    # Evaluate NeuralFoil
-    Inputs.coeff_method = 3
-    nf_interp = load_airfoil_data("arad10")
+    # Evaluate NeuralFoil (section shape passed as CST weights)
+    from functools import partial
+    from geometry import kulfan_from_name
+    nf_interp = partial(load_airfoil_data(3), kulfan=jnp.asarray(kulfan_from_name("arad10")))
     cl_nf, cd_nf, cm_nf = nf_interp(aoa_rad_360, re_fixed, mach_fixed)
 
     active_interp = nf_interp

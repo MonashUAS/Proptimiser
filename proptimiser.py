@@ -1,563 +1,581 @@
 # External Imports
 import jax
 import time
+from dataclasses import dataclass
+import sys
+import signal
+import threading
+import warnings
+import numpy as np
 import jax.numpy as jnp
 import jaxopt
-import matplotlib.pyplot as plt
-from dataclasses import replace
-from jax import lax
 import equinox as eqx
+from abc import ABC, abstractmethod
 
 # Internal Imports
-from init import Inputs
+import airflow
+import airfoil
+import geometry
 import propmodel
 
+_stop_event = threading.Event()
+_sigint_installed = False
 
 
-def minimumInducedLossCost(V_ia, params):
+def _sigint_handler(signum, frame):
+    if not _stop_event.is_set():
+        _stop_event.set()
+        # Write + flush immediately so the message shows up in VSCode's
+        # integrated terminal without waiting on buffered/batched output.
+        sys.stdout.write("\n[Ctrl+C] Interrupt received — stopping after the current iteration...\n")
+        sys.stdout.flush()
+    else:
+        # A second Ctrl+C means "I really mean it, stop now".
+        sys.stdout.write("\n[Ctrl+C] Second interrupt received — forcing immediate exit.\n")
+        sys.stdout.flush()
+        raise KeyboardInterrupt
+
+
+def install_sigint_handler():
     """
-    Returns a DIMENSIONLESS cost measuring deviation from the Betz uniform-inflow
-    condition (coefficient of variation, weighted toward the tip).
-
-    V_ia shape: (Nr, Npsi)
+    Installs the custom SIGINT handler once, from the main thread only.
+    Safe to call multiple times (idempotent).
     """
-    # Global mean over disk (scalar)
-    mean_V_ia = jnp.mean(V_ia)
+    global _sigint_installed
+    if _sigint_installed:
+        return
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGINT, _sigint_handler)
+        _sigint_installed = True
 
-    # Safe denominator: avoid divide-by-zero for near-unloaded blades
-    mean_V_ia_safe = jnp.maximum(jnp.abs(mean_V_ia), 1e-3)
-
-    # Normalised squared error at every (r, psi) station — dimensionless
-    sq_err_normalised = ((V_ia - mean_V_ia) / mean_V_ia_safe) ** 2
-
-    # Collapse azimuthal axis → radial profile (Nr,)
-    radial_sq_err = jnp.mean(sq_err_normalised, axis=1)
-
-    # Outer annuli carry more of the wake energy
-    r_norm = params.r / jnp.max(params.r)
-    weighted_sq_err = radial_sq_err * r_norm
-
-    # RMS over radial stations — O(0.1–0.5) for a realistic propeller in forward flight
-    rms_err = jnp.sqrt(jnp.mean(weighted_sq_err))
-
-    return rms_err
+install_sigint_handler()
 
 
 def objectives(params):
     '''
-    Return the Base Objective Values of the Solver given an input of parameters
-    Values of interest include power, thrust error, minimum induced loss error,
+    Return the Base Objective Values of the Solver given an input of parameters:
+    motor power, thrust and the solved induced velocity V_i_0 for one flight condition.
     '''
-    # replace params object (works in function)
-    V_ia, V_ia_0   = propmodel.induced_velocity(params)             # Solve induced velocity field for current guess
-    thrust = jnp.squeeze(propmodel.thrust(V_ia, params))            # return the total thrust the propeller produce
-    torque = jnp.squeeze(propmodel.torque(V_ia, params))            # return total torque propeller produces
-    rms_MIL_err = minimumInducedLossCost(V_ia, params)            # minimum induced loss condition root mean square error
-    
+    V_i, V_i_0   = propmodel.induced_velocity(params)             # Solve induced velocity field for current guess
+    thrust = jnp.squeeze(propmodel.thrust(V_i, params))            # return the total thrust the propeller produce
+    torque = jnp.squeeze(propmodel.torque(V_i, params))            # return total torque propeller produces
+
     # calculate the motor power
-    motor_power = propmodel.motorPower(torque, params.omega, I_0 = Inputs.I_0, R_m = Inputs.R_m, kV = Inputs.kV)
+    cfg = params.cfg
+    motor_power = propmodel.motorPower(torque, params.omega, I_0 = cfg.I_0, R_m = cfg.R_m, kV = cfg.kV)
 
-    # Return V_ia_0 so we can catch it!
-    return motor_power, thrust, rms_MIL_err, V_ia_0 
+    # Return V_i_0 so we can catch it!
+    return motor_power, thrust, V_i_0
 
-def cost_fn(params):
-    ''' 
-    Computes cost and returns updated V_ia_0 for exactly ONE condition 
+def confidence_penalty(V_i_0, params):
+    '''
+    Penalises NeuralFoil analysis confidence below cfg.min_confidence at the aerodynamic stations (r >= r_aero),
+    keeping the optimised sections and their operating angles inside the network's trusted region.
+    '''
+    cfg = params.cfg
+    if cfg.coeff_method != 3 or cfg.w_confidence == 0:
+        return jnp.zeros(())
+
+    V_i = airflow.inflow_model(V_i_0, params)
+    _, _, _, confidence = airfoil.aero_coeffs(V_i, params, return_confidence=True)
+    shortfall = jax.nn.relu(cfg.min_confidence - confidence) ** 2
+
+    # Hub and blend-zone sections are fixed, so only the aerodynamic zone is penalised
+    aero = (params.r >= params.r_cst[1])[:, None]
+    return cfg.w_confidence * jnp.sum(jnp.where(aero, shortfall, 0.0)) / (jnp.sum(aero) * shortfall.shape[1])
+
+def condition_terms(params):
+    '''
+    Unweighted cost terms (thrust, power, confidence) for exactly ONE condition,
+    along with (motor power, thrust, V_i_0).
     '''
     # unpack objectives and induced velocity
-    motor_power, thrust, rms_MIL_err, V_ia_0 = objectives(params)
-    # calculate scaled variables
+    motor_power, thrust, V_i_0 = objectives(params)
+    cfg = params.cfg
+    # Thrust constraint: zero cost inside the tolerance band, steep quadratic penalty outside it
     thrust_err_rel = (thrust - params.thrust_target)/params.thrust_target
+    thrust_violation = jax.nn.relu(jnp.abs(thrust_err_rel) - cfg.thrust_tol)
+    thrust_penalty = cfg.w_thrust * thrust_violation**2
 
-    # Calculate base cost using this condition's specific targets
-    cost = (
-        (thrust_err_rel)**2 +
-        (motor_power/Inputs.W_max)
-    )
-    
+    # Power objective: minimised freely once the thrust constraint is satisfied
+    power_rel = jnp.abs(motor_power/cfg.P_max)
+
+    terms = (thrust_penalty, power_rel, confidence_penalty(V_i_0, params))
+    return terms, (motor_power, thrust, V_i_0)
+
+def condition_cost(params):
+    '''
+    Computes cost and returns updated V_i_0 for exactly ONE condition
+    '''
+    terms, (_, _, V_i_0) = condition_terms(params)
+    cost = sum(terms)
+
     # Scale by the relative importance weight of this flight condition
     weighted_cost = cost * params.objective_weight
-    return weighted_cost, V_ia_0
+    return weighted_cost, V_i_0
 
-def objectives_fn(opt_vars_scaled, params_list): 
+@jax.jit
+def total_cost(vars_scaled, params_struct, space):
     '''
-    Vectorized objective function mapping over an ensemble of single-condition Params
+    Total cost of all n conditions specified in Inputs, plus the airfoil thickness penalty.
     '''
-    # Unpack Scaled Control Points    
-    c_scaled, beta_scaled, omega_scaled = opt_vars_scaled
-    
-    # Direct pointwise variable assignment
-    c = params_list.c_scale[:, None] * c_scaled[None, :]
-    beta = params_list.beta_scale[:, None] * beta_scaled[None, :]
-
-    omega = lax.switch(Inputs.solve_omega, [lambda _: params_list.omega, lambda _: params_list.omega_max * omega_scaled], None)
-
-    # Update parameters list with new geometry and control points
-    params_list = eqx.tree_at(
-        lambda p: (p.c, p.beta, p.omega), 
-        params_list, 
-        (c, beta, omega)
-    )
+    # Update parameters struct with new geometry and control points
+    params_struct = space.from_unit(vars_scaled, params_struct)
 
     # vmap cost function over parameters list
-    cost_fn_vmap = jax.vmap(cost_fn, in_axes=0)
-    costs, V_ia_0 = cost_fn_vmap(params_list)
+    cost_fn_vmap = jax.vmap(condition_cost, in_axes=0)
+    costs, V_i_0 = cost_fn_vmap(params_struct)
 
-    aux = (V_ia_0)
-    return jnp.sum(costs), aux
-
-def apply_vars_to_struct(vars_scaled, params_struct):
-    """
-    Helper function to apply scaled variables to the batched parameter structure.
-    """
-    c_scaled, beta_scaled, omega_scaled = vars_scaled
-    
-    # Direct pointwise variable assignment
-    c = params_struct.c_scale[:, None] * c_scaled[None, :]
-    beta = params_struct.beta_scale[:, None] * beta_scaled[None, :]
-
-    omega = omega_scaled * params_struct.omega_max
-
-    # Update parameters list with new geometry and control points
-    return replace(params_struct, c=c, beta=beta, omega=omega)
-
-def slsqp_objective(vars_scaled, params_struct):
-    '''
-    Pure performance cost function (Power & MIL) for the slsqp solver.
-    '''
-    # Debug: Print shapes of input variables
-    jax.debug.print("Objective - vars_scaled shapes: {x}", 
-                    x=jax.tree_util.tree_map(jnp.shape, vars_scaled))
-
-    # Pass PyTree directly to the struct applier
-    params_updated = apply_vars_to_struct(vars_scaled, params_struct)
-    
-    # Evaluate objectives across all conditions
-    motor_power, _, rms_MIL_err, _ = evaluate_all_conditions(params_updated)
-    
-    # Debug: Print shape of outputs
-    jax.debug.print("Objective - motor_power shape: {m}, rms_MIL_err shape: {r}", 
-                    m=jnp.shape(motor_power), r=jnp.shape(rms_MIL_err))
-
-    # Calculate efficiency compared to actuator disk
-    actuator_disk_power = jax.vmap(propmodel.actuator_disk_power)(params_updated.thrust_target, params_updated)
-    efficiency = motor_power / actuator_disk_power
-    
-    # Optimize strictly for power efficiency and minimum induced loss
-    cost = (
-        params_updated.objective_MIL * rms_MIL_err**2 + 
-        params_updated.objective_power * efficiency**2
-    )
-    
-    # Scale by the relative importance weight of this flight condition
-    weighted_cost = cost * params_updated.objective_weight
-    
-    total_cost = jnp.sum(weighted_cost)
-    jax.debug.print("Objective - final cost shape: {s}", s=jnp.shape(total_cost))
-    
-    return total_cost
-
-def slsqp_eq_constraints(vars_scaled, params_struct):
-    '''
-    Equality constraints for slsqp-jax. Returns an array of relative thrust errors.
-    '''
-    # Debug: Print shapes of input variables
-    jax.debug.print("Constraint - vars_scaled shapes: {x}", 
-                    x=jax.tree_util.tree_map(jnp.shape, vars_scaled))
-
-    params_updated = apply_vars_to_struct(vars_scaled, params_struct)
-    
-    # We only need thrust for the constraint
-    _, thrust, _, _ = evaluate_all_conditions(params_updated)
-    
-    # Relative thrust error (Shape: (n_cond,))
-    thrust_err_rel = (thrust - params_updated.thrust_target) / params_updated.thrust_target
-    
-    # Debug: Print shape of constraint output
-    jax.debug.print("Constraint - thrust_err_rel shape: {s}", s=jnp.shape(thrust_err_rel))
-    
-    return thrust_err_rel
+    aux = (V_i_0)
+    return jnp.sum(costs) + space.thickness_penalty(params_struct), aux
 
 @jax.jit
 def evaluate_all_conditions(params_struct):
-    vmapped_obj = jax.vmap(objectives, in_axes=0)
-    return vmapped_obj(params_struct)
-
-def get_manual_unflatten(c_shape, b_shape, o_shape):
-    """
-    Returns a closure that unflattened flat_x into the required tuple.
-    We pass shapes as arguments to keep the closure clean for JIT.
-    """
-    c_size = int(jnp.prod(jnp.array(c_shape)))
-    b_size = int(jnp.prod(jnp.array(b_shape)))
-    o_size = int(jnp.prod(jnp.array(o_shape)))
-    
-    def manual_unflatten(flat_x):
-        # 1. Pointer arithmetic for slicing
-        # Ensure we are working with concrete integers
-        c_end = c_size
-        b_end = c_end + b_size
-        
-        # 2. Extract and Reshape
-        c_new = flat_x[:c_end].reshape(c_shape)
-        beta_new = flat_x[c_end:b_end].reshape(b_shape)
-        omega_new = flat_x[b_end:].reshape(o_shape)
-        
-        return (c_new, beta_new, omega_new)
-    
-    return manual_unflatten
-
-def run_optimization(params_base, update_queue=None):
     '''
-    The Meat and Bones of the Optimisation Algorithm.
-    Iterate until solution is stable or criteria are met.
+    Helper Function to evaluate cost terms and objectives for all conditions.
     '''
-    # Debug Print to check initial thrust residual
-    if Inputs.verbose:
-        res_check = propmodel.thrust_residual(params_base.V_ia_0, params_base)
-        jax.debug.print("Initial Residuals Check: {dT_res}", dT_res=res_check)
-
-    ## Construct params_struct for all flight conditions
-    conditions_list = [
-    replace(
-            params_base,
-            V_x=Inputs.V_x[i],
-            V_yz=Inputs.V_yz[i],
-            omega=Inputs.omega[i],
-            thrust_target=Inputs.thrust_target[i],
-            objective_weight=Inputs.objective_weight[i],
-            V_ia_0=jnp.full((Inputs.n_r,), 4.0)
-        )
-        for i in range(Inputs.n_cond)
-    ]
-    
-    # Convert list into a stacked PyTree object that JAX natively unrolls via vmap
-    params_struct = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *conditions_list)
-
-    vars_scaled = (
-        params_base.c / params_base.c_scale,
-        params_base.beta / params_base.beta_scale,
-        params_struct.omega / params_base.omega_max # Shape (2,)
-    )
-
-    lower_bounds = (
-        jnp.full_like(vars_scaled[0], 1e-4),
-        jnp.full_like(vars_scaled[1], 0.0),
-        jnp.full_like(vars_scaled[2], 300/params_base.omega_max)
-    )
-    
-    upper_bounds = (
-        jnp.full_like(vars_scaled[0], 1.0),
-        jnp.full_like(vars_scaled[1], 1.0),
-        jnp.full_like(vars_scaled[2], 1.0)
-    )
-    
-    bounds = (lower_bounds, upper_bounds)
-
-    # Start the clock
-    start_time = time.time()
-
-    # Initialise Timings and Log Arrays
-    iter_time = start_time+10
-    print_time = iter_time
-
-    error_log = jnp.array([1.0])
-    time_log = jnp.array([0])
+    vmapped_terms = jax.vmap(condition_terms, in_axes=0)
+    return vmapped_terms(params_struct)
 
 
-    if Inputs.opt_solver == "SLSQP":
-        print("Initialising SciPy SLSQP Solver...")
-        import scipy.optimize as spo
-        import numpy as np
-        from jax.flatten_util import ravel_pytree
-        
-        # 1. FLATTEN STATE AND BOUNDS FOR SCIPY
-        flat_vars, unflatten_fn = ravel_pytree(vars_scaled)
-        flat_lower, _ = ravel_pytree(lower_bounds)
-        flat_upper, _ = ravel_pytree(upper_bounds)
-        
-        # SciPy expects bounds as a list of tuples or a Bounds object
-        bounds_scipy = list(zip(np.array(flat_lower), np.array(flat_upper)))
-        flat_vars_np = np.array(flat_vars, dtype=np.float64)
+class DesignSpace(eqx.Module):
+    '''
+    Maps the optimiser's unit-box variables onto the blade and operating state.
 
-        # 2. DEFINE MUTABLE CONTAINER FOR PYTHON STATE & WARM-STARTS
-        state_container = {
-            "params_struct": params_struct,
-            "last_jac": None
-        }
+    Only free entries are design variables (physical value = lo + x * (hi - lo)). Stations frozen by
+    BladeSpec.freeze keep their seed values, and blend-zone chord/twist are derived every step from the
+    hub values and the first aerodynamic station.
+    '''
+    lo: dict                    # physical lower bound of each free entry
+    hi: dict                    # physical upper bound of each free entry
+    seed: dict                  # full seed arrays: c, beta (n_r,), cst (n_aero, N_CST), omega, tilt (n_cond,)
+    hub_cst: jnp.ndarray        # hub section, fixed
+    blend: jnp.ndarray          # blend fraction per station (0 at r_hub, 1 at the anchor station)
+    inboard: jnp.ndarray        # stations whose chord/twist are derived from the blend
+    free: tuple = eqx.field(static=True)        # ((name, flat indices of the free entries), ...)
+    anchor: int = eqx.field(static=True)
+    hub_chord: float = eqx.field(static=True)
+    hub_twist: float = eqx.field(static=True)
+    cst_active: bool = eqx.field(static=True)
+    min_tc: float = eqx.field(static=True)
+    w_thickness: float = eqx.field(static=True)
 
-        # 3. DEFINE JIT-COMPILED CORE JAX FUNCTIONS
-        @jax.jit
-        def compute_obj_val_and_grad(flat_x, current_params):
-            def f(x):
-                vars_scl = unflatten_fn(x)
-                params_updated = apply_vars_to_struct(vars_scl, current_params)
-                motor_power, _, rms_MIL_err, final_V_ia_0 = evaluate_all_conditions(params_updated)
-                
-                actuator_disk_power = jax.vmap(propmodel.actuator_disk_power)(params_updated.thrust_target, params_updated)
-                efficiency = motor_power / actuator_disk_power
-                
-                cost = (
-                    params_updated.objective_MIL * rms_MIL_err**2 + 
-                    params_updated.objective_power * efficiency**2
-                )
-                weighted_cost = cost * params_updated.objective_weight
-                total_cost = jnp.sum(weighted_cost)
-                return total_cost, final_V_ia_0
+    @classmethod
+    def build(cls, prop):
+        blade, inputs = prop.blade, prop.inputs
+        r = np.asarray(prop.r)
+        blend, inboard, anchor = geometry.planform_blend_weights(r, blade.R_hub, blade.R_aero)
 
-            (cost, final_V_ia_0), grad = jax.value_and_grad(f, has_aux=True)(flat_x)
-            return cost, grad, final_V_ia_0
+        free, lo, hi = [], {}, {}
 
-        @jax.jit
-        def compute_con_val_and_jac(flat_x, current_params):
-            def c_fn(x):
-                vars_scl = unflatten_fn(x)
-                params_updated = apply_vars_to_struct(vars_scl, current_params)
-                _, thrust, _, final_V_ia_0 = evaluate_all_conditions(params_updated)
-                thrust_err_rel = (thrust - params_updated.thrust_target) / params_updated.thrust_target
-                return thrust_err_rel, final_V_ia_0
+        def add(name, idx, lower, upper):
+            if len(idx) == 0:
+                return
+            free.append((name, tuple(int(i) for i in idx)))
+            lo[name] = jnp.broadcast_to(jnp.asarray(lower, dtype=float), (len(idx),))
+            hi[name] = jnp.broadcast_to(jnp.asarray(upper, dtype=float), (len(idx),))
 
-            val, final_V_ia_0 = c_fn(flat_x)
-            # Shared graph computation via XLA means c_fn evaluates efficiently here
-            jac = jax.jacobian(lambda x: c_fn(x)[0])(flat_x)
-            return val, jac, final_V_ia_0
+        # Chord and twist: aerodynamic-zone stations outside the freeze ranges
+        for name, (lower, upper) in (("c", blade.c_bounds), ("beta", np.radians(blade.beta_bounds_deg))):
+            add(name, [i for i, r_i in enumerate(r) if not inboard[i] and not blade.is_frozen(name, r_i)], lower, upper)
+            if any(blade.is_frozen(name, r_i) for r_i in r[inboard]):
+                warnings.warn(f"freeze['{name}'] covers blend-zone stations; their {name} is derived from the hub and r_aero values")
 
-        # 4. DEFINE SCIPY-COMPATIBLE WRAPPERS (Converts JAX types to NumPy)
-        def scipy_objective(flat_x_np):
-            flat_x = jnp.array(flat_x_np, dtype=jnp.float64)
-            current_params = state_container["params_struct"]
-            cost, grad, final_V_ia_0 = compute_obj_val_and_grad(flat_x, current_params)
-            
-            # Catch the updated inner-solver state and feed it forward as a warm start
-            state_container["params_struct"] = eqx.tree_at(
-                lambda p: p.V_ia_0, current_params, final_V_ia_0
-            )
-            return float(cost), np.array(grad, dtype=np.float64)
+        # CST weights and LE weight at unfrozen aero stations (TE thickness stays at its seed value)
+        cst_active = blade.optimise_cst and inputs.coeff_method == 3
+        if blade.optimise_cst and not cst_active:
+            warnings.warn("CST optimisation needs NeuralFoil (Inputs.coeff_method = 3); airfoil sections stay fixed")
+        if cst_active:
+            stations = [j for j, r_j in enumerate(blade.r_foils[2:]) if not blade.is_frozen("cst", r_j)]
+            idx = [j * geometry.N_CST + k for j in stations for k in range(geometry.N_CST - 1)]
+            seed_values = np.asarray(prop.cst).ravel()[idx]
+            add("cst", idx, seed_values - blade.cst_bound, seed_values + blade.cst_bound)
 
-        def scipy_constraint(flat_x_np):
-            flat_x = jnp.array(flat_x_np, dtype=jnp.float64)
-            current_params = state_container["params_struct"]
-            val, jac, final_V_ia_0 = compute_con_val_and_jac(flat_x, current_params)
-            
-            # Sync the warm-start state and cache the Jacobian array 
-            state_container["params_struct"] = eqx.tree_at(
-                lambda p: p.V_ia_0, current_params, final_V_ia_0
-            )
-            state_container["last_jac"] = jac
-            return np.array(val, dtype=np.float64)
+        # Operating state: conditions flagged in solve_omega / solve_tilt
+        omega_max = 343.0 / blade.R_tip
+        add("omega", np.flatnonzero(np.asarray(inputs.solve_omega)), 0.1 * omega_max, omega_max)
+        add("tilt", np.flatnonzero(np.asarray(inputs.solve_tilt)), 0.0, np.radians(30.0))
 
-        def scipy_constraint_jac(flat_x_np):
-            # Eliminates duplicate execution by returning the pre-cached Jacobian 
-            return np.array(state_container["last_jac"], dtype=np.float64)
+        if not free:
+            raise ValueError("Nothing to optimise: every design variable is frozen")
 
-        # 5. DEFINE ITERATION CALLBACK FOR LIVE TERMINAL DISPLAY
-        iteration_counter = [0]
-        print(f"\n{'Iter':<5} | {'Cond':<5} | {'Omega':<10} | {'Power':<12} | {'Thrust':<12} | {'T-Err':<12} | {'MIL':<10} | {'Time'}")
-        print("-" * 90)
-
-        def scipy_callback(xk):
-            iteration_counter[0] += 1
-            flat_x = jnp.array(xk, dtype=jnp.float64)
-            current_params = state_container["params_struct"]
-            vars_scl = unflatten_fn(flat_x)
-            params_updated = apply_vars_to_struct(vars_scl, current_params)
-            
-            powers, thrusts, rms_MIL_errs, _ = evaluate_all_conditions(params_updated)
-            
-            for idx, (pwr, thr, mil) in enumerate(zip(powers, thrusts, rms_MIL_errs)):
-                t_err = thr - params_updated.thrust_target[idx]
-                omega_cond = params_updated.omega[idx]
-                iter_str = f"{iteration_counter[0]:<5}" if idx == 0 else f"{'':<5}"
-                timing = f"{time.time() - start_time:<4.1f}s" if idx == 0 else ""
-                print(f"{iter_str} | C{idx:<3} | {omega_cond:<10.2f} | {pwr:<12.4f} | {thr:<12.4f} | {t_err:<12.4f} | {mil:<10.4f} | {timing}")
-            print("-" * 90)
-            if update_queue is not None:
-                c_np = np.array(params_updated.c[0]) * 1000
-                beta_np = np.degrees(np.array(params_updated.beta[0]))
-                
-                # Pass current error log structure
-                current_errors = np.array(error_log) 
-                
-                V_ia_0_curr = params_updated.V_ia_0[0]
-                V_ia_curr = np.array(propmodel.inflow_model(V_ia_0_curr, params_base))
-                
-                update_queue.put({
-                    'c': c_np,
-                    'beta': beta_np,
-                    'error_log': current_errors,
-                    'V_ia': V_ia_curr
-                })
-        # 6. EXECUTE SCIPY MINIMIZATION
-        constraints = [
-            {
-                'type': 'eq',
-                'fun': scipy_constraint,
-                'jac': scipy_constraint_jac
-            }
-        ]
-
-        res = spo.minimize(
-            fun=scipy_objective,
-            x0=flat_vars_np,
-            method='SLSQP',
-            jac=True,  # Tells SciPy that scipy_objective returns (cost, grad)
-            bounds=bounds_scipy,
-            constraints=constraints,
-            callback=scipy_callback,
-            options={'maxiter': Inputs.opt_max_iter, 'ftol': Inputs.opt_tol}
+        return cls(
+            lo=lo, hi=hi,
+            seed=dict(c=prop.c, beta=prop.beta, cst=prop.cst, omega=prop.omega, tilt=prop.tilt),
+            hub_cst=jnp.asarray(blade.hub_cst),
+            blend=jnp.asarray(blend),
+            inboard=jnp.asarray(inboard),
+            free=tuple(free),
+            anchor=anchor,
+            hub_chord=blade.hub_chord,
+            hub_twist=float(np.radians(blade.hub_twist_deg)),
+            cst_active=cst_active,
+            min_tc=blade.min_tc,
+            w_thickness=inputs.w_thickness,
         )
 
-        # 7. RECONSTRUCT THE PYTREE RESULTS FROM THE FINAL SCIPY STATE
-        final_flat_vars = jnp.array(res.x)
-        vars_scaled_opt = unflatten_fn(final_flat_vars)
-        
-        params_struct = state_container["params_struct"]
-        params_struct = apply_vars_to_struct(vars_scaled_opt, params_struct)
-        
-        powers, thrusts, rms_MIL_errs, final_V_ia_0 = evaluate_all_conditions(params_struct)
-        params_struct = eqx.tree_at(lambda p: p.V_ia_0, params_struct, final_V_ia_0)
-        
-        print(f"\nOptimization Complete. Status: {res.message}")
-        time_log = jnp.append(time_log, time.time() - start_time)
+    def to_unit(self, prop):
+        '''
+        Unit-box variables for the propeller's current design, clipped to the bounds.
+        '''
+        x = {}
+        for name, idx in self.free:
+            value = jnp.ravel(getattr(prop, name))[np.array(idx)]
+            unit = (value - self.lo[name]) / (self.hi[name] - self.lo[name])
+            if bool(jnp.any((unit < 0.0) | (unit > 1.0))):
+                warnings.warn(f"Seed {name} lies outside its bounds and has been clipped")
+            x[name] = jnp.clip(unit, 0.0, 1.0)
+        return x
 
-    elif Inputs.opt_solver == "L-BFGS-B":
-        import numpy as np
-        solver = jaxopt.LBFGSB(
-            fun=objectives_fn, 
-            has_aux=True,
-            implicit_diff=True, 
-            jit=True
+    def values(self, x):
+        '''
+        Full physical design arrays (c, beta, cst, omega, tilt) for unit-box variables x.
+        '''
+        full = dict(self.seed)
+        for name, idx in self.free:
+            physical = self.lo[name] + x[name] * (self.hi[name] - self.lo[name])
+            base = self.seed[name]
+            full[name] = base.ravel().at[np.array(idx)].set(physical).reshape(base.shape)
+
+        # Blend-zone planform follows the hub values and the first aerodynamic station
+        full["c"], full["beta"] = geometry.apply_planform_blend(
+            full["c"], full["beta"], self.blend, self.inboard, self.anchor, self.hub_chord, self.hub_twist
         )
-        ## Initialisation Prints
-        print("Initialising Solver...")
-        state = solver.init_state(init_params=vars_scaled, bounds=bounds, params_list=params_struct)
-        print(f"{'Iter':<6} | {'Cond':<5} | {'Omega':<10} | {'Power':<12} | {'Thrust':<12} | {'T-Err':<12} | {'MIL':<10} | {'OptErr':<11} | {'Time'}")
-        print("-" * 103)
-        ## Solver Loop
-        try:
-            for i in range(Inputs.opt_max_iter): 
-                vars_scaled, state = solver.update(vars_scaled, 
-                                                state=state, 
-                                                bounds=bounds, 
-                                                params_list=params_struct
-                                                )
-                # state.aux captures the updated tracking profiles (shape: [2, n_r])
-                # We assign them directly back to keep Newton warm-starts efficient
+        return full
 
-                ## Unpack and Rescale Variables
-                c_scaled, beta_scaled, omega_scaled = vars_scaled
-                # toggle for omega solving
-                omega = lax.switch(Inputs.solve_omega, [lambda _: params_struct.omega, lambda _: params_struct.omega_max * omega_scaled], None)
-                c = params_struct.c_scale[:, None] * c_scaled[None, :]
-                beta = params_struct.beta_scale[:, None] * beta_scaled[None, :]
+    def from_unit(self, x, params_struct):
+        '''
+        Writes the design for unit-box variables x into the batched params_struct.
+        '''
+        full = self.values(x)
+        n_cond = params_struct.omega.shape[0]
+        cst_all = jnp.concatenate([self.hub_cst[None, :], full["cst"]])
 
-                # Extract and unpack induced velocity
-                V_ia_0 = state.aux
+        # Geometry is shared by every flight condition
+        shared = lambda a: jnp.broadcast_to(a, (n_cond,) + a.shape)
+        return eqx.tree_at(
+            lambda p: (p.c, p.beta, p.cst, p.omega, p.tilt),
+            params_struct,
+            (shared(full["c"]), shared(full["beta"]), shared(cst_all), full["omega"], full["tilt"])
+        )
 
-                ## Insert all new Guesses into params_struct
-                params_struct = eqx.tree_at(
-                    lambda p: (p.c, p.beta, p.omega, p.V_ia_0), 
-                    params_struct, 
-                    (c, beta, omega, V_ia_0)
-                )
+    def thickness_penalty(self, params_struct):
+        '''
+        Penalises aerodynamic sections thinner than min_tc (zero while every section is thick enough).
+        '''
+        if not self.cst_active or self.w_thickness == 0:
+            return jnp.zeros(())
+        t_over_c = geometry.max_thickness(params_struct.cst[0, 1:])
+        return self.w_thickness * jnp.sum(jax.nn.relu((self.min_tc - t_over_c) / self.min_tc) ** 2)
 
-                # Print Statements for this Iteration
-                is_terminal = state.error < Inputs.opt_tol
-                is_checkpoint = (time.time() - print_time > 5) or (i % 5 == 0)
 
-                if is_terminal or is_checkpoint:
-                    # Calculate State for Printing
-                    powers, thrusts, rms_MIL_errs, _ = evaluate_all_conditions(params_struct)
+@dataclass
+class Progress:
+    '''
+    State of an optimisation, reported every Inputs.opt_print_every iterations and once more when solve() ends.
+    Per-condition fields are numpy arrays of shape (n_cond,).
+    '''
+    iteration: int              # iterations completed
+    max_iter: int
+    cost: float                 # total cost of the current design
+    error: float                # solver stopping criterion (projected gradient norm for L-BFGS-B)
+    elapsed: float              # seconds since solve() started
+    status: str                 # "running", "converged", "stopped" or "max_iter"
+    omega: np.ndarray
+    thrust: np.ndarray
+    thrust_target: np.ndarray
+    power: np.ndarray           # motor power (W)
+    cost_terms: dict            # unweighted per-condition cost terms: "thrust", "power", "confidence"
+    thickness_penalty: float
+    error_log: np.ndarray       # stopping criterion at the seed and after every iteration
+    params_struct: object       # batched Params of the current design
 
-                    # Vectorized array math for errors and costs
-                    t_errs = thrusts - params_struct.thrust_target
+    @property
+    def thrust_err_pct(self) -> np.ndarray:
+        return 100.0 * (self.thrust - self.thrust_target) / self.thrust_target
 
-                    # vmap the reference power calculation over the batched thrust_targets
-                    vmapped_actuator_pwr = jax.vmap(propmodel.actuator_disk_power, in_axes=(0, None))
-                    actuator_pwr_refs = vmapped_actuator_pwr(params_struct.thrust_target, params_base)
-                    cost_Ts = params_struct.objective_thrust * (t_errs / params_struct.thrust_target)**2
-                    cost_Ps = params_struct.objective_power * (powers / actuator_pwr_refs)**2
+    def condition(self, idx: int = 0):
+        '''
+        Params of flight condition idx at the current design, carrying the optimiser error log.
+        '''
+        params = jax.tree_util.tree_map(
+            lambda leaf: leaf[idx] if hasattr(leaf, 'ndim') and leaf.ndim > 0 else leaf,
+            self.params_struct
+        )
+        return eqx.tree_at(lambda p: p.error_log, params, jnp.asarray(self.error_log))
 
-                    # Clean zip over the pre-calculated batched arrays
-                    for idx, (pwr, thr, t_err, mil, om, c_T, c_P) in enumerate(zip(
-                        powers, thrusts, t_errs, rms_MIL_errs, omega, cost_Ts, cost_Ps
-                    )):
-                        # Only print iteration metadata on the first condition row
-                        iter_info = f"{i:<6} |" if idx == 0 else f"{'':<6} |"
-                        opt_err = f"{state.error:<11.3f}" if idx == 0 else f"{'':<11}"
-                        timing = f"{time.time() - iter_time:<4.1f}s" if idx == 0 else ""
-                        
-                        print(f"{iter_info} C{idx:<3} | {om:<5.2f} | {pwr:<12.4f} | {thr:<12.4f} | {t_err:<12.4f} | {mil:<10.4f} | {opt_err} | {timing}")
-                    print_time = time.time()
-                    
-                    ## Plotting Thread Update
-                    if update_queue is not None:
-                        # Extract Condition 0 (params_hover) from the batched PyTree
-                        params_hover = jax.tree_util.tree_map(
-                            lambda leaf: leaf[0] if hasattr(leaf, 'ndim') and leaf.ndim > 0 else leaf,
-                            params_struct
-                        )
-                        
-                        # Inject the current error log into the params object
-                        params_hover = eqx.tree_at(
-                            lambda p: p.error_log, 
-                            params_hover, 
-                            error_log
-                        )
-                        
-                        # params object to queue
-                        update_queue.put(params_hover)
-                    
-                    if is_terminal:
-                        print(f"\nStopping: Convergence reached at step {i}")
-                        break
 
-                # Update Error Log, Iter Time
-                error_log = jnp.append(error_log, state.error)
-                time_log = jnp.append(time_log, time.time() - iter_time)
-                iter_time = time.time()
-        except KeyboardInterrupt:
-            print(f"\n[Interrupt] Optimization paused manually by user at iteration {i}.")
-            print("Extracting current state variables and returning progress...")
+class ProgressPrinter:
+    '''
+    Prints optimisation progress as an aligned table (ASCII only, so any console encoding can show it).
+
+    verbose 0: banner and final summary, 1: + one row group per report, 2: + cost terms of every condition.
+    '''
+    HEADER_EVERY = 20       # reports between repeated headers
+
+    def __init__(self, verbose: int = 1, error_name: str = "OptErr"):
+        self.verbose = verbose
+        self.error_name = error_name
+        self.n_reports = 0
+        self.tol = None
+
+    def banner(self, solver_name, space, n_cond, max_iter, tol):
+        self.tol = tol
+        counts = [f"{name} {len(idx)}" for name, idx in space.free]
+        total = sum(len(idx) for _, idx in space.free)
+        print(f"\n{solver_name} | design variables: {', '.join(counts)} ({total} total) | "
+              f"{n_cond} flight condition{'s' if n_cond != 1 else ''} | max {max_iter} iterations, tol {tol:.1e}", flush=True)
+
+    def note(self, text):
+        print(text, flush=True)
+
+    def report(self, progress: Progress):
+        if self.verbose < 1:
+            return
+        if self.n_reports % self.HEADER_EVERY == 0:
+            self._header()
+        self.n_reports += 1
+        self._rows(progress)
+
+    def summary(self, progress: Progress):
+        n = progress.iteration
+        if progress.status == "converged":
+            reason = f"Converged at iteration {n}: {self.error_name} {progress.error:.2e} < tol {self.tol:.1e}"
+        elif progress.status == "stopped":
+            reason = f"Stopped by user after {n} iteration{'s' if n != 1 else ''}"
         else:
-            # Final terminal backup evaluation if max iterations is hit
-            vmapped_objectives = jax.vmap(objectives, in_axes=0)
-            _, thrusts, _, _ = vmapped_objectives(params_struct)
-            for cond_idx in range(len(thrusts)):
-                err = float(thrusts[cond_idx] - params_struct.thrust_target[cond_idx])
-                print(f"Warning: max iterations reached. Final thrust error [Cond {cond_idx}]: {err:.2e}")
-        
-        # Clock Time of solve
-        solve_time = time.time() - start_time
-        print(f"\nTotal Solve Time: {solve_time:.2f} seconds")
+            reason = f"Reached the iteration limit ({n}) without converging: {self.error_name} {progress.error:.2e} > tol {self.tol:.1e}"
+        per_iter = f" ({progress.elapsed / n:.2f} s/iteration)" if n else ""
 
-    # return optimised variables
-    final_c = params_struct.c[0]
-    final_beta = params_struct.beta[0]
-    final_omega = jnp.atleast_1d(params_struct.omega[0])
-    final_V_ia_0 = params_struct.V_ia_0[0]
+        print(f"\n{reason}\n{n} iterations in {progress.elapsed:.1f} s{per_iter}\nFinal design:")
+        self._header()
+        self._rows(progress)
+        print(flush=True)
 
-    return replace(params_base, 
-                c=final_c, 
-                beta=final_beta,   
-                omega=final_omega,
-                V_ia_0=final_V_ia_0,
-                error_log=error_log, 
-                time_log=time_log)
+    def _header(self):
+        names = f"{'Iter':>6}  {'Cost':>11}  {self.error_name:>9} | {'Cond':>4}  {'Omega':>8}  {'Thrust':>8}  {'Target':>8}  {'T-Err':>7}  {'Power':>8} | {'Time':>7}"
+        units = f"{'':>6}  {'':>11}  {'':>9} | {'':>4}  {'[rad/s]':>8}  {'[N]':>8}  {'[N]':>8}  {'[%]':>7}  {'[W]':>8} | {'[s]':>7}"
+        print(f"\n{names}\n{units}\n{'-' * len(names)}")
+
+    def _rows(self, p: Progress):
+        blank = " " * 30      # width of the Iter/Cost/error columns
+        err_pct = p.thrust_err_pct
+        for idx in range(len(p.omega)):
+            lead = f"{p.iteration:>6}  {p.cost:>11.4e}  {p.error:>9.2e}" if idx == 0 else blank
+            time_col = f"{p.elapsed:>7.1f}" if idx == 0 else ""
+            print(f"{lead} | {'C' + str(idx):>4}  {p.omega[idx]:>8.1f}  {p.thrust[idx]:>8.3f}  {p.thrust_target[idx]:>8.3f}  "
+                  f"{err_pct[idx]:>+7.2f}  {p.power[idx]:>8.1f} | {time_col}".rstrip())
+            if self.verbose >= 2:
+                terms = "  ".join(f"{name} {values[idx]:.2e}" for name, values in p.cost_terms.items())
+                print(f"{blank} |       cost terms: {terms}")
+        if self.verbose >= 2:
+            print(f"{blank} |       thickness penalty: {p.thickness_penalty:.2e}")
+        sys.stdout.flush()
+
+
+class BaseSolver(ABC):
+    name = "Solver"
+    error_name = "OptErr"       # label of the solver's stopping criterion (state.error)
+
+    def __init__(self, prop, callback=None, stop_event=None):
+        '''
+        callback(progress) receives a Progress at every report and when solve() ends.
+        stop_event, when set, ends solve() after the current iteration (defaults to the Ctrl+C event).
+        '''
+        self.prop = prop
+        self.inputs = prop.inputs
+        self.callback = callback
+        self.stop_event = _stop_event if stop_event is None else stop_event
+        self.space, self.params_struct, self.vars_scaled, self.bounds = self._prepare_problem()
+
+    def _prepare_problem(self):
+        """Universal setup: builds the design space, batched params_struct and optimization bounds."""
+        space = DesignSpace.build(self.prop)
+        vars_scaled = space.to_unit(self.prop)
+
+        # Start from the design space's view of the blade (blend zone applied to the seed)
+        params_struct = space.from_unit(vars_scaled, self.prop.batched())
+
+        lower_bounds = jax.tree_util.tree_map(jnp.zeros_like, vars_scaled)
+        upper_bounds = jax.tree_util.tree_map(jnp.ones_like, vars_scaled)
+        bounds = (lower_bounds, upper_bounds)
+
+        return space, params_struct, vars_scaled, bounds
+
+    @abstractmethod
+    def init_state(self):
+        """Initializes and returns the solver-specific state."""
+        pass
+
+    @abstractmethod
+    def step(self, vars_scaled, state, params_struct):
+        """Performs a single update step. Must return (new_vars, new_state, aux_data)."""
+        pass
+
+    def solve(self):
+        """The main optimization loop returning the optimised Propeller."""
+        if self.stop_event is _stop_event:
+            # The shared Ctrl+C event may still be set by a previous solve; a caller's own event is left alone
+            _stop_event.clear()
+
+        inputs = self.inputs
+        printer = ProgressPrinter(inputs.opt_verbose, self.error_name)
+        printer.banner(self.name, self.space, inputs.n_cond, inputs.opt_max_iter, inputs.opt_tol)
+        printer.note("Compiling the solver (the first iteration can take a while)...")
+
+        start_time = time.time()
+        state = self.init_state()
+        vars_scaled = self.vars_scaled
+        params_struct = self.params_struct
+
+        error_log = [float(getattr(state, 'error', 1.0))]
+        time_log = [0.0]
+        last_report = time.time()
+        status = "max_iter"
+
+        for i in range(inputs.opt_max_iter):
+            if self.stop_event.is_set():
+                status = "stopped"
+                break
+
+            iter_start = time.time()
+
+            # Step delegated to the specific solver
+            vars_scaled, state, V_i_0 = self.step(vars_scaled, state, params_struct)
+
+            # Update and rescale params
+            params_struct = self.space.from_unit(vars_scaled, params_struct)
+
+            # Keep the solved induced velocity as the warm start for the next step
+            V_i_0 = jnp.where(jnp.isfinite(V_i_0), V_i_0, params_struct.V_i_0)
+            params_struct = eqx.tree_at(lambda p: p.V_i_0, params_struct, V_i_0)
+
+            error_log.append(float(getattr(state, 'error', 1.0)))
+            time_log.append(time.time() - iter_start)
+
+            if error_log[-1] < inputs.opt_tol:
+                status = "converged"
+                break
+
+            iteration = i + 1
+            if iteration == 1 or iteration % inputs.opt_print_every == 0 or time.time() - last_report > 10.0:
+                progress = self._progress(iteration, state, params_struct, error_log, start_time, "running")
+                printer.report(progress)
+                self._notify(progress)
+                last_report = time.time()
+
+        final = self._progress(len(error_log) - 1, state, params_struct, error_log, start_time, status)
+        printer.summary(final)
+        self._notify(final)
+
+        # Geometry is shared by every condition; operating state is kept per condition
+        return self.prop.with_state(
+            c=params_struct.c[0],
+            beta=params_struct.beta[0],
+            cst=params_struct.cst[0, 1:],
+            omega=params_struct.omega,
+            tilt=params_struct.tilt,
+            V_i_0=params_struct.V_i_0,
+            error_log=jnp.array(error_log),
+            time_log=jnp.array(time_log),
+        )
+
+    def _progress(self, iteration, state, params_struct, error_log, start_time, status) -> Progress:
+        # Calculate the per-condition objectives of the current design
+        (thrust_terms, power_terms, confidence_terms), (powers, thrusts, _) = evaluate_all_conditions(params_struct)
+        as_np = lambda a: np.asarray(a, dtype=float)
+        return Progress(
+            iteration=iteration,
+            max_iter=self.inputs.opt_max_iter,
+            cost=float(getattr(state, 'value', np.nan)),
+            error=error_log[-1],
+            elapsed=time.time() - start_time,
+            status=status,
+            omega=as_np(params_struct.omega),
+            thrust=as_np(thrusts),
+            thrust_target=as_np(params_struct.thrust_target),
+            power=as_np(powers),
+            cost_terms=dict(thrust=as_np(thrust_terms), power=as_np(power_terms), confidence=as_np(confidence_terms)),
+            thickness_penalty=float(self.space.thickness_penalty(params_struct)),
+            error_log=np.asarray(error_log),
+            params_struct=params_struct,
+        )
+
+    def _notify(self, progress):
+        if self.callback is not None:
+            self.callback(progress)
+
+class LBFGSBSolver(BaseSolver):
+    name = "L-BFGS-B"
+    error_name = "ProjGrad"
+
+    def __init__(self, prop, callback=None, stop_event=None):
+        super().__init__(prop, callback, stop_event)
+        self.solver = jaxopt.LBFGSB(
+            fun=total_cost,
+            has_aux=True,
+            implicit_diff=True,
+            jit=True,
+            verbose=self.inputs.opt_verbose >= 2
+        )
+
+    def init_state(self):
+        return self.solver.init_state(
+            init_params=self.vars_scaled,
+            bounds=self.bounds,
+            params_struct=self.params_struct,
+            space=self.space,
+        )
+
+    def step(self, vars_scaled, state, params_struct):
+        vars_scaled, state = self.solver.update(
+            vars_scaled,
+            state=state,
+            bounds=self.bounds,
+            params_struct=params_struct,
+            space=self.space,
+        )
+        # JAXopt specific auxiliary extraction
+        V_i_0 = state.aux
+        return vars_scaled, state, V_i_0
+
+# Outer-loop solvers selectable through Inputs.opt_solver
+SOLVERS = {"L-BFGS-B": LBFGSBSolver}
+
+def run_optimization(prop, update_queue=None, callback=None, stop_event=None):
+    '''
+    Optimises the propeller's design variables for its Inputs; returns the optimised Propeller.
+
+    callback(progress) receives a Progress at every report and when the solve ends. update_queue (for the
+    matplotlib live plot) receives the Params of condition 0 at the same points. stop_event, when set,
+    ends the solve after the current iteration (defaults to the Ctrl+C event).
+    '''
+    solver_cls = SOLVERS.get(prop.inputs.opt_solver)
+    if solver_cls is None:
+        raise ValueError(f"Solver {prop.inputs.opt_solver} not implemented.")
+
+    if update_queue is not None:
+        user_callback = callback
+
+        def callback(progress):
+            update_queue.put(progress.condition(0))
+            if user_callback is not None:
+                user_callback(progress)
+
+    solver = solver_cls(prop, callback=callback, stop_event=stop_event)
+    return solver.solve()
 
 if __name__ == "__main__":
-    # Enable LaTeX formatting for pretty titles
-    plt.rcParams.update({
-        "text.usetex": True,
-        "font.family": "serif",
-        "axes.labelsize": 12,
-        "axes.titlesize": 14
-    })
+    ## Testing of optimiser functions
+    from init import Propeller
 
-    # Complete Optimisation Run
-    params_opt = run_optimization()
+    # generate basic propeller
+    prop = Propeller.default()
 
-    # Save/Export Solver State
+    weighted_cost, V_i_0 = condition_cost(prop.condition(0))
+    print(weighted_cost)
 
-    # Plotting
-    propinfoplot(params_opt)
+    solver = LBFGSBSolver(prop)
+    costs, V_i_0 = total_cost(solver.vars_scaled, solver.params_struct, solver.space)
+    print(costs)
+    print(V_i_0)

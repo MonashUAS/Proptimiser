@@ -9,3 +9,6 @@ equinox
 interpax
 neuralfoil
 aerosandbox
+
+PySide6
+pyvistaqt
