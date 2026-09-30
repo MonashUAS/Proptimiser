@@ -8,6 +8,7 @@ import warnings
 from datetime import datetime
 
 import jax
+import numpy as np
 from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QHBoxLayout, QLabel, QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QWidget,
@@ -22,14 +23,14 @@ from gui.workers import Task
 
 PROGRESS_COLUMNS = (
     ("Cond", "{}"), ("Omega [rad/s]", "{:.1f}"), ("Thrust [N]", "{:.3f}"), ("Target [N]", "{:.3f}"),
-    ("T err [%]", "{:+.2f}"), ("Motor power [W]", "{:.1f}"), ("Thrust term", "{:.2e}"), ("Power term", "{:.2e}"),
-    ("Confidence term", "{:.2e}"),
+    ("T err [%]", "{:+.2f}"), ("Motor power [W]", "{:.1f}"), ("P / P ideal", "{:.3f}"), ("Confidence", "{:.3f}"),
 )
 
 FINAL_STATUS = {
     "converged": "Converged",
     "stopped": "Stopped by user",
     "max_iter": "Reached the iteration limit",
+    "failed": "Solver stopped early",
 }
 
 JAX_TRACE_DIR = "/tmp/jax_trace"
@@ -218,17 +219,19 @@ class OptimiseTab(QWidget):
         self.latest = update
         self.progress_bar.setValue(progress.iteration)
 
+        summary = (f"objective {progress.objective:.5f} x ideal power, "
+                   + ("feasible" if progress.violation <= 0 else f"constraint violation {100 * progress.violation:.2f}%"))
         if progress.status != "running":
-            self.status.setText(f"{FINAL_STATUS[progress.status]} after {progress.iteration} iterations "
-                                f"({progress.elapsed:.1f} s), cost {progress.cost:.4e}")
+            detail = f": {progress.message}" if progress.message else ""
+            self.status.setText(f"{FINAL_STATUS[progress.status]}{detail} after {progress.iteration} iterations "
+                                f"({progress.elapsed:.1f} s), {summary}")
         elif not self.stop_event.is_set():
-            self.status.setText(f"Running: iteration {progress.iteration}, cost {progress.cost:.4e}, "
-                                f"stopping criterion {progress.error:.2e}")
+            self.status.setText(f"Running: iteration {progress.iteration}, {summary}, change {progress.error:.1e}")
 
-        terms = progress.cost_terms
         fill_table(self.table, [
             (f"C{i}", progress.omega[i], progress.thrust[i], progress.thrust_target[i], progress.thrust_err_pct[i],
-             progress.power[i], terms["thrust"][i], terms["power"][i], terms["confidence"][i])
+             progress.power[i], progress.power_ratio[i],
+             progress.confidence[i] if np.isfinite(progress.confidence[i]) else "-")
             for i in range(len(progress.omega))
         ], formats=[fmt for _, fmt in PROGRESS_COLUMNS])
         fit_table_height(self.table)

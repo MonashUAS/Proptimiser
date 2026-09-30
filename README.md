@@ -20,7 +20,8 @@ By leveraging [JAX](https://github.com/google/jax) for automatic differentiation
   * Uses the Kulfan Class Shape Transformation (CST) [13] via **AeroSandbox** [5] to create a fully continuous loft of the blade from the structural hub to the aerodynamic tip.
   * Directly exports production-ready `.ibl` surface meshes and mold-split parting lines directly to **Creo Parametric**.
 * **JAX-Accelerated Optimisation:**
-  * Multi-condition optimisation of thrust targets and motor power using `JAXopt` [8]
+  * Multi-condition optimisation of motor power subject to thrust, motor power, section thickness and NeuralFoil confidence constraints, using SLSQP (SciPy) or penalised L-BFGS-B (`JAXopt` [8])
+  * The induced velocity is solved with blockwise Newton and differentiated exactly by implicit differentiation, so gradients are accurate to machine precision
   * Optimises blade twist ($\beta$), chord ($c$), spanwise CST airfoil sections and operational RPM ($\omega$) simultaneously, with radial ranges of the blade optionally frozen for design purposes.
 
 ---
@@ -92,12 +93,43 @@ blade = BladeSpec(
 prop = Propeller.default(inputs=inputs, blade=blade)     # or Propeller.from_apc("apc_prop_data/propgeom_data/20x8-PERF.PE0")
 ```
 
+#### Optimisation problem
+
+Every quantity the optimiser sees is non-dimensionalised by a physical reference from the specification, so no weights are needed to balance them:
+
+| | Definition | Meaning |
+|---|---|---|
+| Objective | $J = \sum_i w_i P_i \,/\, \sum_i w_i P_{ideal,i}$ | Motor power relative to the ideal (actuator disc) power of the thrust targets. The denominator depends only on the flight conditions, so $J$ is the mission energy (`objective_weight` = time fractions) made dimensionless, roughly 1/efficiency. |
+| Thrust | $\lvert T_i/T_i^* - 1 \rvert \le$ `thrust_tol` | Each condition within its thrust band. |
+| Motor power | $P_i \le$ `P_max` | Motor limit. |
+| Thickness | $t/c \ge$ `min_tc` | At every optimised CST section (buildability). |
+| Confidence | NeuralFoil confidence $\ge$ `min_confidence` | One per condition: the mean over the aerodynamic zone, with each blade element weighted by its force scale $V_R^2 c\,dr\,d\psi$. Errors in the section coefficients reach thrust and power in that proportion. Held as $\log(\text{confidence}/\text{min\_confidence}) \ge 0$, which keeps a gradient where NeuralFoil's sigmoid saturates at zero. `0` disables. |
+
+Every constraint is written as a margin relative to its own limit (`-0.01` = limit exceeded by 1% of itself).
+
+* **`SLSQP`** (default) treats the constraints exactly.
+  * *Phase 1:* if the seed violates a constraint, it first restores feasibility by minimising the sum of squared relative violations.
+  * *Phase 2:* SLSQP runs in design variables scaled by the exact curvature of the objective at that point (Jacobi scaling, computed once from the Hessian diagonal), so its initial Hessian estimate has the right size in every direction. SciPy's SLSQP stops when a linearisation of the constraints is incompatible. In that case the solver restarts from the best feasible design with a fresh Hessian, as long as the previous attempt improved that design.
+* **`L-BFGS-B`** handles only bounds, so the constraints become quadratic penalties weighted by `w_thrust`, `w_thickness` and `w_confidence`. These weights are used by L-BFGS-B only.
+
+Both solvers stop when the objective changes by less than `opt_tol` (relative) in an iteration, or after `opt_max_iter` iterations.
+
+The induced velocity is solved by damped Newton on each annulus. The BEMT residual Jacobian is block diagonal, since every annulus only sees its own induced velocity, so each Newton iteration costs one forward-mode pass per solved component. It converges to `V_i_0_eps` (non-dimensional residual, default `1e-8`) in a handful of iterations, and `jax.lax.custom_root` makes the gradients of the converged solution exact. An annulus that is already converged takes no step. An annulus where backtracking finds no decrease (a minimum of the residual norm that is not a root, e.g. reversed flow near the hub in forward flight) restarts from the momentum-theory guess.
+
 Solver output is controlled per solver in `Inputs`:
 
-* `opt_verbose` (outer optimiser): `0` prints the start banner and final summary only, `1` (default) adds an iteration table every `opt_print_every` iterations, `2` also prints each condition's cost terms and JAXopt's internal L-BFGS-B line.
-* `V_i_0_verbose` (induced velocity Broyden solve): `0` (default) is silent, `1` prints one line per solve (thrust target, Broyden iterations, final residual), `2` also prints every Broyden iteration and the sectional thrust.
+* `opt_verbose` (outer optimiser):
+  * `0` prints the start banner and final summary only.
+  * `1` (default) adds an iteration table every `opt_print_every` iterations.
+  * `2` also prints the constraint margins, the load-weighted and lowest-station NeuralFoil confidence, and JAXopt's internal L-BFGS-B line.
+* `V_i_0_verbose` (induced velocity Newton solve):
+  * `0` (default) is silent.
+  * `1` prints one line per solve (thrust target, Newton iterations, final residual).
+  * `2` also prints every Newton iteration and the sectional thrust.
 
-Chord and twist in the blend zone are always derived from the hub values (`hub_chord`, `hub_twist_deg`) and the first aerodynamic station, so the analysed blade matches the exported CAD. With NeuralFoil (`coeff_method = 3`) the CST sections are also design variables, kept buildable by a minimum thickness penalty (`BladeSpec.min_tc`) and inside NeuralFoil's trusted region by a confidence penalty.
+Propeller files written before format 3 load with the Broyden-era `V_i_0_eps`, `V_i_0_max_iter` and `opt_tol` replaced by the new defaults (a warning says so).
+
+Chord and twist in the blend zone are always derived from the hub values (`hub_chord`, `hub_twist_deg`) and the first aerodynamic station, so the analysed blade matches the exported CAD. With NeuralFoil (`coeff_method = 3`) the CST sections are also design variables, kept buildable by a minimum thickness constraint (`BladeSpec.min_tc`) and inside NeuralFoil's trusted region by the confidence constraint.
 
 ### 2. Graphical Interface
 
@@ -128,7 +160,7 @@ python init.py
 ```
 
 * **Live plots:** A Matplotlib window updates the convergence plots, induced velocity fields, airfoil sections and blade shape at every reported solver step.
-* **Terminal Output:** An aligned table reports the cost, the stopping criterion and, for each flight condition, omega, thrust against target and motor power, followed by a final summary. Press Ctrl+C once to stop after the current iteration.
+* **Terminal Output:** An aligned table reports the objective (power relative to ideal), the largest constraint violation, the relative change and, for each flight condition, omega, thrust against target, motor power and P/P_ideal, followed by a final summary. Press Ctrl+C once to stop after the current iteration.
 * **Exporting:** Upon convergence (or hitting the maximum iteration limit), the CLI will prompt: `Save Propeller? (y/n)`. Selecting `y` saves the propeller, its `Inputs` and `BladeSpec` to `propellers/<name>.json`.
 
 Saved propellers are reloaded with `Propeller.load("<name>")`. Files are plain JSON with named fields, so they can be read and diffed, and new fields never break old files. `prop.with_inputs(...)` and `prop.with_blade(...)` re-use a saved design with new flight conditions, discretisation or blade zones. Propellers saved in the old `.eqx` format are converted once with `Propeller.from_legacy_eqx("<name>").save("<name>")`.

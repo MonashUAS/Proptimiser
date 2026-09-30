@@ -2,9 +2,7 @@
 Proptimiser graphical interface.
 
     python app.py                   # start from the default propeller
-    python app.py Currawong_V1      # open propellers/Currawong_V1.json (or any path to a propeller file)
 
-The command-line workflow (python init.py / python results.py) still works without the GUI.
 '''
 import os
 import signal

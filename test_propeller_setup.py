@@ -3,7 +3,8 @@ test_propeller_setup.py
 
 Checks for the run-setup refactor: JSON propeller files, Inputs reaching the physics,
 spanwise CST sections, the NeuralFoil port, the optimiser design space (radial mask + blend zone),
-live plotting of the seed state, verbosity settings and optimiser progress reporting.
+live plotting of the seed state, verbosity settings, optimiser progress reporting, the Newton BEMT
+solve and the normalised constrained problem.
 
     python test_propeller_setup.py
 
@@ -138,12 +139,12 @@ def test_neuralfoil_port_matches_reference():
                                leading_edge_weight=kulfan[16], TE_thickness=kulfan[17]),
         alpha=alpha_deg, Re=Re, model_size="large",
     )
-    CL, CD, CM, confidence = airfoil.load_airfoil_data(3).raw(jnp.radians(alpha_deg), jnp.full(4, Re), jnp.asarray(kulfan))
+    CL, CD, CM, log_confidence = airfoil.load_airfoil_data(3).raw(jnp.radians(alpha_deg), jnp.full(4, Re), jnp.asarray(kulfan))
 
     assert np.allclose(CL, ref["CL"], rtol=1e-8)
     assert np.allclose(CD, ref["CD"], rtol=1e-8)
     assert np.allclose(CM, ref["CM"], rtol=1e-8, atol=1e-12)
-    assert np.allclose(confidence, ref["analysis_confidence"], rtol=1e-8)
+    assert np.allclose(np.exp(log_confidence), ref["analysis_confidence"], rtol=1e-8)
 
 
 # ---------------------------------------------------------------------------
@@ -239,23 +240,153 @@ def test_legacy_verbose_key_maps_to_bemt_verbosity():
     assert not any("verbose" in str(w.message) for w in caught)
 
 
-def test_solver_reports_progress_and_stops():
+def test_solvers_report_progress_and_stop():
+    import dataclasses
     import threading
 
-    prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6, opt_max_iter=2, opt_print_every=1, opt_verbose=0))
-    reports = []
-    result = proptimiser.run_optimization(prop, callback=reports.append, stop_event=threading.Event())
-    assert reports and all(isinstance(p, proptimiser.Progress) for p in reports)
-    assert reports[-1].status == "max_iter" and reports[-1].iteration == 2
-    assert len(result.error_log) == 3 and len(result.time_log) == 3
-    assert reports[-1].condition(1).omega == prop.omega[1]
+    base = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6, opt_max_iter=2, opt_print_every=1, opt_verbose=0))
+    for solver in proptimiser.SOLVERS:
+        prop = base.with_inputs(dataclasses.replace(base.inputs, opt_solver=solver))
+        reports = []
+        result = proptimiser.run_optimization(prop, callback=reports.append, stop_event=threading.Event())
+        assert reports and all(isinstance(p, proptimiser.Progress) for p in reports), solver
+        assert reports[-1].status in ("max_iter", "converged") and reports[-1].iteration <= 2, (solver, reports[-1].status)
+        assert len(result.error_log) == reports[-1].iteration + 1 == len(result.time_log), solver
+        assert reports[-1].condition(1).omega == prop.omega[1]
+        assert np.isfinite(reports[-1].objective) and reports[-1].objective > 0
 
-    stop = threading.Event()
-    stop.set()
-    reports = []
-    result = proptimiser.run_optimization(prop, callback=reports.append, stop_event=stop)
-    assert reports[-1].status == "stopped" and reports[-1].iteration == 0
-    assert result.c.shape == prop.c.shape
+        stop = threading.Event()
+        stop.set()
+        reports = []
+        result = proptimiser.run_optimization(prop, callback=reports.append, stop_event=stop)
+        assert reports[-1].status == "stopped" and reports[-1].iteration == 0, solver
+        assert result.c.shape == prop.c.shape
+
+
+# ---------------------------------------------------------------------------
+# Newton BEMT solve and the normalised problem
+# ---------------------------------------------------------------------------
+
+def test_bemt_jacobian_is_block_diagonal():
+    import propmodel
+
+    params = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6)).condition(0)
+    lam = params.V_i_0[params.cfg.solve_rows] / propmodel.get_velocity_scales(params)
+    J = np.asarray(jax.jacfwd(propmodel.bemt_residuals)(lam, params))           # (k, n_r, k, n_r)
+    off_station = ~np.eye(J.shape[1], dtype=bool)[None, :, None, :].repeat(J.shape[0], 0).repeat(J.shape[2], 2)
+    assert np.abs(J[off_station]).max() == 0.0
+
+
+def test_newton_bemt_converges_and_matches_a_tighter_solve():
+    import dataclasses
+    import propmodel
+
+    prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=8))
+    params = prop.condition(0)
+    V_i, V_i_0 = propmodel.induced_velocity(params)
+    lam = V_i_0[params.cfg.solve_rows] / propmodel.get_velocity_scales(params)
+    assert np.abs(np.asarray(propmodel.bemt_residuals(lam, params))).max() <= params.cfg.V_i_0_eps
+
+    tight = prop.with_inputs(dataclasses.replace(prop.inputs, V_i_0_eps=1e-12)).condition(0)
+    V_i_tight, _ = propmodel.induced_velocity(tight)
+    assert np.isclose(float(propmodel.thrust(V_i, params)), float(propmodel.thrust(V_i_tight, tight)), rtol=1e-7)
+
+
+def test_zero_radius_station_is_handled():
+    # A blade whose BEMT grid starts at r = 0 (a zero-area annulus with no momentum equation)
+    import propmodel
+
+    prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=8), blade=BladeSpec(r_foils=(0.0, 0.0, 0.05, 0.15, 0.275)))
+    assert float(prop.r[0]) == 0.0
+    V_i, V_i_0 = propmodel.induced_velocity(prop.condition(0))
+    assert bool(jnp.all(jnp.isfinite(V_i_0)))
+    assert np.isfinite(float(propmodel.thrust(V_i, prop.condition(0))))
+
+
+def test_newton_bemt_escapes_a_stale_warm_start():
+    # Currawong_V1's saved induced velocity puts the first station near the hub on a reversed-flow state in
+    # forward flight, where Newton stalls at a minimum of the residual norm that is not a root
+    import propmodel
+
+    prop = Propeller.load("Currawong_V1")
+    p = prop.condition(0)
+    _, V_i_0 = propmodel.induced_velocity(p)
+    lam = V_i_0[p.cfg.solve_rows] / propmodel.get_velocity_scales(p)
+    residual = np.abs(np.asarray(propmodel.bemt_residuals(lam, p)))[:, np.asarray(p.r) > 0]
+    assert residual.max() <= p.cfg.V_i_0_eps
+
+
+def test_cost_gradient_matches_finite_differences():
+    solver = proptimiser.LBFGSBSolver(Propeller.default(inputs=Inputs(coeff_method=0, n_r=6)))
+    x, ps, space = solver.vars_scaled, solver.params_struct, solver.space
+    f = lambda v: proptimiser.total_cost(v, ps, space)[0]
+    g = jax.grad(f)(x)
+    rng = np.random.default_rng(1)
+    d = {k: jnp.asarray(rng.standard_normal(v.shape)) for k, v in x.items()}
+    h = 1e-6
+    fd = (float(f({k: x[k] + h * d[k] for k in x})) - float(f({k: x[k] - h * d[k] for k in x}))) / (2 * h)
+    ad = sum(float(jnp.sum(g[k] * d[k])) for k in x)
+    assert abs(ad - fd) <= 1e-5 * abs(fd), (ad, fd)
+
+
+def test_constraints_match_their_groups():
+    for inputs in (Inputs(coeff_method=0, n_r=6), Inputs(coeff_method=3, n_r=6)):
+        prop = Propeller.default(inputs=inputs)
+        space = proptimiser.DesignSpace.build(prop)
+        J, g, _ = proptimiser.problem_values(space.to_unit(prop), prop.batched(), space)
+        assert g.shape == (sum(n for _, n in space.constraint_groups(inputs.n_cond)),)
+        assert np.isfinite(float(J)) and float(J) > 0
+
+
+def test_confidence_constraint_is_load_weighted_and_keeps_its_gradient():
+    import propmodel
+
+    x = jnp.array([0.0, 0.1, 0.35, 0.4, 1.0])
+    assert np.isclose(jnp.sum(proptimiser._trapezoid_weights(x) * jnp.sin(3 * x)), jnp.trapezoid(jnp.sin(3 * x), x=x))
+
+    # One constraint per condition: the confidence averaged over the aerodynamic zone, weighted by V_R^2 c dr dpsi
+    prop = Propeller.default(inputs=Inputs(coeff_method=3, n_r=6))
+    space = proptimiser.DesignSpace.build(prop)
+    ps = prop.batched()
+    g = np.asarray(proptimiser.constraint_values(proptimiser.evaluate_all_conditions(ps), ps, space))
+    p = prop.condition(0)
+    V_i, _ = propmodel.induced_velocity(p)
+    V_R, _ = airfoil.resultantVelocityComponents(V_i, p)
+    confidence = np.exp(np.asarray(airfoil.aero_coeffs(V_i, p, return_log_confidence=True)[3]))
+    w = (np.asarray(V_R) ** 2 * np.asarray(p.c * proptimiser._trapezoid_weights(p.r))[:, None]
+         * np.asarray(proptimiser._trapezoid_weights(p.psi))[None, :])[np.array(space.aero_stations)]
+    expected = np.sum(w * confidence[np.array(space.aero_stations)]) / np.sum(w)
+    assert np.isclose(np.exp(g[-prop.inputs.n_cond]) * prop.inputs.min_confidence, expected, rtol=1e-6)
+
+    # Far outside NeuralFoil's training data the confidence saturates at zero; its log still has a gradient
+    raw = airfoil.load_airfoil_data(3).raw
+    kulfan = jnp.asarray(geometry.kulfan_from_name("arad10"))
+    alpha = jnp.radians(-80.0)
+    d_log = jax.grad(lambda a: raw(a, 5e5, kulfan)[3])(alpha)
+    d_conf = jax.grad(lambda a: jnp.exp(raw(a, 5e5, kulfan)[3]))(alpha)
+    assert np.isfinite(d_log) and abs(d_log) > 1.0 and abs(d_conf) < 1e-6
+
+
+def test_curvature_scale_is_positive_and_normalised():
+    prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6))
+    space = proptimiser.DesignSpace.build(prop)
+    x = space.to_unit(prop)
+    s = proptimiser.curvature_scale(x, space.from_unit(x, prop.batched()), space)
+    assert np.all(np.isfinite(s)) and np.all(s > 0)
+    assert np.isclose(np.exp(np.mean(np.log(s))), 1.0)
+
+
+def test_format_2_files_take_the_newton_defaults():
+    data = Propeller.default().to_dict()
+    data["format_version"] = 2
+    data["inputs"].update(V_i_0_eps=0.05, V_i_0_max_iter=1000, opt_tol=1e-4)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        prop = Propeller.from_dict(data)
+    defaults = Inputs()
+    assert (prop.inputs.V_i_0_eps, prop.inputs.V_i_0_max_iter, prop.inputs.opt_tol) == (
+        defaults.V_i_0_eps, defaults.V_i_0_max_iter, defaults.opt_tol)
+    assert any("Format 2" in str(w.message) for w in caught)
 
 
 TESTS = [value for name, value in list(globals().items()) if name.startswith("test_")]

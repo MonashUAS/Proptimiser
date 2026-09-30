@@ -4,7 +4,7 @@
 import jax
 import jax.numpy as jnp
 import equinox as eqx
-import jaxopt
+import numpy as np
 
 import matplotlib.pyplot as plt
 
@@ -342,7 +342,7 @@ def bemt_residuals(lambda_i_0_guess, params):
 def get_velocity_scales(params):
     """
     Computes characteristic velocity scales for the 3 inflow components
-    to act as a diagonal preconditioner for the Broyden solver.
+    that non-dimensionalise the unknowns of the induced velocity solve.
     Returns: V_scale -> shape (3, 1) for broadcasting against (3, n_r) arrays.
     """
     R_tip = params.cfg.R_tip
@@ -365,44 +365,105 @@ def get_velocity_scales(params):
     V_scale = V_scale[params.cfg.solve_rows]  # Only keep the components that are being solved for
     return V_scale
 
+def _station_blocks(linear_fn, shape):
+    '''
+    The (n_r, k, k) diagonal blocks of a linear map on (k, n_r) arrays whose stations are independent:
+    one JVP per solved component gives that column of every station's block at once.
+    '''
+    k = shape[0]
+    columns = [linear_fn(jnp.zeros(shape).at[c].set(1.0)) for c in range(k)]
+    return jnp.transpose(jnp.stack(columns, axis=-1), (1, 0, 2))
+
+def _station_solve(blocks, rhs, active):
+    '''
+    Solves every station's block system (rhs of shape (k, n_r)). The pseudo-inverse gives the minimum-norm solution
+    when a block is rank deficient (e.g. a component whose residual is not modelled); inactive stations get zero.
+    '''
+    x = jnp.einsum("nij,jn->in", jnp.linalg.pinv(blocks), rhs)
+    return jnp.where(active[None, :], x, 0.0)
+
+def _newton_bemt(residual_fn, lam, active, tol, max_iter, verbose, params):
+    '''
+    Damped blockwise Newton on residual_fn(lam) = 0. Each station backtracks (halving its step) until its own
+    residual norm decreases, so a hard station never slows the others. A station already within tol takes no
+    step: at round-off level its residual cannot decrease, and backtracking would run to machine epsilon.
+    Converged when the largest scaled residual over the active stations is below tol.
+    '''
+    def max_residual(l):
+        # Non-finite residuals count as unconverged (a NaN would otherwise end the loop as if converged)
+        res = jnp.abs(residual_fn(l))
+        return jnp.max(jnp.where(active[None, :], jnp.where(jnp.isfinite(res), res, jnp.inf), 0.0))
+
+    def newton_step(state):
+        l, it, _ = state
+        r, linear_fn = jax.linearize(residual_fn, l)
+        step = _station_solve(_station_blocks(linear_fn, l.shape), -r, active)
+
+        # A station whose Newton step is undefined (non-finite residual or derivative, e.g. far outside the airfoil
+        # model's range) restarts from the momentum-theory guess, lambda = 1, rather than spreading NaN
+        restart = active & ~jnp.all(jnp.isfinite(step), axis=0)
+        step = jnp.where(restart[None, :], 0.0, step)
+        r = jnp.where(restart[None, :], 0.0, r)
+        done = jnp.all(jnp.abs(r) <= tol, axis=0)
+        step = jnp.where(done[None, :], 0.0, step)
+        r0 = jnp.sum(r**2, axis=0)
+
+        # Backtracking stops at the precision of the residual: halving past machine epsilon cannot change l
+        max_halvings = int(-np.log2(np.finfo(l.dtype).eps))
+        def backtrack_cond(carry):
+            _, accepted, n = carry
+            return (~jnp.all(accepted)) & (n < max_halvings)
+        def backtrack(carry):
+            alpha, accepted, n = carry
+            decreased = jnp.sum(residual_fn(l + alpha * step)**2, axis=0) < r0
+            accepted = accepted | decreased
+            return jnp.where(accepted, alpha, 0.5 * alpha), accepted, n + 1
+        alpha, accepted, _ = jax.lax.while_loop(backtrack_cond, backtrack, (jnp.ones(l.shape[1]), done | ~active, 0))
+
+        # No decrease down to machine epsilon: the station sits at a stationary point of its residual norm that is
+        # not a root (e.g. a reversed-flow state near the hub in forward flight); it restarts from the
+        # momentum-theory guess too
+        restart = restart | ~accepted
+        l = jnp.where(restart[None, :], 1.0, l + alpha * step)
+        err = max_residual(l)
+        if verbose >= 2:
+            jax.debug.print("    [BEMT] Newton iter {i:3d} | residual {e:.2e} | smallest step fraction {a:.2e}",
+                            i=it + 1, e=err, a=jnp.min(jnp.where(active & ~done, alpha, 1.0)))
+        return l, it + 1, err
+
+    def not_converged(state):
+        _, it, err = state
+        return (it < max_iter) & (err > tol)
+
+    l, it, err = jax.lax.while_loop(not_converged, newton_step, (lam, 0, max_residual(lam)))
+    if verbose >= 1:
+        jax.debug.print("  [BEMT] T_target {t:7.2f} N | omega {w:7.1f} rad/s | Newton iters {n:3d} | residual {e:.2e}",
+                        t=params.thrust_target, w=params.omega, n=it, e=err)
+    return l
+
 @jax.jit
 def induced_velocity(params):
     '''
     Calculates the coupled 3D induced velocity field using BEMT.
+
+    Solves the non-dimensional residuals (bemt_residuals) for the solved components with blockwise Newton, from
+    params.V_i_0 as the initial guess. jax.lax.custom_root makes derivatives of the solution exact by implicit
+    differentiation, so gradients do not depend on the iteration history. A station at r = 0 is a zero-area
+    annulus with no momentum equation to satisfy, so its induced velocity is left at the initial guess
+    (it carries no thrust or torque).
     '''
-    V_i_0_guess_physical = params.V_i_0
-
-    # Apply Induced Velocity Solver Type (remove non-solve components)
-    V_i_0_guess_physical = V_i_0_guess_physical[params.cfg.solve_rows]
-
-    # Non-Dimensionalise Initial Guess Component-Wise
+    cfg = params.cfg
     V_scale = get_velocity_scales(params)
-    initial_guess_lambda = V_i_0_guess_physical / V_scale
+    lam_0 = params.V_i_0[cfg.solve_rows] / V_scale
+    active = params.r > 0.0
 
-    # Broyden Solver Call
-    solver = jaxopt.Broyden(
-        fun=bemt_residuals, 
-        maxiter=params.cfg.V_i_0_max_iter, 
-        tol=params.cfg.V_i_0_eps,
-        implicit_diff=True,
-        implicit_diff_solve=jaxopt.linear_solve.solve_lu,
-        jit = True,
-        verbose = params.cfg.V_i_0_verbose >= 2
-    )
+    residual_fn = lambda lam: bemt_residuals(lam, params)
+    solve = lambda f, guess: _newton_bemt(f, guess, active, cfg.V_i_0_eps, cfg.V_i_0_max_iter, cfg.V_i_0_verbose, params)
+    tangent_solve = lambda linear_fn, rhs: _station_solve(_station_blocks(linear_fn, rhs.shape), rhs, active)
+    lam = jax.lax.custom_root(residual_fn, lam_0, solve, tangent_solve)
 
-    (lambda_i_0, info) = solver.run(initial_guess_lambda, params)
-
-    # Re-dimensionalise the converged solution
-    V_i_0 = lambda_i_0 * V_scale
-
-    # re-add non solver components to the solution vector
-    V_i_0 = jnp.zeros_like(params.V_i_0).at[params.cfg.solve_rows].set(V_i_0)
-
-    if params.cfg.V_i_0_verbose >= 1:
-        jax.debug.print(
-            "  [BEMT] T_target {t:7.2f} N | omega {w:7.1f} rad/s | Broyden iters {n:4d} | residual {e:.2e}",
-            t=params.thrust_target, w=params.omega, n=info.iter_num, e=info.error,
-        )
+    # Re-dimensionalise, with zeros for the components that are not solved
+    V_i_0 = jnp.zeros_like(params.V_i_0).at[cfg.solve_rows].set(lam * V_scale)
 
     # Expand to 3D inflow grid
     V_i = inflow_model(V_i_0, params)

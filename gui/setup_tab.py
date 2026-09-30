@@ -29,11 +29,13 @@ INPUT_GROUPS = [
     ("Optimiser", [
         Field("opt_solver", "Solver", "text_choice", choices=tuple(proptimiser.SOLVERS)),
         Field("opt_max_iter", "Max iterations", "int", minimum=1),
-        Field("opt_tol", "Tolerance", "float"),
+        Field("opt_tol", "Relative tolerance", "float",
+              tooltip="Converged when the objective changes by less than this fraction in one iteration"),
     ]),
     ("Induced velocity (BEMT)", [
-        Field("V_i_0_max_iter", "Max Broyden iterations", "int", minimum=1),
-        Field("V_i_0_eps", "Tolerance", "float"),
+        Field("V_i_0_max_iter", "Max Newton iterations", "int", minimum=1),
+        Field("V_i_0_eps", "Residual tolerance", "float",
+              tooltip="Largest non-dimensional BEMT residual accepted (thrust / target, torque / (target x R_tip))"),
         Field("bemt_type", "Solved components", "flags", choices=("Axial", "Tangential", "Radial")),
         Field("n_r", "Radial stations", "int", minimum=3, maximum=500),
         Field("n_psi", "Azimuthal stations", "int", minimum=1, maximum=360),
@@ -50,21 +52,25 @@ INPUT_GROUPS = [
         Field("I_0", "No-load current [A]", "float"),
         Field("R_m", "Winding resistance [ohm]", "float"),
         Field("kV", "kV [RPM/V]", "float"),
-        Field("P_max", "Max power [W]", "float"),
     ]),
-    ("Cost penalties", [
-        Field("w_thrust", "Thrust weight", "float", tooltip="Weight of the thrust constraint penalty"),
-        Field("thrust_tol", "Thrust tolerance", "float", tooltip="Relative thrust error allowed before the penalty applies"),
+    ("Constraints", [
+        Field("thrust_tol", "Thrust tolerance", "float", tooltip="Relative thrust error allowed about each target"),
+        Field("P_max", "Max motor power [W]", "float"),
+        Field("min_confidence", "Min NeuralFoil confidence", "float",
+              tooltip="Lowest NeuralFoil confidence, averaged over the aerodynamic zone with each element weighted by "
+                      "its force scale V_R^2 c dr (0 disables)"),
+    ]),
+    ("Penalty weights (L-BFGS-B only)", [
+        Field("w_thrust", "Thrust weight", "float", tooltip="Weight of the thrust and motor power penalties"),
         Field("w_thickness", "Thickness weight", "float", tooltip="Weight of the minimum t/c penalty"),
         Field("w_confidence", "Confidence weight", "float", tooltip="Weight of the NeuralFoil low-confidence penalty"),
-        Field("min_confidence", "Min confidence", "float"),
     ]),
     ("Diagnostics", [
         Field("opt_verbose", "Optimiser verbosity", "int", maximum=2,
-              tooltip="0: start/end summary only, 1: iteration table, 2: + cost terms and jaxopt line-search info"),
+              tooltip="0: start/end summary only, 1: iteration table, 2: + constraint margins and solver detail"),
         Field("opt_print_every", "Report every (iterations)", "int", minimum=1),
         Field("V_i_0_verbose", "BEMT verbosity", "int", maximum=2,
-              tooltip="0: silent, 1: one line per induced velocity solve, 2: + every Broyden iteration"),
+              tooltip="0: silent, 1: one line per induced velocity solve, 2: + every Newton iteration"),
         Field("jax_tracing", "JAX profiler trace", "bool"),
     ]),
 ]

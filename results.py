@@ -286,10 +286,10 @@ class LivePropPlotter:
 
         # Subplot 2: Convergence
         self.ax2 = self.fig.add_subplot(2, 3, 2)
-        self.line_err, = self.ax2.plot([], [], 'orange', marker='o', label='State Error')
+        self.line_err, = self.ax2.plot([], [], 'orange', marker='o', label="Relative change")
         self.ax2.set_title("Solver Convergence History")
         self.ax2.set_xlabel("Iteration")
-        self.ax2.set_ylabel("Residual Error")
+        self.ax2.set_ylabel("Relative objective change")
         self.ax2.set_yscale('log')
         self.ax2.grid(True, which="both", alpha=0.3)
 

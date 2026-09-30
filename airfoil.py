@@ -179,7 +179,7 @@ class ParametricInterpolator:
         self.alpha_stall = jnp.radians(alpha_stall)
         self.k_smooth = k_smooth
 
-    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_confidence=False):
+    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_log_confidence=False):
         # Apply the zero-lift offset internally
         alpha_eff = alpha - self.AoA_0
         Cd90 = 1.98
@@ -207,7 +207,7 @@ class ParametricInterpolator:
         Cn_final = (1 - transition) * Cn_lin + transition * Cn_stall
         Cm = -Cn_final * (0.25 - 0.175 * (1 - 2 * jnp.abs(alpha_eff) / jnp.pi))
 
-        return _with_confidence((Cl, Cd, Cm), return_confidence)
+        return _with_confidence((Cl, Cd, Cm), return_log_confidence)
 
 class AlphaReInterpolator:
     def __init__(self, airfoilname):
@@ -276,7 +276,7 @@ class AlphaReInterpolator:
         self.cd_grid = jnp.nan_to_num(interp_vmap(self.re_grid_log, log_re_array, cd_array))
         self.cm_grid = jnp.nan_to_num(interp_vmap(self.re_grid_log, log_re_array, cm_array))
 
-    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_confidence=False):
+    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_log_confidence=False):
         input_shape = jnp.shape(alpha)
         alpha_flat, re_flat, mach_flat = jnp.ravel(alpha), jnp.ravel(re), jnp.ravel(mach)
 
@@ -289,7 +289,7 @@ class AlphaReInterpolator:
         
         cl_comp, cd_comp, cm_comp = apply_mach_corrections(Cl, Cd, Cm, mach_flat)
         coeffs = jnp.reshape(cl_comp, input_shape), jnp.reshape(cd_comp, input_shape), jnp.reshape(cm_comp, input_shape)
-        return _with_confidence(coeffs, return_confidence)
+        return _with_confidence(coeffs, return_log_confidence)
 
 class AlphaMachReInterpolator:
     def __init__(self, airfoilname):
@@ -366,7 +366,7 @@ class AlphaMachReInterpolator:
         self.cd_grid = jnp.nan_to_num(gaussian_filter(cd_grid, sigma=(1.5, 0.8, 1.0)))
         self.cm_grid = jnp.nan_to_num(gaussian_filter(cm_grid, sigma=(1.5, 0.8, 1.0)))
 
-    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_confidence=False):
+    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_log_confidence=False):
         input_shape = jnp.shape(alpha)
         alpha_flat, mach_flat, re_flat = jnp.ravel(alpha), jnp.ravel(mach), jnp.ravel(re)
 
@@ -384,7 +384,7 @@ class AlphaMachReInterpolator:
                                self.alpha_grid, self.mach_grid, self.re_grid_log,
                                self.cm_grid, method='cubic')
         coeffs = Cl.reshape(input_shape), Cd.reshape(input_shape), Cm.reshape(input_shape)
-        return _with_confidence(coeffs, return_confidence)
+        return _with_confidence(coeffs, return_log_confidence)
 
 class NeuralFoilInterpolator:
     '''
@@ -412,7 +412,9 @@ class NeuralFoilInterpolator:
         Network outputs before flat-plate blending and Mach correction.
         kulfan (..., N_CST) broadcasts against alpha along a trailing axis.
 
-        Returns CL, CD, CM and the analysis confidence (0-1), each shaped like alpha.
+        Returns CL, CD, CM and the log of the analysis confidence (confidence 0-1), each shaped like alpha.
+        The log is taken from the logit (log_sigmoid), so it keeps a useful gradient where the confidence itself
+        saturates to zero far outside the training data.
         '''
         alpha, re = jnp.broadcast_arrays(alpha, re)
         alpha_deg = jnp.degrees(alpha)
@@ -483,20 +485,20 @@ class NeuralFoilInterpolator:
         y_fused = (y + y_unflipped) / 2
         
         # Extract coefficients
-        confidence = jax.nn.sigmoid(y_fused[..., 0])
+        log_confidence = jax.nn.log_sigmoid(y_fused[..., 0])
         CL_raw = y_fused[..., 1] / 2
         CD_raw = jnp.exp((y_fused[..., 2] - 2) * 2)
         CM_raw = y_fused[..., 3] / 20
-        return CL_raw, CD_raw, CM_raw, confidence
+        return CL_raw, CD_raw, CM_raw, log_confidence
 
-    def __call__(self, alpha, re, mach, kulfan, t_over_c=0.10, return_confidence=False):
+    def __call__(self, alpha, re, mach, kulfan, t_over_c=0.10, return_log_confidence=False):
         # 1. Wrap alpha to [-pi, pi] preserving original shape
         alpha = jnp.mod(alpha + jnp.pi, 2 * jnp.pi) - jnp.pi
         
         # Broadcast arrays together to unify their shapes automatically
         alpha, re = jnp.broadcast_arrays(alpha, re)
 
-        CL_raw, CD_raw, CM_raw, confidence = self.raw(alpha, re, kulfan)
+        CL_raw, CD_raw, CM_raw, log_confidence = self.raw(alpha, re, kulfan)
         
         # Flat-Plate Blending
         alpha_trust_low = jnp.radians(-11.0)
@@ -524,13 +526,13 @@ class NeuralFoilInterpolator:
 
         # Apply Mach corrections (which handles shapes smoothly natively)
         coeffs = apply_mach_corrections(CL_inc, CD_inc, CM_inc, mach, t_over_c)
-        return coeffs + (confidence,) if return_confidence else coeffs
+        return coeffs + (log_confidence,) if return_log_confidence else coeffs
 
-def _with_confidence(coeffs, return_confidence):
+def _with_confidence(coeffs, return_log_confidence):
     '''
-    Table and parametric models have no confidence estimate; report full confidence when one is requested.
+    Table and parametric models have no confidence estimate; report full confidence (log 0) when one is requested.
     '''
-    return coeffs + (jnp.ones_like(coeffs[0]),) if return_confidence else coeffs
+    return coeffs + (jnp.zeros_like(coeffs[0]),) if return_log_confidence else coeffs
 
 ### Data Loading/Grid Utilities
 
@@ -681,12 +683,12 @@ def apply_mach_corrections(cl_inc, cd_inc, cm_inc, mach, t_over_c=0.10):
     return cl_comp, cd_comp, cm_comp
 
 # Aerodynamic Coefficient Pipeline
-def aero_coeffs(V_i, params, return_confidence=False):
+def aero_coeffs(V_i, params, return_log_confidence=False):
     '''
     Universal Aerodynamic pipeline.
 
     Each radial station uses its own section, interpolated along the span from the CST sections in params.cst.
-    With return_confidence=True the NeuralFoil analysis confidence (n_r, n_psi) is returned as a 4th output.
+    With return_log_confidence=True the log NeuralFoil analysis confidence (n_r, n_psi) is returned as a 4th output.
     '''
     geometric_angle = params.beta[:, None]
     V_R, phi = resultantVelocityComponents(V_i, params)
@@ -701,7 +703,7 @@ def aero_coeffs(V_i, params, return_confidence=False):
 
     # Natively calls the instantiated class
     outputs = params.airfoil_interp(AoA_eff, Re, Mach, kulfan=kulfan[:, None, :], t_over_c=t_over_c,
-                                    return_confidence=return_confidence)
+                                    return_log_confidence=return_log_confidence)
     C_L_2D, C_D_2D, C_M = outputs[:3]
 
     # Apply 3D Rotational Corrections
@@ -712,7 +714,7 @@ def aero_coeffs(V_i, params, return_confidence=False):
         operands
     )
 
-    if return_confidence:
+    if return_log_confidence:
         return C_L_final, C_D_final, C_M_final, outputs[3]
     return C_L_final, C_D_final, C_M_final
 

@@ -125,8 +125,8 @@ def test_level0c_aero_coeffs_cst():
 
     def f(cst):
         p = replace(params, cst=cst)
-        C_L, C_D, C_M, conf = airfoil.aero_coeffs(V_i, p, return_confidence=True)
-        return jnp.sum(C_L**2) + jnp.sum(C_D**2) + jnp.sum(conf)
+        C_L, C_D, C_M, log_conf = airfoil.aero_coeffs(V_i, p, return_log_confidence=True)
+        return jnp.sum(C_L**2) + jnp.sum(C_D**2) + jnp.sum(log_conf)
 
     val, g = jax.value_and_grad(f)(params.cst)
     print(f"  forward value = {val}")

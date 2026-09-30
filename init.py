@@ -22,7 +22,11 @@ import numpy as np
 import geometry
 
 PROP_DIR = Path(__file__).resolve().parent / "propellers"
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
+
+# Inputs whose meaning changed in format 3 (Newton BEMT solve, relative-change stopping test): older files take
+# the new defaults for these
+_RESET_FROM_V2 = ("V_i_0_eps", "V_i_0_max_iter", "opt_tol")
 
 # Inputs fields holding one entry per flight condition
 CONDITION_FIELDS = ("thrust_target", "V_x", "V_yz", "omega", "tilt", "solve_omega", "solve_tilt", "objective_weight")
@@ -41,17 +45,17 @@ class Inputs:
     Run configuration: solver settings, discretisation, model selection and flight conditions.
     Every field is saved with the propeller and reaches the physics through Params.cfg.
     '''
-    # Outer-loop Optimisation (Currently only L-BFGS-B works)
-    opt_solver: str = "L-BFGS-B"
+    # Outer-loop Optimisation
+    opt_solver: str = "SLSQP"       # "SLSQP": exact constraints (recommended) | "L-BFGS-B": penalty weights below
     opt_max_iter: int = 2000
-    opt_tol: float = 1e-4
+    opt_tol: float = 1e-6           # converged when the objective changes by less than this fraction between iterations
     opt_verbose: int = 1            # 0: start/end summary only, 1: iteration table, 2: + cost terms and jaxopt line-search info
     opt_print_every: int = 5        # iterations between table rows (a row is also printed after 10 s without one)
 
     # Induced Velocity Settings
-    V_i_0_max_iter: int = 1000
-    V_i_0_eps: float = 5e-2
-    V_i_0_verbose: int = 0          # 0: silent, 1: one line per BEMT solve, 2: + every Broyden iteration and sectional thrust
+    V_i_0_max_iter: int = 50        # Newton iterations (typically 3-7 from a warm start)
+    V_i_0_eps: float = 1e-8         # largest non-dimensional BEMT residual accepted (thrust / T_target, torque / (T_target R_tip))
+    V_i_0_verbose: int = 0          # 0: silent, 1: one line per BEMT solve, 2: + every Newton iteration and sectional thrust
 
     # Solver Type
     bemt_type: tuple = (True, True, False) # (V_ia,V_it,V_ir)
@@ -80,11 +84,12 @@ class Inputs:
     P_max: float = 3300
 
     # Cost Penalties
-    w_thrust: float = 1e4           # weight of the thrust constraint penalty (large => near-hard constraint)
-    thrust_tol: float = 0.01        # relative thrust error allowed before the constraint penalty applies
+    # Constraint limits (every solver) and penalty weights (L-BFGS-B only; SLSQP treats the constraints exactly)
+    w_thrust: float = 1e4           # weight of the thrust and motor power penalties (large => near-hard constraint)
+    thrust_tol: float = 0.01        # relative thrust error allowed around each target
     w_thickness: float = 10.0       # weight of the minimum t/c penalty (BladeSpec.min_tc)
     w_confidence: float = 1.0       # weight of the NeuralFoil low-confidence penalty
-    min_confidence: float = 0.9     # NeuralFoil analysis confidence below which the penalty applies
+    min_confidence: float = 0.9     # lowest load-weighted NeuralFoil confidence over the aerodynamic zone (0 disables)
 
     # Aerodynamic Models Selection
     inflow_model: int = 0   #0: Simple 1: Pitt-Peters
@@ -227,6 +232,7 @@ class ModelConfig:
     P_max: float
     w_thrust: float
     thrust_tol: float
+    w_thickness: float
     w_confidence: float
     min_confidence: float
 
@@ -405,10 +411,18 @@ class Propeller:
     @classmethod
     def from_dict(cls, data: dict, name=None) -> "Propeller":
         version = data.get("format_version")
-        if version != FORMAT_VERSION:
+        if version not in (2, FORMAT_VERSION):
             raise ValueError(f"Unsupported propeller file format_version {version} (expected {FORMAT_VERSION})")
 
         inputs_data = dict(data["inputs"])
+        if version == 2:
+            defaults = Inputs()
+            reset = [k for k in _RESET_FROM_V2 if k in inputs_data and inputs_data[k] != getattr(defaults, k)]
+            for k in reset:
+                del inputs_data[k]
+            if reset:
+                warnings.warn(f"Format 2 propeller file: {', '.join(reset)} reset to the defaults of the Newton BEMT "
+                              f"solve and relative-change stopping test")
         if "verbose" in inputs_data:
             # Files saved before the per-solver verbosity levels: the old flag drove the induced velocity solver
             inputs_data.setdefault("V_i_0_verbose", int(inputs_data.pop("verbose")))
