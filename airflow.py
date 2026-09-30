@@ -78,13 +78,15 @@ def resultantVelocityComponents(V_i, params, plotting=False):
     # Calculate V_R from the magnitude of the vector sum of the individual components
     V_axial_net = V_x + V_i_a
     
-    # Add tangential velocity (swirl.) Sign convention is with flow.
-    V_norml_net = omega * r[:, None] + V_yz_perp + V_i_t
-    
+    # Swirl V_i_t > 0 turns with the blade (the momentum torque 2 rho r^2 V_i_t V' is then positive), so it reduces
+    # the tangential velocity the blade sees: W_t = omega r (1 - a') for a propeller. With + V_i_t a drag-free blade
+    # would absorb less shaft power than the axial momentum flux it produces, which breaks energy conservation.
+    V_norml_net = omega * r[:, None] + V_yz_perp - V_i_t
+
     V_R = jnp.sqrt(jnp.square(V_axial_net) + jnp.square(V_norml_net))
 
-    # Using the same components we can efficiently calculate phi
-    phi = jnp.arctan(V_axial_net / V_norml_net)
+    # Four-quadrant inflow angle: continuous where the tangential velocity changes sign (reversed flow)
+    phi = jnp.arctan2(V_axial_net, V_norml_net)
 
     if plotting:
         raise(NotImplementedError("Debug plotting not currently supported by the 'resultantVelocityComponents' function (airflow.py)"))
@@ -199,7 +201,7 @@ def prandtl_root_loss(phi, params):
     sin_phi_safe = jnp.maximum(jnp.sin(abs_phi), 1e-3)   #guard low-phi (rotation-dominated) stations
 
 
-    f_root = (B / 2.0) * (r[:, None] - R_hub) / (r[:, None] * jnp.sin(abs_phi))
+    f_root = (B / 2.0) * (r[:, None] - R_hub) / (r[:, None] * sin_phi_safe)
     
     # Clip to guarantee arccos operates within valid domain [-1, 1]
     f_root_safe = jax.nn.softplus(f_root - eps) + eps   # smooth floor near f_tip -> 0, ~linear elsewhere

@@ -128,7 +128,8 @@ class BladeSpec:
         0      <= r <  r_hub  : structural hub section (stadium), outside the BEMT domain
         r_hub  <= r <  r_aero : blend zone; chord/twist and section shape blend from the hub to the aero zone
         r_aero <= r <= r_tip  : aerodynamic zone; CST sections defined at r_foils[2:] and interpolated linearly
-    The BEMT grid spans [r_hub, r_tip].
+    The BEMT grid spans [r_hub, r_tip], but only the aerodynamic zone is solved and carries force: the blend zone is a
+    structural transition (like a root cutout) whose chord and twist follow from the hub and the first aero station.
 
     freeze holds radial ranges (m) where a design variable keeps its seed value during optimisation,
     e.g. {"c": [(0.05, 0.08)], "beta": [(0.05, 0.08)], "cst": [(0.27, 0.28)]}.
@@ -215,6 +216,7 @@ class ModelConfig:
     on Params as a static field, so jit specialises on it.
     '''
     R_hub: float
+    R_aero: float                   # inboard edge of the aerodynamic zone: the blend zone inboard of it carries no force
     R_tip: float
     solve_idx: tuple                # induced-velocity components solved for (from Inputs.bemt_type)
     V_i_0_max_iter: int
@@ -238,9 +240,10 @@ class ModelConfig:
 
     @classmethod
     def build(cls, inputs: Inputs, blade: BladeSpec) -> "ModelConfig":
-        copied = [f.name for f in dataclasses.fields(cls) if f.name not in ("R_hub", "R_tip", "solve_idx")]
+        copied = [f.name for f in dataclasses.fields(cls) if f.name not in ("R_hub", "R_aero", "R_tip", "solve_idx")]
         return cls(
             R_hub=blade.R_hub,
+            R_aero=blade.R_aero,
             R_tip=blade.R_tip,
             solve_idx=tuple(i for i, solved in enumerate(inputs.bemt_type) if solved),
             **{name: getattr(inputs, name) for name in copied},

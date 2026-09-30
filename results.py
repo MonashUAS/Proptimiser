@@ -479,10 +479,7 @@ def _diagnostics_fields(params):
     VR_mean = jnp.mean(V_R, axis=1)
     phi_deg = jnp.degrees(jnp.mean(phi, axis=1))
     beta_deg = jnp.degrees(params.beta)
-    return dict(
-        r=params.r,
-        c=params.c,
-        beta_deg=beta_deg,
+    flow = dict(
         phi_deg=phi_deg,
         alpha_deg=beta_deg - phi_deg,
         V_R=VR_mean,
@@ -493,11 +490,15 @@ def _diagnostics_fields(params):
         dT=propmodel.dT_blade(V_i, params),
         dQ=propmodel.dQ_blade(V_i, params),
     )
+    # The blend zone is not solved (propmodel.aero_zone): its flow quantities are NaN, which plots leave as a gap
+    aero = propmodel.aero_zone(params)
+    return dict(r=params.r, c=params.c, beta_deg=beta_deg, **{k: jnp.where(aero, v, jnp.nan) for k, v in flow.items()})
 
 def diagnostics_data(params) -> dict:
     '''
     Azimuth-averaged sectional data (numpy, one value per radial station) of one solved flight condition:
     r, c, beta_deg, phi_deg, alpha_deg, V_R, Mach, Re, CL, CD, dT (N/m), dQ (Nm/m).
+    The flow quantities are NaN in the blend zone, which the BEMT does not solve.
     '''
     return {k: np.asarray(v) for k, v in _diagnostics_fields(_without_logs(params)).items()}
 

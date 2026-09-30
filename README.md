@@ -16,6 +16,7 @@ By leveraging [JAX](https://github.com/google/jax) for automatic differentiation
   * Predicts tip and root losses via classical Prandtl loss factors.
 * **Physics-Informed Aerodynamics:**
   * Utilises Parametric, XFOIL or **NeuralFoil** [9] for airfoil lookups, providing differentiable aerodynamic coefficients ($C_L$, $C_D$, $C_M$) across operational Reynolds and Mach numbers.
+  * NeuralFoil is trusted to about ±20° angle of attack (it predicts stall itself) and blends into the Truong 360° post-stall model beyond that, as AeroSandbox does.
 * **Parametric Geometry Generation:**
   * Uses the Kulfan Class Shape Transformation (CST) [13] via **AeroSandbox** [5] to create a fully continuous loft of the blade from the structural hub to the aerodynamic tip.
   * Directly exports production-ready `.ibl` surface meshes and mold-split parting lines directly to **Creo Parametric**.
@@ -73,7 +74,7 @@ Proptimiser is designed to be configured centrally and executed from the command
 A run is described by three classes in `init.py`:
 
 * **`Inputs`**: solver settings, discretisation, model selection, cost penalties and the flight conditions (one array entry per condition).
-* **`BladeSpec`**: the blade definition. `r_foils = [0, r_hub, r_aero, r_mid..., r_tip]` splits the blade into a structural hub (`r < r_hub`, outside the BEMT domain), a blend zone (`r_hub <= r < r_aero`) and the aerodynamic zone, where CST airfoil sections are defined at `r_foils[2:]` and interpolated along the span. `freeze` holds radial ranges (m) where chord, twist or CST sections keep their seed values during optimisation.
+* **`BladeSpec`**: the blade definition. `r_foils = [0, r_hub, r_aero, r_mid..., r_tip]` splits the blade into a structural hub (`r < r_hub`, outside the BEMT domain), a blend zone (`r_hub <= r < r_aero`, a structural transition that the BEMT does not solve and that carries no force) and the aerodynamic zone, where CST airfoil sections are defined at `r_foils[2:]` and interpolated along the span. `freeze` holds radial ranges (m) where chord, twist or CST sections keep their seed values during optimisation.
 * **`Propeller`**: a design (chord, twist, CST sections) plus the `Inputs` and `BladeSpec` it is analysed with. It builds the solver parameters and handles all saving and loading.
 
 ```python
@@ -114,7 +115,7 @@ Every constraint is written as a margin relative to its own limit (`-0.01` = lim
 
 Both solvers stop when the objective changes by less than `opt_tol` (relative) in an iteration, or after `opt_max_iter` iterations.
 
-The induced velocity is solved by damped Newton on each annulus. The BEMT residual Jacobian is block diagonal, since every annulus only sees its own induced velocity, so each Newton iteration costs one forward-mode pass per solved component. It converges to `V_i_0_eps` (non-dimensional residual, default `1e-8`) in a handful of iterations, and `jax.lax.custom_root` makes the gradients of the converged solution exact. An annulus that is already converged takes no step. An annulus where backtracking finds no decrease (a minimum of the residual norm that is not a root, e.g. reversed flow near the hub in forward flight) restarts from the momentum-theory guess.
+The induced velocity is solved by damped Newton on each annulus. The BEMT residual Jacobian is block diagonal, since every annulus only sees its own induced velocity, so each Newton iteration costs one forward-mode pass per solved component. It converges to `V_i_0_eps` (non-dimensional residual, default `1e-8`) in a handful of iterations, and `jax.lax.custom_root` makes the gradients of the converged solution exact. An annulus that is already converged takes no step. An annulus where 10 step halvings find no decrease is heading into a minimum of the residual norm that is not a root (a fold of the residual past stall, or reversed flow near the hub in forward flight). Newton stops there, and a bracketed fallback solves that annulus: for a trial axial inflow it solves the torque balance for the swirl, then it moves the axial inflow to balance the thrust. Both scalar roots stay bracketed (Illinois regula falsi), so the fallback always ends on a root. It solves up to 4 annuli at a time on a copy of the blade that holds only those annuli, and it runs only when an annulus needs it.
 
 Solver output is controlled per solver in `Inputs`:
 
@@ -124,7 +125,7 @@ Solver output is controlled per solver in `Inputs`:
   * `2` also prints the constraint margins, the load-weighted and lowest-station NeuralFoil confidence, and JAXopt's internal L-BFGS-B line.
 * `V_i_0_verbose` (induced velocity Newton solve):
   * `0` (default) is silent.
-  * `1` prints one line per solve (thrust target, Newton iterations, final residual).
+  * `1` prints one line per solve (thrust target, Newton iterations, annuli solved by the bracketed fallback, final residual).
   * `2` also prints every Newton iteration and the sectional thrust.
 
 Propeller files written before format 3 load with the Broyden-era `V_i_0_eps`, `V_i_0_max_iter` and `opt_tol` replaced by the new defaults (a warning says so).

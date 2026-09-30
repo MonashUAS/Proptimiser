@@ -382,37 +382,147 @@ def _station_solve(blocks, rhs, active):
     x = jnp.einsum("nij,jn->in", jnp.linalg.pinv(blocks), rhs)
     return jnp.where(active[None, :], x, 0.0)
 
+FALLBACK_STATIONS = 4   # stations solved together in one pass of the bracketed fallback
+MAX_HALVINGS = 10       # Newton step halvings before a station is handed to the bracketed fallback
+
+def _station_subset(params, idx):
+    '''
+    Params holding only the radial stations idx. The BEMT residuals of a station depend on no other station, so
+    the subset gives the same residuals for those stations.
+    '''
+    return eqx.tree_at(lambda p: (p.r, p.dr, p.c, p.beta, p.V_i_0), params,
+                       (params.r[idx], params.dr[idx], params.c[idx], params.beta[idx], params.V_i_0[:, idx]))
+
+def _bracketed_root(f, x0, aux0, todo, ftol, h0=0.25, max_expand=12, max_iter=100):
+    '''
+    Root of a scalar residual at every station in todo, kept bracketed. f(x) returns (residual, aux), each shaped
+    like x (n,); aux carries a by-product of the evaluation (the inner root when root finders are nested).
+
+    The bracket grows about x0 (half-width h0, doubled up to max_expand times) until f changes sign, then Illinois
+    (modified regula falsi) iterations shrink it until |f| <= ftol or it reaches round-off width. Each step
+    evaluates f once, vmapped over three points (x0 and x0 -/+ h while the bracket grows, the Illinois iterate
+    after), so f is traced only once: nested root finders then compile to one copy of the residual rather than one
+    per call site. A station with no sign change in the largest bracket, or not in todo, keeps x0 and aux0.
+    Returns (x, aux).
+    '''
+    f3 = jax.vmap(f)
+    sign_change = lambda fa, fb: jnp.isfinite(fa) & jnp.isfinite(fb) & (jnp.sign(fa) != jnp.sign(fb))
+    EXPAND, ILLINOIS, DONE = 0, 1, 2
+
+    def cond(s):
+        return (s["n"] < max_expand + max_iter) & jnp.any(s["phase"] != DONE)
+
+    def body(s):
+        a, fa, b, fb, h = s["a"], s["fa"], s["b"], s["fb"], s["h"]
+        expanding, iterating = s["phase"] == EXPAND, s["phase"] == ILLINOIS
+
+        # Illinois iterate from the bracket; bisection if the secant leaves it
+        x = (a * fb - b * fa) / (fb - fa)
+        x = jnp.where(jnp.isfinite(x) & (x > jnp.minimum(a, b)) & (x < jnp.maximum(a, b)), x, 0.5 * (a + b))
+        points = jnp.where(expanding[None, :], jnp.stack([x0, x0 - h, x0 + h]), jnp.stack([x, x, x]))
+        values, aux = f3(points)
+
+        # Growing bracket: stop at a root at x0, or at a sign change on either side
+        f0, fl, fr = values
+        at_root = expanding & jnp.isfinite(f0) & (jnp.abs(f0) <= ftol)
+        left = expanding & ~at_root & sign_change(fl, f0)
+        right = expanding & ~at_root & ~left & sign_change(f0, fr)
+        exhausted = expanding & ~(at_root | left | right) & ((s["n"] + 1 >= max_expand) | ~jnp.isfinite(f0))
+        new_a = jnp.where(left, x0 - h, jnp.where(right, x0, a))
+        new_fa = jnp.where(left, fl, jnp.where(right, f0, fa))
+        new_b = jnp.where(left | at_root, x0, jnp.where(right, x0 + h, b))
+        new_fb = jnp.where(left | at_root, f0, jnp.where(right, fr, fb))
+        new_aux = jnp.where(left | at_root, aux[0], jnp.where(right, aux[2], s["aux"]))
+
+        # Illinois: b is the latest iterate; a is the retained end, whose residual is halved each time it is kept
+        fx = values[0]
+        valid = iterating & jnp.isfinite(fx)
+        flip = jnp.sign(fx) != jnp.sign(fb)
+        new_a = jnp.where(valid, jnp.where(flip, b, a), new_a)
+        new_fa = jnp.where(valid, jnp.where(flip, fb, 0.5 * fa), new_fa)
+        new_b = jnp.where(valid, x, new_b)
+        new_fb = jnp.where(valid, fx, new_fb)
+        new_aux = jnp.where(valid, aux[0], new_aux)
+        width = jnp.abs(new_b - new_a) <= 4 * jnp.finfo(x.dtype).eps * (1.0 + jnp.abs(new_b))
+        converged = valid & ((jnp.abs(new_fb) <= ftol) | width)
+
+        phase = jnp.where(left | right, ILLINOIS, s["phase"])
+        phase = jnp.where(at_root | exhausted | converged | (iterating & ~valid), DONE, phase)
+        return dict(n=s["n"] + 1, phase=phase, found=s["found"] | at_root | left | right,
+                    a=new_a, fa=new_fa, b=new_b, fb=new_fb, aux=new_aux,
+                    h=jnp.where(expanding & ~(at_root | left | right), 2 * h, h))
+
+    init = dict(n=0, phase=jnp.where(todo, EXPAND, DONE), found=jnp.zeros_like(todo),
+                a=x0, fa=jnp.zeros_like(x0), b=x0, fb=jnp.zeros_like(x0), aux=aux0, h=jnp.full_like(x0, h0))
+    s = jax.lax.while_loop(cond, body, init)
+    return jnp.where(s["found"], s["b"], x0), jnp.where(s["found"], s["aux"], aux0)
+
+def _bracketed_bemt(residual_fn, lam, todo, tol, solve_idx):
+    '''
+    Fallback for the stations in todo where Newton stalls (a stationary point of the residual norm that is not a
+    root, typically on the post-stall side of the lift curve, where the residual folds). The axial and tangential
+    residuals are solved as nested scalar roots, each kept bracketed (_bracketed_root): for a trial axial inflow the
+    tangential one balances the torque, and the axial inflow is then moved to balance the thrust. Both residuals
+    change sign between large negative and large positive induced velocity (the drag terms grow as V^2 while the
+    momentum terms grow as V|V|), so a bracket exists; the nearest root to the stalled point is taken.
+    '''
+    ia = solve_idx.index(0) if 0 in solve_idx else None
+    it = solve_idx.index(1) if 1 in solve_idx else None
+    if ia is None and it is None:
+        return lam      # only the radial component, whose residual is not modelled
+
+    if ia is None or it is None:
+        row = it if ia is None else ia
+        f = lambda x: (residual_fn(lam.at[row].set(x))[row], x)
+        x, _ = _bracketed_root(f, lam[row], lam[row], todo, 0.5 * tol)
+        return lam.at[row].set(x)
+
+    # Nested: the torque balance to a tighter tolerance, so the thrust residual is smooth in the axial inflow. The
+    # inner root finder carries the thrust residual as its by-product (NaN where it finds no torque root, which the
+    # outer one then treats as unusable), so the residual is evaluated in one place only
+    with_rows = lambda a, t: lam.at[ia].set(a).at[it].set(t)
+    def thrust_residual(a):
+        torque_and_thrust = lambda t: (lambda r: (r[it], r[ia]))(residual_fn(with_rows(a, t)))
+        t, thrust = _bracketed_root(torque_and_thrust, lam[it], jnp.full_like(a, jnp.nan), todo, 0.1 * tol)
+        return thrust, t
+    a, t = _bracketed_root(thrust_residual, lam[ia], lam[it], todo, 0.5 * tol)
+    return with_rows(a, t)
+
 def _newton_bemt(residual_fn, lam, active, tol, max_iter, verbose, params):
     '''
     Damped blockwise Newton on residual_fn(lam) = 0. Each station backtracks (halving its step) until its own
     residual norm decreases, so a hard station never slows the others. A station already within tol takes no
     step: at round-off level its residual cannot decrease, and backtracking would run to machine epsilon.
-    Converged when the largest scaled residual over the active stations is below tol.
+
+    Near a regular root the full Newton step is accepted. A station whose residual norm does not decrease within
+    MAX_HALVINGS halvings of its step is heading into a stationary point that is not a root (a fold of the residual
+    past stall, or a reversed-flow state near the hub in forward flight), where Newton creeps with ever smaller
+    steps and never arrives. The station stops there and, once the other stations converge, is solved by the bracketed
+    fallback (_bracketed_bemt), as is any station still above tol after max_iter. The fallback runs only when a
+    station needs it. Converged when the largest scaled residual over the active stations is below tol.
     '''
-    def max_residual(l):
+    def station_residual(l):
         # Non-finite residuals count as unconverged (a NaN would otherwise end the loop as if converged)
         res = jnp.abs(residual_fn(l))
-        return jnp.max(jnp.where(active[None, :], jnp.where(jnp.isfinite(res), res, jnp.inf), 0.0))
+        return jnp.max(jnp.where(jnp.isfinite(res), res, jnp.inf), axis=0)
 
     def newton_step(state):
-        l, it, _ = state
+        l, it, _, stuck = state
         r, linear_fn = jax.linearize(residual_fn, l)
         step = _station_solve(_station_blocks(linear_fn, l.shape), -r, active)
 
         # A station whose Newton step is undefined (non-finite residual or derivative, e.g. far outside the airfoil
         # model's range) restarts from the momentum-theory guess, lambda = 1, rather than spreading NaN
-        restart = active & ~jnp.all(jnp.isfinite(step), axis=0)
+        restart = active & ~stuck & ~jnp.all(jnp.isfinite(step), axis=0)
         step = jnp.where(restart[None, :], 0.0, step)
         r = jnp.where(restart[None, :], 0.0, r)
-        done = jnp.all(jnp.abs(r) <= tol, axis=0)
+        done = jnp.all(jnp.abs(r) <= tol, axis=0) | stuck
         step = jnp.where(done[None, :], 0.0, step)
         r0 = jnp.sum(r**2, axis=0)
 
-        # Backtracking stops at the precision of the residual: halving past machine epsilon cannot change l
-        max_halvings = int(-np.log2(np.finfo(l.dtype).eps))
         def backtrack_cond(carry):
             _, accepted, n = carry
-            return (~jnp.all(accepted)) & (n < max_halvings)
+            return (~jnp.all(accepted)) & (n < MAX_HALVINGS)
         def backtrack(carry):
             alpha, accepted, n = carry
             decreased = jnp.sum(residual_fn(l + alpha * step)**2, axis=0) < r0
@@ -420,26 +530,64 @@ def _newton_bemt(residual_fn, lam, active, tol, max_iter, verbose, params):
             return jnp.where(accepted, alpha, 0.5 * alpha), accepted, n + 1
         alpha, accepted, _ = jax.lax.while_loop(backtrack_cond, backtrack, (jnp.ones(l.shape[1]), done | ~active, 0))
 
-        # No decrease down to machine epsilon: the station sits at a stationary point of its residual norm that is
-        # not a root (e.g. a reversed-flow state near the hub in forward flight); it restarts from the
-        # momentum-theory guess too
-        restart = restart | ~accepted
-        l = jnp.where(restart[None, :], 1.0, l + alpha * step)
-        err = max_residual(l)
+        stuck = stuck | ~accepted
+        l = jnp.where(restart[None, :], 1.0, jnp.where(stuck[None, :], l, l + alpha * step))
+        err = jnp.max(jnp.where(active & ~stuck, station_residual(l), 0.0))
         if verbose >= 2:
-            jax.debug.print("    [BEMT] Newton iter {i:3d} | residual {e:.2e} | smallest step fraction {a:.2e}",
-                            i=it + 1, e=err, a=jnp.min(jnp.where(active & ~done, alpha, 1.0)))
-        return l, it + 1, err
+            jax.debug.print("    [BEMT] Newton iter {i:3d} | residual {e:.2e} | smallest step fraction {a:.2e} | stalled {s}",
+                            i=it + 1, e=err, a=jnp.min(jnp.where(active & ~done, alpha, 1.0)), s=jnp.sum(stuck))
+        return l, it + 1, err, stuck
 
     def not_converged(state):
-        _, it, err = state
+        _, it, err, _ = state
         return (it < max_iter) & (err > tol)
 
-    l, it, err = jax.lax.while_loop(not_converged, newton_step, (lam, 0, max_residual(lam)))
+    no_station = jnp.zeros_like(active)
+    err0 = jnp.max(jnp.where(active, station_residual(lam), 0.0))
+    l, it, _, stuck = jax.lax.while_loop(not_converged, newton_step, (lam, 0, err0, no_station))
+
+    # Bracketed fallback on the stations Newton could not solve, FALLBACK_STATIONS at a time: the stations are
+    # independent, so each pass solves a small copy of the blade holding only those stations, at a fraction of the
+    # cost of the full grid. A while_loop rather than lax.cond, which under vmap would run for every condition.
+    todo = active & (stuck | (station_residual(l) > tol))
+    n_sub = min(FALLBACK_STATIONS, l.shape[1])
+    def fallback(carry):
+        l, remaining = carry
+        idx = jnp.argsort(~remaining)[:n_sub]          # remaining stations first
+        chosen = remaining[idx]
+        sub = _station_subset(params, idx)
+        sub_residual = lambda l_sub: bemt_residuals(l_sub, sub)
+        l_sub = _bracketed_bemt(sub_residual, l[:, idx], chosen, tol, params.cfg.solve_idx)
+        worst_new, worst_old = jax.vmap(lambda l_sub: jnp.max(jnp.abs(sub_residual(l_sub)), axis=0))(
+            jnp.stack([l_sub, l[:, idx]]))
+        better = chosen & (worst_new < worst_old)
+        l = l.at[:, idx].set(jnp.where(better[None, :], l_sub, l[:, idx]))
+        return l, remaining.at[idx].set(False)
+    l, _ = jax.lax.while_loop(lambda carry: jnp.any(carry[1]), fallback, (l, todo))
+
     if verbose >= 1:
-        jax.debug.print("  [BEMT] T_target {t:7.2f} N | omega {w:7.1f} rad/s | Newton iters {n:3d} | residual {e:.2e}",
-                        t=params.thrust_target, w=params.omega, n=it, e=err)
+        err = jnp.max(jnp.where(active, station_residual(l), 0.0))
+        jax.debug.print("  [BEMT] T_target {t:7.2f} N | omega {w:7.1f} rad/s | Newton iters {n:3d} | "
+                        "bracketed stations {b:2d} | residual {e:.2e}",
+                        t=params.thrust_target, w=params.omega, n=it, b=jnp.sum(todo), e=err)
     return l
+
+def aero_zone(params):
+    '''
+    Mask of the radial stations in the aerodynamic zone (r >= r_aero). The blend zone inboard of it is a structural
+    transition whose chord and twist follow from the hub and the first aero station: it is not solved and carries
+    no force, so it cannot drive the first aero station's design.
+    '''
+    return params.r >= params.cfg.R_aero
+
+def radial_weights(params):
+    '''
+    Trapezoid weights over the aerodynamic zone: sum(w * f) integrates f from the first aero station to the tip,
+    and blend-zone stations get zero weight.
+    '''
+    segment = jnp.diff(params.r) * aero_zone(params)[:-1]
+    zero = jnp.zeros(1)
+    return (jnp.concatenate([zero, segment]) + jnp.concatenate([segment, zero])) / 2
 
 @jax.jit
 def induced_velocity(params):
@@ -448,14 +596,13 @@ def induced_velocity(params):
 
     Solves the non-dimensional residuals (bemt_residuals) for the solved components with blockwise Newton, from
     params.V_i_0 as the initial guess. jax.lax.custom_root makes derivatives of the solution exact by implicit
-    differentiation, so gradients do not depend on the iteration history. A station at r = 0 is a zero-area
-    annulus with no momentum equation to satisfy, so its induced velocity is left at the initial guess
-    (it carries no thrust or torque).
+    differentiation, so gradients do not depend on the iteration history. Only the aerodynamic zone is solved
+    (aero_zone): blend-zone stations keep the initial guess and carry no thrust or torque.
     '''
     cfg = params.cfg
     V_scale = get_velocity_scales(params)
     lam_0 = params.V_i_0[cfg.solve_rows] / V_scale
-    active = params.r > 0.0
+    active = aero_zone(params)
 
     residual_fn = lambda lam: bemt_residuals(lam, params)
     solve = lambda f, guess: _newton_bemt(f, guess, active, cfg.V_i_0_eps, cfg.V_i_0_max_iter, cfg.V_i_0_verbose, params)
@@ -488,13 +635,11 @@ def torque(V_i, params, debug=False):
         |V_yz| < |V_x + V_ia|   <- Assumption that the annuli do not interact with each other 
     """
     
-    r = params.r
-
     # Get the average torque per rotation in each annulus using the dQ_blade function
     dQ_blade_ave = dQ_momentum(V_i, params, debug, apply_tip_loss=True)   # accurate, applied post-solve
 
-    # Use trapezoidal integration in the radial direction to compute the total torque
-    Q = jnp.trapezoid(dQ_blade_ave, x=r)
+    # Use trapezoidal integration over the aerodynamic zone to compute the total torque
+    Q = jnp.sum(dQ_blade_ave * radial_weights(params))
 
     return Q
 
@@ -502,12 +647,10 @@ def thrust(V_i, params):
     '''
     Calculate total thrust from solved induced velocity
     '''
-    r = params.r
-    
     dT = dT_momentum(V_i, params, apply_tip_loss=True)   # accurate, applied post-solve
 
-    # Numerically Compute Double Integral to Solve for Thrust
-    T = jnp.trapezoid(dT, x=r)
+    # Numerically Compute Double Integral (over the aerodynamic zone) to Solve for Thrust
+    T = jnp.sum(dT * radial_weights(params))
 
     return T
 

@@ -409,7 +409,7 @@ class NeuralFoilInterpolator:
 
     def raw(self, alpha, re, kulfan):
         '''
-        Network outputs before flat-plate blending and Mach correction.
+        Network outputs before the post-stall blend and Mach correction.
         kulfan (..., N_CST) broadcasts against alpha along a trailing axis.
 
         Returns CL, CD, CM and the log of the analysis confidence (confidence 0-1), each shaped like alpha.
@@ -494,39 +494,48 @@ class NeuralFoilInterpolator:
     def __call__(self, alpha, re, mach, kulfan, t_over_c=0.10, return_log_confidence=False):
         # 1. Wrap alpha to [-pi, pi] preserving original shape
         alpha = jnp.mod(alpha + jnp.pi, 2 * jnp.pi) - jnp.pi
-        
+
         # Broadcast arrays together to unify their shapes automatically
         alpha, re = jnp.broadcast_arrays(alpha, re)
 
         CL_raw, CD_raw, CM_raw, log_confidence = self.raw(alpha, re, kulfan)
-        
-        # Flat-Plate Blending
-        alpha_trust_low = jnp.radians(-11.0)
-        alpha_trust_high = jnp.radians(13.0)
-        
-        Cd90 = 1.98
-        Cd0_default = 0.015 
-        sin_a = jnp.sin(alpha)
-        cos_a = jnp.cos(alpha)
-        Cn_fp = Cd90 * sin_a / (0.56 + 0.44 * jnp.abs(sin_a))
-        Ct_fp = 0.5 * Cd0_default * cos_a
-        
-        bg_cl = Cn_fp * cos_a - Ct_fp * sin_a
-        bg_cd = Cn_fp * sin_a + Ct_fp * cos_a
-        bg_cm = -Cn_fp * (0.25 - 0.175 * (1 - 2 * jnp.abs(alpha) / jnp.pi))
-        
-        k_smooth = 40.0 
-        mask_low = 1.0 / (1.0 + jnp.exp(-k_smooth * (alpha - alpha_trust_low)))
-        mask_high = 1.0 / (1.0 + jnp.exp(k_smooth * (alpha - alpha_trust_high)))
-        weight = mask_low * mask_high
-        
-        CL_inc = weight * CL_raw + (1 - weight) * bg_cl
-        CD_inc = weight * CD_raw + (1 - weight) * bg_cd
-        CM_inc = weight * CM_raw + (1 - weight) * bg_cm
+        CL_sep, CD_sep, CM_sep = post_stall_coefficients(alpha)
+
+        # Separation blend of AeroSandbox (KulfanAirfoil.get_aero_from_neuralfoil with include_360_deg_effects):
+        # NeuralFoil predicts stall itself and extrapolates well past it, so it is trusted up to about +/-20 deg and
+        # hands over to the 360 deg model over about +/-6 deg. separated = 1/2 (1 + tanh(softmax(a - 20, -20 - a) / 3))
+        # with a in degrees and a softmax softness of 1 deg.
+        alpha_deg = jnp.degrees(alpha)
+        switch = jax.nn.logsumexp(jnp.stack([alpha_deg - 20.0, -20.0 - alpha_deg]), axis=0) / 3.0
+        separated = 0.5 * (1.0 + jnp.tanh(switch))
+
+        CL_inc = separated * CL_sep + (1 - separated) * CL_raw
+        # Drag blends in log space; the separated drag carries turbulent flat-plate skin friction
+        CD_inc = jnp.exp(separated * jnp.log(CD_sep + 0.074 / re ** 0.2) + (1 - separated) * jnp.log(CD_raw))
+        CM_inc = separated * CM_sep + (1 - separated) * CM_raw
 
         # Apply Mach corrections (which handles shapes smoothly natively)
         coeffs = apply_mach_corrections(CL_inc, CD_inc, CM_inc, mach, t_over_c)
         return coeffs + (log_confidence,) if return_log_confidence else coeffs
+
+def post_stall_coefficients(alpha):
+    '''
+    Fully separated section coefficients over 360 deg of angle of attack (rad): Truong, "An analytical model for
+    airfoil aerodynamic characteristics over the entire 360 deg angle of attack range", J. Renewable Sustainable
+    Energy, 2020 (doi 10.1063/1.5126055), with the NACA 0012 constants that AeroSandbox uses
+    (aerodynamics.aero_2D.airfoil_polar_functions.airfoil_coefficients_post_stall).
+
+    CM, which AeroSandbox leaves at zero, puts the normal force at a centre of pressure that moves from 0.325c to 0.5c
+    behind the leading edge as the section goes from edgewise to broadside.
+    '''
+    sin_a, cos_a = jnp.sin(alpha), jnp.cos(alpha)
+    Cd90 = 2.08 + 8.36e-2 * cos_a + 4.06e-1 * cos_a**2
+    CN = Cd90 * sin_a
+    CT = (9.00e-2 - 1.78e-1 * cos_a - 2.98e-1 * cos_a**3) * sin_a**2
+    CL = CN * cos_a + CT * sin_a
+    CD = CN * sin_a - CT * cos_a
+    CM = -CN * (0.25 - 0.175 * (1 - 2 * jnp.abs(alpha) / jnp.pi))
+    return CL, CD, CM
 
 def _with_confidence(coeffs, return_log_confidence):
     '''

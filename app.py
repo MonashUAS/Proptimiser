@@ -4,6 +4,8 @@ Proptimiser graphical interface.
     python app.py                   # start from the default propeller
 
 '''
+
+
 import os
 import signal
 import sys

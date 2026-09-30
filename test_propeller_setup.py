@@ -147,6 +147,48 @@ def test_neuralfoil_port_matches_reference():
     assert np.allclose(np.exp(log_confidence), ref["analysis_confidence"], rtol=1e-8)
 
 
+def test_post_stall_blend_matches_aerosandbox():
+    # 360 deg coefficients: NeuralFoil blended into the Truong post-stall model exactly as AeroSandbox does
+    # (KulfanAirfoil.get_aero_from_neuralfoil), built here from its parts because AeroSandbox's own compressibility
+    # step changes CL slightly even at M = 0
+    import neuralfoil as nf
+    import aerosandbox.numpy as anp
+    from aerosandbox.aerodynamics.aero_2D.airfoil_polar_functions import airfoil_coefficients_post_stall
+    from aerosandbox.library.aerodynamics import Cf_flat_plate
+
+    kulfan = geometry.kulfan_from_name("arad10")
+    alpha_deg = np.arange(-180.0, 180.0, 2.5)
+    Re = 2e5
+    raw = nf.get_aero_from_kulfan_parameters(
+        kulfan_parameters=dict(lower_weights=kulfan[:8], upper_weights=kulfan[8:16],
+                               leading_edge_weight=kulfan[16], TE_thickness=kulfan[17]),
+        alpha=alpha_deg, Re=Re, model_size="large",
+    )
+    CL_sep, CD_sep, _ = airfoil_coefficients_post_stall(airfoil=None, alpha=alpha_deg)
+    separated = anp.softmax(alpha_deg - 20, -20 - alpha_deg) / 3
+    CL_ref = anp.blend(separated, CL_sep, raw["CL"])
+    CD_ref = np.exp(anp.blend(separated, np.log(CD_sep + Cf_flat_plate(Re_L=Re, method="turbulent")), np.log(raw["CD"])))
+
+    n = alpha_deg.size
+    CL, CD, _ = airfoil.load_airfoil_data(3)(jnp.radians(alpha_deg), jnp.full(n, Re), jnp.zeros(n), kulfan=jnp.asarray(kulfan))
+    assert np.allclose(CL, CL_ref, rtol=1e-8, atol=1e-10)
+    assert np.allclose(CD, CD_ref, rtol=1e-8)
+
+
+def test_swirl_reduces_the_tangential_velocity():
+    # Swirl V_it > 0 turns with the blade (positive momentum torque), so the blade sees omega r - V_it
+    import airflow
+
+    params = Propeller.default(inputs=Inputs(coeff_method=0, n_r=8, V_yz=[0.0, 0.0])).condition(0)
+    V_i = jnp.zeros((3, 8, params.psi.shape[0])).at[0].set(2.0)
+    _, phi_0 = airflow.resultantVelocityComponents(V_i, params)
+    V_R, phi = airflow.resultantVelocityComponents(V_i.at[1].set(3.0), params)
+    V_t = params.omega * params.r[:, None] - 3.0
+    assert np.allclose(np.tan(phi), (params.V_x + 2.0) / V_t)
+    assert np.allclose(V_R, np.hypot(params.V_x + 2.0, V_t))
+    assert bool(jnp.all(phi > phi_0))
+
+
 # ---------------------------------------------------------------------------
 # Design space: radial mask, derived blend zone, CST variables
 # ---------------------------------------------------------------------------
@@ -285,11 +327,47 @@ def test_newton_bemt_converges_and_matches_a_tighter_solve():
     params = prop.condition(0)
     V_i, V_i_0 = propmodel.induced_velocity(params)
     lam = V_i_0[params.cfg.solve_rows] / propmodel.get_velocity_scales(params)
-    assert np.abs(np.asarray(propmodel.bemt_residuals(lam, params))).max() <= params.cfg.V_i_0_eps
+    # Only the aerodynamic zone is solved; the blend zone keeps its initial guess
+    residual = np.abs(np.asarray(propmodel.bemt_residuals(lam, params)))[:, np.asarray(propmodel.aero_zone(params))]
+    assert residual.max() <= params.cfg.V_i_0_eps
 
     tight = prop.with_inputs(dataclasses.replace(prop.inputs, V_i_0_eps=1e-12)).condition(0)
     V_i_tight, _ = propmodel.induced_velocity(tight)
     assert np.isclose(float(propmodel.thrust(V_i, params)), float(propmodel.thrust(V_i_tight, tight)), rtol=1e-7)
+
+
+def test_bracketed_fallback_finds_the_newton_roots():
+    # With no Newton iterations every station goes to the bracketed fallback, which must reach the same roots
+    import dataclasses
+    import propmodel
+
+    for coeff_method in (0, 3):
+        params = Propeller.default(inputs=Inputs(coeff_method=coeff_method, n_r=8)).condition(1)
+        _, V_newton = propmodel.induced_velocity(params)
+        bracketed = dataclasses.replace(params, cfg=dataclasses.replace(params.cfg, V_i_0_max_iter=0))
+        _, V_bracketed = propmodel.induced_velocity(bracketed)
+        lam = V_bracketed[params.cfg.solve_rows] / propmodel.get_velocity_scales(params)
+        residual = np.abs(np.asarray(propmodel.bemt_residuals(lam, params)))[:, np.asarray(propmodel.aero_zone(params))]
+        assert residual.max() <= params.cfg.V_i_0_eps
+        assert np.allclose(V_bracketed, V_newton, atol=1e-6)
+
+
+def test_blend_zone_carries_no_force():
+    # The blend zone is not solved: its geometry (set by the hub values) must not change thrust or torque
+    import dataclasses
+    import propmodel
+
+    inputs = Inputs(coeff_method=0, n_r=16)
+    base = Propeller.default(inputs=inputs)
+    wide_hub = Propeller.default(inputs=inputs, blade=dataclasses.replace(base.blade, hub_chord=0.06, hub_twist_deg=20.0))
+    assert not bool(jnp.all(propmodel.aero_zone(base.condition(0))))
+    solver = proptimiser.SLSQPSolver(base)
+    solver_wide = proptimiser.SLSQPSolver(wide_hub)
+    assert not np.allclose(solver.params_struct.c, solver_wide.params_struct.c)
+    J, g, _ = proptimiser.problem_values(solver.vars_scaled, solver.params_struct, solver.space)
+    J_wide, g_wide, _ = proptimiser.problem_values(solver_wide.vars_scaled, solver_wide.params_struct, solver_wide.space)
+    assert np.isclose(float(J), float(J_wide), rtol=1e-9)
+    assert np.allclose(np.asarray(g), np.asarray(g_wide), rtol=1e-9, atol=1e-12)
 
 
 def test_zero_radius_station_is_handled():
