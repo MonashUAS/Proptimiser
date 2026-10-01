@@ -85,7 +85,7 @@ class ConditionOutputs(NamedTuple):
     power: jnp.ndarray          # motor power (W)
     thrust: jnp.ndarray         # thrust (N)
     ideal_power: jnp.ndarray    # actuator disc power at the thrust target (W)
-    log_load: jnp.ndarray       # per station: log of the section force scale, sum over psi of V_R^2 c dr dpsi
+    log_load: jnp.ndarray       # per station: log of the section dynamic-pressure weight, sum over psi of V_R^2 dr dpsi
     log_load_confidence: jnp.ndarray  # per station: log of the same sum weighted by the NeuralFoil confidence
     V_i_0: jnp.ndarray          # solved induced velocity (warm start for the next evaluation)
 
@@ -111,10 +111,11 @@ def condition_outputs(params) -> ConditionOutputs:
     else:
         log_confidence = jnp.zeros((params.r.shape[0], params.psi.shape[0]))
 
-    # Each blade element's force scale 1/2 rho V_R^2 c dr dpsi, independent of the (uncertain) coefficients; the
-    # floor on V_R matches the Reynolds number in aero_coeffs
+    # Each blade element's dynamic-pressure weight V_R^2 dr dpsi, independent of the (uncertain) coefficients and of
+    # the chord: a chord factor would let the optimiser drop a poorly modelled station from the average by shrinking
+    # it; the floor on V_R matches the Reynolds number in aero_coeffs
     V_R, _ = airfoil.resultantVelocityComponents(V_i, params)
-    log_load = (2 * jnp.log(jnp.maximum(V_R, 1e-6)) + jnp.log(params.c * _trapezoid_weights(params.r))[:, None]
+    log_load = (2 * jnp.log(jnp.maximum(V_R, 1e-6)) + jnp.log(_trapezoid_weights(params.r))[:, None]
                 + jnp.log(_trapezoid_weights(params.psi))[None, :])
     return ConditionOutputs(motor_power, thrust, propmodel.actuator_disk_power(params.thrust_target, params),
                             jax.nn.logsumexp(log_load, axis=1), jax.nn.logsumexp(log_load + log_confidence, axis=1),
@@ -142,10 +143,10 @@ def constraint_values(outputs, params_struct, space):
     space.constraint_groups(). A value of -0.01 means the limit is exceeded by 1% of itself.
 
     NeuralFoil confidence is constrained once per condition, as the mean over the aerodynamic zone weighted by
-    each blade element's force scale (V_R^2 c dr dpsi): errors in the section coefficients reach thrust and power
-    in that proportion. A per-station limit would also bind at elements that carry almost no load, and can be
-    impossible to meet: near the hub in forward flight the inflow angle approaches 90 deg, far beyond the
-    blade's twist bounds, for every section shape.
+    each blade element's dynamic pressure (V_R^2 dr dpsi). The chord is left out of the weight on purpose: with it
+    a poorly modelled station can leave the average by shrinking to the minimum chord. A per-station limit would
+    also bind at elements that carry almost no load, and can be impossible to meet: near the hub in forward flight
+    the inflow angle approaches 90 deg, far beyond the blade's twist bounds, for every section shape.
 
     It is held as log(confidence / min_confidence) >= 0: the same feasible set, and equal to the relative form
     to first order at the limit. NeuralFoil's confidence is a sigmoid that saturates at zero far outside its
@@ -175,14 +176,34 @@ def relative_margins(g, space, n_cond):
         start += size
     return g
 
+def planform_penalty(params_struct):
+    """
+    Chord smoothness penalty: w_smooth times the mean, over aerodynamic-zone stations, of the squared second
+    difference of log(chord). Zero for a geometric (exponential) taper.
+
+    The BEMT annuli are independent, so nothing in the physics couples neighbouring chords, and the energy ratio
+    is nearly flat along the span (power per unit thrust within about 25% at every station). A station can then
+    sit at the minimum chord. Its thrust and power both scale with its chord, so the objective's gradient in that
+    chord stays finite as the chord goes to zero, and a penalty that is quadratic in chord (bounded gradient) can
+    lose to it. The gradient of a log-chord penalty grows as 1/chord, so it always wins near the bound, while a
+    smooth taper (second differences of log c of a few percent) costs almost nothing.
+    """
+    cfg = params_struct.cfg
+    log_c, r = jnp.log(params_struct.c[0]), params_struct.r[0]      # geometry is shared by every flight condition
+    triples = (r[:-2] >= cfg.R_aero).astype(log_c.dtype)            # a triple lies in the aero zone when its first station does
+    second_difference = log_c[2:] - 2 * log_c[1:-1] + log_c[:-2]
+    return cfg.w_smooth * jnp.sum(triples * second_difference ** 2) / jnp.maximum(jnp.sum(triples), 1.0)
+
 @jax.jit
 def problem_values(vars_scaled, params_struct, space):
     """
-    (objective, constraints, V_i_0) of the design vars_scaled, for constrained solvers.
+    (objective, constraints, V_i_0) of the design vars_scaled, for constrained solvers. The objective is the energy
+    ratio plus the chord smoothness penalty (planform_penalty); Progress reports the energy ratio alone.
     """
     params_struct = space.from_unit(vars_scaled, params_struct)
     outputs = evaluate_all_conditions(params_struct)
-    return energy_ratio(outputs, params_struct), constraint_values(outputs, params_struct, space), outputs.V_i_0
+    objective = energy_ratio(outputs, params_struct) + planform_penalty(params_struct)
+    return objective, constraint_values(outputs, params_struct, space), outputs.V_i_0
 
 def penalty(g, params_struct, space):
     """

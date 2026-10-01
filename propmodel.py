@@ -100,8 +100,8 @@ def dH_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
     Assumes: 
         |V_yz| < |V_x + V_ia|   <- Assumption that the annuli do not interact with each other 
 
-    Uses formulation from (M. Nahon et al., 2015) equation 11 modified with 
-    the inclusion of the prandtl loss parameter 'F'
+    Uses formulation from (M. Nahon et al., 2015) equation 11. No Prandtl loss factor enters the blade-element
+    side; it is applied to the momentum thrust and torque in thrust() and torque().
     """
     # Unpack parameters
     N, c, psi = params.N, params.c, params.psi # geometric and positional values
@@ -113,12 +113,6 @@ def dH_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
     # Get Aerodynamic Coefficients
     C_L, C_D, _ = aero_coeffs(V_i, params)
 
-    # Tip and Root Loss Factors
-    tip_loss, root_loss = tip_root_loss_factors(phi, params)
-    
-    # Calculate the total prandtl loss correction factor
-    F = jnp.multiply(tip_loss, root_loss)
-
     # Inner integral term
     inner = (V_R**2) * (C_L * jnp.sin(phi) + C_D * jnp.cos(phi))
 
@@ -129,7 +123,6 @@ def dH_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
         print("------dH_blade DEBUG------")
         print("dH Shapes (ave.):", jnp.shape(dH_blade_ave))
         print("V_i shape:", jnp.shape(V_i))
-        print("F shape:", jnp.shape(F))
         print("------dH_blade DEBUG------")
 
     return dH_blade_ave

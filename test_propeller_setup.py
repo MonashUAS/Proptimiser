@@ -16,6 +16,7 @@ import tempfile
 import warnings
 from pathlib import Path
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -422,7 +423,8 @@ def test_confidence_constraint_is_load_weighted_and_keeps_its_gradient():
     x = jnp.array([0.0, 0.1, 0.35, 0.4, 1.0])
     assert np.isclose(jnp.sum(proptimiser._trapezoid_weights(x) * jnp.sin(3 * x)), jnp.trapezoid(jnp.sin(3 * x), x=x))
 
-    # One constraint per condition: the confidence averaged over the aerodynamic zone, weighted by V_R^2 c dr dpsi
+    # One constraint per condition: the confidence averaged over the aerodynamic zone, weighted by V_R^2 dr dpsi
+    # (no chord factor, so shrinking a station cannot remove it from the average)
     prop = Propeller.default(inputs=Inputs(coeff_method=3, n_r=6))
     space = proptimiser.DesignSpace.build(prop)
     ps = prop.batched()
@@ -431,7 +433,7 @@ def test_confidence_constraint_is_load_weighted_and_keeps_its_gradient():
     V_i, _ = propmodel.induced_velocity(p)
     V_R, _ = airfoil.resultantVelocityComponents(V_i, p)
     confidence = np.exp(np.asarray(airfoil.aero_coeffs(V_i, p, return_log_confidence=True)[3]))
-    w = (np.asarray(V_R) ** 2 * np.asarray(p.c * proptimiser._trapezoid_weights(p.r))[:, None]
+    w = (np.asarray(V_R) ** 2 * np.asarray(proptimiser._trapezoid_weights(p.r))[:, None]
          * np.asarray(proptimiser._trapezoid_weights(p.psi))[None, :])[np.array(space.aero_stations)]
     expected = np.sum(w * confidence[np.array(space.aero_stations)]) / np.sum(w)
     assert np.isclose(np.exp(g[-prop.inputs.n_cond]) * prop.inputs.min_confidence, expected, rtol=1e-6)
@@ -443,6 +445,58 @@ def test_confidence_constraint_is_load_weighted_and_keeps_its_gradient():
     d_log = jax.grad(lambda a: raw(a, 5e5, kulfan)[3])(alpha)
     d_conf = jax.grad(lambda a: jnp.exp(raw(a, 5e5, kulfan)[3]))(alpha)
     assert np.isfinite(d_log) and abs(d_log) > 1.0 and abs(d_conf) < 1e-6
+
+
+def test_prandtl_loss_follows_the_closed_form_and_vanishes_at_the_ends():
+    import airflow
+
+    prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=20, tip_loss_model=1, root_loss_model=1))
+    p = prop.condition(0)
+    r = np.asarray(p.r)
+    phi = jnp.full((len(r), 1), 0.35)
+    tip, root = airflow.tip_root_loss_factors(phi, p)
+    tip, root = np.asarray(tip)[:, 0], np.asarray(root)[:, 0]
+    B, R_aero, R_tip = float(p.N[0]), p.cfg.R_aero, 1.05 * p.cfg.R_tip
+    exact = lambda f: 2 / np.pi * np.arccos(np.exp(-f))
+
+    aero = r > R_aero
+    f_root = B / 2 * (r - R_aero) / (r * np.sin(0.35))
+    f_tip = B / 2 * (R_tip - r) / (r * np.sin(0.35))
+    far = aero & (f_root > 0.3)
+    assert far.any() and np.allclose(root[far], exact(f_root[far]), atol=1e-3)
+    far = f_tip > 0.3
+    assert far.any() and np.allclose(tip[far], exact(f_tip[far]), atol=1e-3)
+
+    # The root factor is small at the inboard end of the loaded blade and rises with radius; it is not floored near 0.67
+    first = int(np.argmax(r >= R_aero))
+    assert root[first] < 0.3 and np.isclose(root[first], exact(max(f_root[first], 0.0)), atol=0.05)
+    assert float(airflow.prandtl_root_loss(jnp.full((len(r), 1), 0.35), eqx.tree_at(
+        lambda q: q.r, p, jnp.full_like(p.r, R_aero)))[0, 0]) < 0.15       # f = 0 exactly at R_aero
+    assert np.all(np.diff(root[first:]) > 0)
+    assert np.all(np.isfinite(np.asarray(jax.grad(lambda ph: jnp.sum(airflow.prandtl_root_loss(ph, p)))(phi))))
+
+
+def test_planform_penalty_couples_neighbouring_chords():
+    prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=12))
+    ps = prop.batched()
+    r = np.asarray(prop.r)
+    aero = r >= prop.blade.R_aero
+    n_cond = prop.inputs.n_cond
+    with_chord = lambda c: eqx.tree_at(lambda q: q.c, ps, jnp.broadcast_to(jnp.asarray(c), (n_cond, len(r))))
+
+    taper = np.where(aero, 0.06 * np.exp(-6.0 * (r - prop.blade.R_aero)), 0.03)
+    spike = taper.copy()
+    spike[int(np.argmax(aero)) + 3] = 0.001
+    penalty = lambda c: float(proptimiser.planform_penalty(with_chord(c)))
+
+    assert penalty(taper) < 1e-12                       # geometric taper (the blend-zone steps are not penalised)
+    assert penalty(spike) > 100 * max(penalty(taper), 1e-9)
+    # Its gradient grows as the station shrinks, so no chord bound is a stationary point
+    grad_at = lambda value: float(jax.grad(lambda c: proptimiser.planform_penalty(with_chord(c)))(
+        jnp.asarray(spike).at[int(np.argmax(aero)) + 3].set(value))[int(np.argmax(aero)) + 3])
+    assert abs(grad_at(0.001)) > 5 * abs(grad_at(0.005))
+    g = jax.grad(lambda c: proptimiser.planform_penalty(with_chord(c)))(jnp.asarray(spike))
+    assert np.all(np.isfinite(np.asarray(g)))
 
 
 def test_curvature_scale_is_positive_and_normalised():

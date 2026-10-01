@@ -163,12 +163,19 @@ def no_loss(phi, params):
     '''
     return jnp.ones_like(phi)
 
+def _smooth_floor(f, eps=1e-2):
+    '''
+    Smooth, strictly positive stand-in for |f| in the Prandtl exponent, so d(arccos(exp(-f)))/df stays finite at f = 0.
+    Leaves F within 1e-4 of the exact Prandtl factor for f > 0.3 and lets it fall to ~0.09 as f -> 0 (the exact
+    limit is 0).
+    '''
+    return jnp.sqrt(f**2 + eps**2)
+
 def prandtl_tip_loss(phi, params):
     ''' 
     Calculates the Prandtl tip loss according to "Propeller blade element momentum theory with vortex wake deflection"
     M. K. Rwigema : https://www.icas.org/icas_archive/ICAS2010/PAPERS/434.PDF
     '''
-    eps = 1e-3
     B = params.N
     r = params.r
     R_tip = params.cfg.R_tip * 1.05
@@ -178,11 +185,7 @@ def prandtl_tip_loss(phi, params):
 
     f_tip = (B / 2.0) * (R_tip - r[:, None]) / (r[:, None] * sin_phi_safe)
 
-    # Soft-saturate f_tip itself (smooth floor) rather than hard-clipping exp(-f_tip).
-    # This keeps d(F)/d(phi) finite AND continuous, instead of exactly zero past a hard cutoff.
-    f_tip_safe = jax.nn.softplus(f_tip - eps) + eps   # smooth floor near f_tip -> 0, ~linear elsewhere
-
-    f = jnp.exp(-f_tip_safe)
+    f = jnp.exp(-_smooth_floor(f_tip))
     F_tip = (2.0 / jnp.pi) * jnp.arccos(jnp.clip(f, -1.0 + 1e-6, 1.0 - 1e-6))
 
     return F_tip
@@ -192,21 +195,17 @@ def prandtl_root_loss(phi, params):
     Calculates the Prandtl root loss according to "Propeller blade element momentum theory with vortex wake deflection"
     M. K. Rwigema : https://www.icas.org/icas_archive/ICAS2010/PAPERS/434.PDF
     '''
-    eps = 1e-2
     B = params.N
     r = params.r
-    R_hub = params.cfg.R_hub / 2.0
+    # The wake vortex sheet starts at the inboard end of the loaded blade; the blend zone inboard of it carries no force
+    R_root = params.cfg.R_aero
 
     abs_phi = jnp.abs(phi)
     sin_phi_safe = jnp.maximum(jnp.sin(abs_phi), 1e-3)   #guard low-phi (rotation-dominated) stations
 
+    f_root = (B / 2.0) * (r[:, None] - R_root) / (r[:, None] * sin_phi_safe)
 
-    f_root = (B / 2.0) * (r[:, None] - R_hub) / (r[:, None] * sin_phi_safe)
-    
-    # Clip to guarantee arccos operates within valid domain [-1, 1]
-    f_root_safe = jax.nn.softplus(f_root - eps) + eps   # smooth floor near f_tip -> 0, ~linear elsewhere
-
-    f = jnp.exp(-f_root_safe)
+    f = jnp.exp(-_smooth_floor(f_root))
 
     F_root = (2.0 / jnp.pi) * jnp.arccos(jnp.clip(f, -1.0 + 1e-6, 1.0 - 1e-6))
 

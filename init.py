@@ -89,6 +89,7 @@ class Inputs:
     thrust_tol: float = 0.01        # relative thrust error allowed around each target
     w_thickness: float = 10.0       # weight of the minimum t/c penalty (BladeSpec.min_tc)
     w_confidence: float = 1.0       # weight of the NeuralFoil low-confidence penalty
+    w_smooth: float = 1e-2          # weight of the chord smoothness penalty (all solvers; 0 disables)
     min_confidence: float = 0.9     # lowest load-weighted NeuralFoil confidence over the aerodynamic zone (0 disables)
 
     # Aerodynamic Models Selection
@@ -236,6 +237,7 @@ class ModelConfig:
     thrust_tol: float
     w_thickness: float
     w_confidence: float
+    w_smooth: float
     min_confidence: float
 
     @classmethod

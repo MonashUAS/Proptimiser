@@ -58,7 +58,10 @@ INPUT_GROUPS = [
         Field("P_max", "Max motor power [W]", "float"),
         Field("min_confidence", "Min NeuralFoil confidence", "float",
               tooltip="Lowest NeuralFoil confidence, averaged over the aerodynamic zone with each element weighted by "
-                      "its force scale V_R^2 c dr (0 disables)"),
+                      "its force scale V_R^2 dr (0 disables)"),
+        Field("w_smooth", "Chord smoothness weight", "float",
+              tooltip="Weight of the penalty on the second difference of chord over the aerodynamic zone, relative to "
+                      "the mean chord (every solver; 0 disables). Stops single stations collapsing to the minimum chord"),
     ]),
     ("Penalty weights (L-BFGS-B only)", [
         Field("w_thrust", "Thrust weight", "float", tooltip="Weight of the thrust and motor power penalties"),
