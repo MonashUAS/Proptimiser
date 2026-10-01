@@ -3,6 +3,9 @@ import jax.numpy as jnp
 import jax
 from jax import lax
 
+# internal imports
+import geometry
+
 ##  Dimensionless Constants 
 def calc_mach(V, a):
     ''' 
@@ -50,14 +53,34 @@ def equivelantActuatorDiskEfficiency(T, params):
     
     return eta_actuator_disk
 
+def swept_section_velocity(V_axial_net, V_norml_net, V_radial_net, params):
+    '''
+    Relative air velocity in the plane normal to the span of a swept blade, on the section axes of
+    geometry.section_frame: returns (u_n, u_c), the components along the normal n and the chord direction c.
+
+    The inputs are the components of the relative air velocity on the air basis (rho, t, a) at the polar radius of
+    each station: V_radial_net outward in the disc plane (the radial in-plane inflow, which an unswept blade
+    ignores), V_norml_net opposite to the blade motion (omega r + in-plane inflow - swirl) and V_axial_net downstream.
+    The component along the span is dropped (independence principle): only the velocity normal to the
+    pitch axis makes lift. Unswept: (u_n, u_c) = (V_axial_net, V_norml_net).
+    '''
+    frame = geometry.section_frame(params.r, params.offsets)
+    col = lambda x: x[:, None]
+    u_c = col(frame.c_rho) * V_radial_net + col(frame.c_t) * V_norml_net + col(frame.c_a) * V_axial_net
+    u_n = col(frame.n_rho) * V_radial_net + col(frame.n_a) * V_axial_net
+    return u_n, u_c
+
 def resultantVelocityComponents(V_i, params, plotting=False):
     '''
     Calculates the magnitude of the relative velocity at each station of the propeller, and the inflow angle phi
-    
+
     As per equation (2) in "A propeller model for general forward flight conditions" [Waqas Khan and Meyer Nolan 2015]
-    
+
     Updated to accept V_i (n_r, n_psi, 3) representing [axial, tangential, radial] induced velocities.
-    
+
+    A swept blade (params.cfg.swept) takes the velocity normal to its span instead (swept_section_velocity). Its
+    grid azimuth psi is that of the pitch-axis point, so the in-plane inflow needs no shift.
+
     Implemented here for purposes of reducing repeated code (helps with debugging!)
 
     TODO Debug plot implementation
@@ -82,6 +105,9 @@ def resultantVelocityComponents(V_i, params, plotting=False):
     # the tangential velocity the blade sees: W_t = omega r (1 - a') for a propeller. With + V_i_t a drag-free blade
     # would absorb less shaft power than the axial momentum flux it produces, which breaks energy conservation.
     V_norml_net = omega * r[:, None] + V_yz_perp - V_i_t
+
+    if params.cfg.swept:
+        V_axial_net, V_norml_net = swept_section_velocity(V_axial_net, V_norml_net, V_yz * jnp.cos(psi[None, :]), params)
 
     V_R = jnp.sqrt(jnp.square(V_axial_net) + jnp.square(V_norml_net))
 

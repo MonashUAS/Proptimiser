@@ -434,7 +434,7 @@ def test_confidence_constraint_is_load_weighted_and_keeps_its_gradient():
     V_R, _ = airfoil.resultantVelocityComponents(V_i, p)
     confidence = np.exp(np.asarray(airfoil.aero_coeffs(V_i, p, return_log_confidence=True)[3]))
     w = (np.asarray(V_R) ** 2 * np.asarray(proptimiser._trapezoid_weights(p.r))[:, None]
-         * np.asarray(proptimiser._trapezoid_weights(p.psi))[None, :])[np.array(space.aero_stations)]
+         * np.asarray(proptimiser._periodic_weights(p.psi))[None, :])[np.array(space.aero_stations)]
     expected = np.sum(w * confidence[np.array(space.aero_stations)]) / np.sum(w)
     assert np.isclose(np.exp(g[-prop.inputs.n_cond]) * prop.inputs.min_confidence, expected, rtol=1e-6)
 
@@ -519,6 +519,74 @@ def test_format_2_files_take_the_newton_defaults():
     assert (prop.inputs.V_i_0_eps, prop.inputs.V_i_0_max_iter, prop.inputs.opt_tol) == (
         defaults.V_i_0_eps, defaults.V_i_0_max_iter, defaults.opt_tol)
     assert any("Format 2" in str(w.message) for w in caught)
+
+
+# ---------------------------------------------------------------------------
+# Azimuth quadrature
+# ---------------------------------------------------------------------------
+
+def test_azimuth_mean_is_the_full_turn_rule():
+    import propmodel
+
+    for n_psi in (6, 12, 25):
+        psi = jnp.linspace(0.0, 2 * jnp.pi, n_psi, endpoint=False)
+        assert np.isclose(float(propmodel.azimuth_mean(jnp.ones((3, n_psi)))[0]), 1.0, rtol=0, atol=1e-15)
+        # harmonics below n_psi leave only the constant term (the old trapezoid rule gave (n_psi - 1) / n_psi of it)
+        field = 2.0 + jnp.sin(psi + 0.3) + 0.5 * jnp.cos(2 * psi)
+        assert np.isclose(float(propmodel.azimuth_mean(field[None, :])[0]), 2.0, rtol=0, atol=1e-14)
+        assert np.allclose(np.asarray(proptimiser._periodic_weights(psi)), 2 * np.pi / n_psi)
+
+
+def test_momentum_thrust_and_torque_integrate_a_full_turn():
+    # Uniform inflow in psi: the annulus integral is 2 pi times the local momentum flux, for any n_psi
+    import propmodel
+
+    for n_psi in (12, 24):
+        p = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6, n_psi=n_psi)).condition(0)
+        V_i, _ = propmodel.induced_velocity(p)
+        V_ia, V_it = V_i[0, :, 0], V_i[1, :, 0]
+        V_prime = jnp.sqrt((p.V_x + V_ia) ** 2 + p.V_yz ** 2)
+        w = propmodel.radial_weights(p)
+        assert np.isclose(float(propmodel.thrust(V_i, p)), float(jnp.sum(w * 4 * jnp.pi * p.rho * p.r * V_ia * V_prime)), rtol=1e-12)
+        assert np.isclose(float(propmodel.torque(V_i, p)), float(jnp.sum(w * 4 * jnp.pi * p.rho * p.r ** 2 * V_it * V_prime)), rtol=1e-12)
+
+
+def test_zero_offsets_match_legacy_aero():
+    # The swept section frame must reduce to the unswept aerodynamics at zero offsets. An unswept blade never takes
+    # it, so it is forced on here. The literals are the unswept results recorded after the azimuth-quadrature fix.
+    import dataclasses
+    import airflow
+    import propmodel
+
+    prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6))
+    recorded = [(49.89642176871895, 4.566568796083332, 2685.142452096999),
+                (88.15170240170801, 7.431125215399332, 4830.231390009566)]
+    for idx, (T, Q, P) in enumerate(recorded):
+        p = prop.condition(idx)
+        assert not p.cfg.swept and p.offsets.shape == (6, 4) and not bool(jnp.any(p.offsets))
+        V_i, V_i_0 = propmodel.induced_velocity(p)
+        assert np.isclose(float(propmodel.thrust(V_i, p)), T, rtol=1e-9)
+        assert np.isclose(float(propmodel.torque(V_i, p)), Q, rtol=1e-9)
+        assert np.isclose(float(propmodel.mechanicalPower(V_i, p)), P, rtol=1e-9)
+
+        swept = dataclasses.replace(p, cfg=dataclasses.replace(p.cfg, swept=True))
+        for a, b in zip(airflow.resultantVelocityComponents(V_i, p), airflow.resultantVelocityComponents(V_i, swept)):
+            assert np.allclose(a, b, rtol=0, atol=1e-13)
+        assert np.allclose(propmodel.dT_blade(V_i, p), propmodel.dT_blade(V_i, swept), rtol=0, atol=1e-12)
+        assert np.allclose(propmodel.dH_blade(V_i, p), propmodel.dH_blade(V_i, swept), rtol=0, atol=1e-12)
+        _, V_i_0_swept = propmodel.induced_velocity(swept)
+        assert np.allclose(V_i_0, V_i_0_swept, rtol=0, atol=1e-9)
+
+
+def test_blade_element_thrust_matches_momentum_thrust_without_loss_models():
+    # The solve equates the two sides station by station, so their radial integrals agree for any n_psi
+    import propmodel
+
+    for n_psi in (12, 24):
+        p = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6, n_psi=n_psi)).condition(1)
+        V_i, _ = propmodel.induced_velocity(p)
+        blade_element = float(jnp.sum(propmodel.dT_blade(V_i, p) * propmodel.radial_weights(p)))
+        assert np.isclose(blade_element, float(propmodel.thrust(V_i, p)), rtol=1e-6)
 
 
 TESTS = [value for name, value in list(globals().items()) if name.startswith("test_")]

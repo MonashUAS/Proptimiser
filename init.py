@@ -154,6 +154,21 @@ class BladeSpec:
     cst_bound: float = 0.25                 # CST weights may move +/- this far from their seed values
     min_tc: float = 0.06                    # minimum thickness-to-chord ratio of the aero sections
 
+    # Sweep and rake: offsets of the pitch axis (the quarter-chord line of the aero zone) from the radial line through
+    # the hub centre, at the control radii offset_r, held at the end values outside them and blended smoothly between
+    # them (PCHIP). Empty tuples are an unswept blade. An empty offset_y or offset_z means zero offset.
+    offset_r: tuple = ()                    # control radii (m), strictly increasing
+    offset_y: tuple = ()                    # tangential offset (m): + toward the rotation direction (APC SWEEP), so a backswept tip is negative
+    offset_z: tuple = ()                    # axial offset (m): + toward the thrust direction (APC RAKE)
+
+    # Structure: one isotropic material over the CST section outline (defaults follow the APC propeller files)
+    mat_density: float = 1700.0             # kg/m^3 (specific gravity 1.7)
+    mat_E: float = 19.7e9                   # Young's modulus (Pa)
+    mat_G: float = 7.3e9                    # shear modulus (Pa)
+    mat_sigma_allow: float = 60e6           # allowable normal stress (Pa), a placeholder: set it from the material
+    mat_tau_allow: float = 0.0              # allowable shear stress (Pa); 0 means mat_sigma_allow / sqrt(3)
+    fill_factor: float = 1.0                # share of the outline area that is material: 1 solid, < 1 homogenised infill
+
     def __post_init__(self):
         self.N = int(self.N)
         self.r_foils = tuple(float(r) for r in self.r_foils)
@@ -184,6 +199,31 @@ class BladeSpec:
 
         self.c_bounds = tuple(float(b) for b in self.c_bounds)
         self.beta_bounds_deg = tuple(float(b) for b in self.beta_bounds_deg)
+
+        self.offset_r = tuple(float(v) for v in self.offset_r)
+        self.offset_y = tuple(float(v) for v in self.offset_y)
+        self.offset_z = tuple(float(v) for v in self.offset_z)
+        if self.offset_r:
+            if len(self.offset_r) < 2 or np.any(np.diff(self.offset_r) <= 0):
+                raise ValueError(f"offset_r needs at least two strictly increasing radii, got {self.offset_r}")
+            n = len(self.offset_r)
+            self.offset_y = self.offset_y or (0.0,) * n
+            self.offset_z = self.offset_z or (0.0,) * n
+            if len(self.offset_y) != n or len(self.offset_z) != n:
+                raise ValueError(f"offset_y and offset_z need {n} entries to match offset_r, "
+                                 f"got {len(self.offset_y)} and {len(self.offset_z)}")
+        elif self.offset_y or self.offset_z:
+            raise ValueError("offset_y and offset_z need control radii in offset_r")
+
+        if min(self.mat_density, self.mat_E, self.mat_G, self.mat_sigma_allow) <= 0 or self.mat_tau_allow < 0:
+            raise ValueError("Material density, E, G and sigma_allow must be positive, and tau_allow cannot be negative")
+        if not 0.0 < self.fill_factor <= 1.0:
+            raise ValueError(f"fill_factor must be in (0, 1], got {self.fill_factor}")
+
+    @property
+    def swept(self) -> bool:
+        '''True when any sweep or rake offset is nonzero: the aerodynamics then take the swept section frame.'''
+        return any(v != 0.0 for v in self.offset_y + self.offset_z)
 
     @property
     def R_hub(self) -> float:
@@ -220,6 +260,7 @@ class ModelConfig:
     R_aero: float                   # inboard edge of the aerodynamic zone: the blend zone inboard of it carries no force
     R_tip: float
     solve_idx: tuple                # induced-velocity components solved for (from Inputs.bemt_type)
+    swept: bool                     # the blade has sweep or rake: the aerodynamics use the swept section frame
     V_i_0_max_iter: int
     V_i_0_eps: float
     V_i_0_verbose: int
@@ -242,12 +283,13 @@ class ModelConfig:
 
     @classmethod
     def build(cls, inputs: Inputs, blade: BladeSpec) -> "ModelConfig":
-        copied = [f.name for f in dataclasses.fields(cls) if f.name not in ("R_hub", "R_aero", "R_tip", "solve_idx")]
+        copied = [f.name for f in dataclasses.fields(cls) if f.name not in ("R_hub", "R_aero", "R_tip", "solve_idx", "swept")]
         return cls(
             R_hub=blade.R_hub,
             R_aero=blade.R_aero,
             R_tip=blade.R_tip,
             solve_idx=tuple(i for i, solved in enumerate(inputs.bemt_type) if solved),
+            swept=blade.swept,
             **{name: getattr(inputs, name) for name in copied},
         )
 
@@ -264,6 +306,7 @@ class Params(eqx.Module):
 
     shape(r, dr, c, beta) = (N_r,)
     shape(psi, dpsi) = (N_psi,)
+    shape(offsets) = (N_r, 4) [sweep y, rake z, dy/dr, dz/dr]
     shape(cst) = (N_foils + 1, N_CST) [hub section, then aero sections at r_foils[2:]]
     shape(V_i) = (3, N_r, N_psi) [axial, tangential, radial]
     '''
@@ -279,6 +322,7 @@ class Params(eqx.Module):
     beta: jnp.ndarray       # blade twist angle (rad)
     cst: jnp.ndarray        # CST sections [lower x8, upper x8, LE weight, TE thickness] at r_cst
     r_cst: jnp.ndarray      # radii of the CST sections (r_foils[1:]) (m)
+    offsets: jnp.ndarray    # pitch-axis offsets (N_r, 4): [y_sw, z_rk, dy_sw/dr, dz_rk/dr] (m, m, -, -), see geometry.station_offsets
 
     # Inflow / rotor state
     V_x: jnp.ndarray        # axial inflow velocity (ms^{-1})
@@ -333,6 +377,7 @@ class Propeller:
         # Build Grids
         self.r, self.dr = geometry.radial_stops(blade.R_tip, blade.R_hub, inputs.n_r)
         self.psi, self.dpsi = geometry.angular_stops(inputs.n_psi)
+        self.offsets = geometry.station_offsets(self.r, blade)
 
         # Design arrays
         self.c = _checked("c", c, (inputs.n_r,))
@@ -373,10 +418,11 @@ class Propeller:
         )
 
     @classmethod
-    def from_apc(cls, filepath, inputs: Inputs = None, blade: BladeSpec = None) -> "Propeller":
+    def from_apc(cls, filepath, inputs: Inputs = None, blade: BladeSpec = None, use_apc_sweep: bool = False) -> "Propeller":
         '''
         Chord and twist from an APC .PE0 geometry file, interpolated onto the BEMT grid.
         The blade tip (r_foils[-1]) moves to the APC tip radius.
+        use_apc_sweep also takes the file's sweep and rake, as offsets of the pitch axis (geometry.apc_offsets).
         '''
         # Internal Imports
         import apcpropanalysis
@@ -394,6 +440,9 @@ class Propeller:
         if not np.isclose(r_tip, blade.R_tip):
             warnings.warn(f"Moving the blade tip from r_foils[-1] = {blade.R_tip:.4f} m to the APC tip radius {r_tip:.4f} m")
             blade = dataclasses.replace(blade, r_foils=blade.r_foils[:-1] + (r_tip,))
+        if use_apc_sweep:
+            offset_r, offset_y, offset_z = geometry.apc_offsets(apc_geom, blade.R_hub, blade.R_aero)
+            blade = dataclasses.replace(blade, offset_r=offset_r, offset_y=offset_y, offset_z=offset_z)
 
         r, _ = geometry.radial_stops(blade.R_tip, blade.R_hub, inputs.n_r)
         return cls(
@@ -538,6 +587,15 @@ class Propeller:
                 state["V_i_0"] = self.V_i_0
         return Propeller(inputs, blade, c=c, beta=beta, cst=cst, name=self.name, **state)
 
+    def material(self):
+        '''
+        The blade material as structure.Material, for the structural loads (kept out of Params and ModelConfig, so a
+        change of material never recompiles the BEMT).
+        '''
+        from structure import Material      # Internal Import: structure imports this module
+
+        return Material.from_blade(self.blade)
+
     ## Solver Setup
     def condition(self, idx: int = 0) -> Params:
         '''
@@ -562,6 +620,7 @@ class Propeller:
             beta=self.beta,
             cst=jnp.concatenate([jnp.asarray(self.blade.hub_cst)[None, :], self.cst]),
             r_cst=jnp.asarray(self.blade.r_cst),
+            offsets=self.offsets,
             V_x=inputs.V_x[idx],
             V_yz=inputs.V_yz[idx],
             omega=self.omega[idx],

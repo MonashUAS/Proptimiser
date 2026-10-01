@@ -19,6 +19,7 @@ from init import Inputs, Propeller
 import geometry
 import airfoil
 import airflow
+import structure
 
 class DraggableSplineEditor:
     '''
@@ -502,6 +503,194 @@ def diagnostics_data(params) -> dict:
     '''
     return {k: np.asarray(v) for k, v in _diagnostics_fields(_without_logs(params)).items()}
 
+## Structural loads
+@jax.jit
+def _structural_fields(params, mat, kin):
+    result = structure.structural_loads(params, mat, kin)
+    stress = structure.stress_fields(result, mat)
+    props, loads, hub = result.props, result.resultants, result.hub
+    return dict(
+        r=params.r, psi=params.psi, c=params.c, beta_deg=jnp.degrees(params.beta), aero=propmodel.aero_zone(params),
+        mass_per_length=mat.density * mat.fill * props.area * result.axes.arc,
+        area=props.area, I_xx=props.I_xx, I_zz=props.I_zz, I_xz=props.I_xz, J=props.J, t_max=props.t_max,
+        x_c=props.x_c, z_c=props.z_c,
+        N=loads.N, V_x=loads.V_x, V_z=loads.V_z, M_x=loads.M_x, M_z=loads.M_z, T=loads.T,
+        T_aero=result.T_aero, T_inertial=result.T_inertial,
+        sigma_max=stress.sigma_max, tau=stress.tau, sigma_vm=stress.sigma_vm, safety_factor=stress.safety_factor,
+        atm=result.pitch_torque_aero, ctm=result.pitch_torque_inertial, hold=result.pitch_torque_hold,
+        hub_force=hub.force, hub_moment=hub.moment,
+        hub_force_amplitude=hub.force_amplitude, hub_moment_amplitude=hub.moment_amplitude,
+        N_blades=params.N[0],
+    )
+
+def structural_data(params, mat, kin=None) -> dict:
+    '''
+    Loads along the blade and at the hub of one solved flight condition (numpy), from structure.structural_loads and
+    structure.stress_fields. params is a Params whose V_i_0 is solved (evaluate_conditions), mat a structure.Material
+    (Propeller.material()) and kin an optional structure.Kinematics.
+
+    The dict holds, per station (n_r,): r, c, beta_deg, aero (aerodynamic zone mask), the section properties (area,
+    I_xx, I_zz, I_xz, J, t_max, x_c, z_c) and mass_per_length; per azimuth and station (n_psi, n_r), SI units: the
+    internal loads N, V_x, V_z, M_x, M_z, T, and T_aero and T_inertial (the parts of T), the stresses sigma_max, tau,
+    sigma_vm and safety_factor; per azimuth (n_psi,): the root pitch torques atm, ctm and hold; and the hub loads
+    hub_force, hub_moment (n_psi, 3) with their harmonics hub_force_amplitude and hub_moment_amplitude, with a
+    'summary' dict of the figures structural_summary reports. Blade loads are those of one blade at root azimuth psi.
+    '''
+    fields = {k: np.asarray(v) for k, v in _structural_fields(_without_logs(params), mat, kin).items()}
+    psi = fields["psi"]
+    n_blades = int(round(float(fields.pop("N_blades"))))
+
+    # Largest loads on the blade root (station 0) over the azimuth, and the weakest section (the tip carries no load)
+    peak = lambda a: float(np.max(np.abs(a)))
+    sf = fields["safety_factor"][:, :-1]
+    psi_i, r_i = np.unravel_index(np.argmin(sf), sf.shape)
+    hub_force, hub_moment = fields["hub_force"], fields["hub_moment"]
+    amplitude = fields["hub_force_amplitude"]
+    fields["summary"] = dict(
+        n_blades=n_blades, r_root=float(fields["r"][0]),
+        root_N=float(np.max(fields["N"][:, 0])), root_V_x=peak(fields["V_x"][:, 0]), root_V_z=peak(fields["V_z"][:, 0]),
+        root_M_x=peak(fields["M_x"][:, 0]), root_M_z=peak(fields["M_z"][:, 0]), root_T=peak(fields["T"][:, 0]),
+        atm_mean=float(fields["atm"].mean()), ctm_mean=float(fields["ctm"].mean()), hold_mean=float(fields["hold"].mean()),
+        atm_peak=peak(fields["atm"]), ctm_peak=peak(fields["ctm"]), hold_peak=peak(fields["hold"]),
+        safety_factor_min=float(sf[psi_i, r_i]), safety_factor_r=float(fields["r"][r_i]),
+        safety_factor_psi=float(np.degrees(psi[psi_i])), sigma_vm_max=float(fields["sigma_vm"].max()),
+        sigma_allow=float(mat.sigma_allow), tau_allow=float(mat.tau_allow),
+        hub_thrust=float(hub_force[:, 2].mean()), hub_torque=float(-hub_moment[:, 2].mean()),
+        hub_side_force=float(np.max(np.hypot(hub_force[:, 0], hub_force[:, 1]))),
+        hub_moment_xy=float(np.max(np.hypot(hub_moment[:, 0], hub_moment[:, 1]))),
+        hub_thrust_amplitude=float(amplitude[n_blades, 2]) if n_blades < amplitude.shape[0] else float("nan"),
+    )
+    return fields
+
+def structural_summary(data, cond_idx=None) -> str:
+    '''
+    Plain-text report of structural_data: the blade-root loads, the pitch-change torques of a constant-speed unit, the
+    weakest section and the hub loads. Blade-root values are the largest over the azimuth, in N, N m and MPa.
+    '''
+    s = data["summary"]
+    title = "Structural loads" + ("" if cond_idx is None else f", flight condition {cond_idx}")
+    return "\n".join([
+        f"{title} ({s['n_blades']} blades, rigid blade, isotropic section)",
+        f"  Blade root (r = {1000 * s['r_root']:.1f} mm): retention force {s['root_N']:.1f} N | shear x/z {s['root_V_x']:.1f} / {s['root_V_z']:.1f} N | "
+        f"flap moment {s['root_M_x']:.3f} N m | edge moment {s['root_M_z']:.3f} N m | torque {s['root_T']:.3f} N m",
+        f"  Pitch-change torque (about the blade axis): aerodynamic {s['atm_mean']:+.3f} N m | centrifugal {s['ctm_mean']:+.3f} N m | "
+        f"hold {s['hold_mean']:+.3f} N m (mean), peak hold {s['hold_peak']:.3f} N m",
+        f"  Weakest section: safety factor {s['safety_factor_min']:.2f} at r = {1000 * s['safety_factor_r']:.1f} mm, "
+        f"azimuth {s['safety_factor_psi']:.0f} deg (von Mises {s['sigma_vm_max'] / 1e6:.1f} MPa, allowable {s['sigma_allow'] / 1e6:.1f} MPa)",
+        f"  Hub: thrust {s['hub_thrust']:.2f} N | shaft torque {s['hub_torque']:.3f} N m | peak side force {s['hub_side_force']:.2f} N | "
+        f"peak moment about x/y {s['hub_moment_xy']:.3f} N m | thrust at {s['n_blades']}/rev {s['hub_thrust_amplitude']:.3f} N",
+    ])
+
+def structural_peak(values, psi_index=None):
+    '''
+    One value per station from a (n_psi, n_r) array of blade loads: the entry of the chosen azimuth, or with
+    psi_index None the value of largest magnitude over the azimuth (sign kept).
+    '''
+    values = np.asarray(values)
+    if psi_index is not None:
+        return values[psi_index]
+    return values[np.argmax(np.abs(values), axis=0), np.arange(values.shape[1])]
+
+def structural_plot(data, cond_idx=None, show=True, fig=None, psi_index=None):
+    '''
+    Six panels of structural_data: axial and shear force, bending moments, torque about the span, von Mises stress
+    with the safety factor, hub loads against azimuth, and section properties. Blade loads show the mean over the
+    azimuth with the band of their range, or the single azimuth psi_index. The blend zone is shaded.
+    Draws into fig when given (cleared first).
+    '''
+    fig = plt.figure(figsize=(16, 9)) if fig is None else fig
+    fig.clear()
+    axs = fig.subplots(2, 3)
+    fig.suptitle("Structural loads" + ("" if cond_idx is None else f": flight condition {cond_idx}"), fontsize=14)
+
+    r = data["r"] * 1000
+    blend = ~data["aero"]
+    azimuth = np.degrees(data["psi"])
+    mode = "mean and range over the azimuth" if psi_index is None else f"azimuth {azimuth[psi_index]:.0f} deg"
+
+    def trace(ax, key, label, color, scale=1.0, style="-"):
+        a = np.asarray(data[key]) * scale
+        if psi_index is None:
+            ax.fill_between(r, a.min(axis=0), a.max(axis=0), color=color, alpha=0.2)
+            ax.plot(r, a.mean(axis=0), style, color=color, label=label)
+        else:
+            ax.plot(r, a[psi_index], style, color=color, label=label)
+
+    def finish(ax, title, ylabel, xlabel="Radius [mm]", shade=True):
+        if shade and blend.any():
+            ax.axvspan(r[0], r[blend][-1], color="0.9", zorder=0)
+        ax.set_title(title, fontsize=10)
+        ax.set_ylabel(ylabel)
+        ax.set_xlabel(xlabel)
+        ax.grid(True, linestyle="--", alpha=0.5)
+
+    def twin(ax, ylabel, color):
+        other = ax.twinx()
+        other.set_ylabel(ylabel, color=color)
+        other.tick_params(axis="y", labelcolor=color)
+        return other
+
+    def legend(*axes):
+        lines = [line for ax in axes for line in ax.get_lines()]
+        axes[0].legend(lines, [line.get_label() for line in lines], fontsize=8, loc="best")
+
+    # Axial force (tension) and shear forces
+    trace(axs[0, 0], "N", "Axial force N", "tab:blue")
+    shear = twin(axs[0, 0], "Shear [N]", "tab:orange")
+    trace(shear, "V_x", "Shear along the chord", "tab:orange")
+    trace(shear, "V_z", "Shear normal to the chord", "tab:green")
+    finish(axs[0, 0], "Axial and shear force", "Axial force [N]")
+    legend(axs[0, 0], shear)
+
+    # Bending moments
+    trace(axs[0, 1], "M_x", "Flap moment (about the chord)", "tab:red")
+    trace(axs[0, 1], "M_z", "Edgewise moment", "tab:purple")
+    finish(axs[0, 1], "Bending moments", "Moment [N m]")
+    axs[0, 1].legend(fontsize=8)
+
+    # Torque about the span
+    trace(axs[0, 2], "T", "Total", "black")
+    trace(axs[0, 2], "T_aero", "Aerodynamic", "tab:cyan", style="--")
+    trace(axs[0, 2], "T_inertial", "Centrifugal and inertial", "tab:olive", style="--")
+    finish(axs[0, 2], "Torque about the span", "Torque [N m]")
+    axs[0, 2].legend(fontsize=8)
+
+    # Von Mises stress against the allowable, and the safety factor
+    s = data["summary"]
+    trace(axs[1, 0], "sigma_vm", "Von Mises stress", "tab:red", scale=1e-6)
+    axs[1, 0].axhline(s["sigma_allow"] / 1e6, color="tab:red", linestyle=":", label="Allowable normal stress")
+    factor = twin(axs[1, 0], "Safety factor", "tab:blue")
+    safety = data["safety_factor"].min(axis=0) if psi_index is None else data["safety_factor"][psi_index]
+    safety = np.where(safety > 1e3, np.nan, safety)             # the unloaded tip
+    factor.plot(r, safety, "-", color="tab:blue", label="Safety factor (lowest over the azimuth)" if psi_index is None else "Safety factor")
+    factor.set_ylim(0, min(20.0, float(np.nanmax(safety)) * 1.1) if np.isfinite(safety).any() else 1.0)
+    finish(axs[1, 0], f"Stress ({mode})", "Stress [MPa]")
+    legend(axs[1, 0], factor)
+
+    # Hub loads of all blades against the azimuth of the first blade
+    forces = {"Force x": 0, "Force y": 1, "Thrust (force z)": 2}
+    for (label, k), color in zip(forces.items(), ("tab:orange", "tab:green", "tab:blue")):
+        axs[1, 1].plot(azimuth, data["hub_force"][:, k], color=color, label=label)
+    moments = twin(axs[1, 1], "Moment [N m]", "tab:red")
+    for (label, k), style in zip({"Moment x": 0, "Moment y": 1, "Moment z": 2}.items(), ("--", "-.", ":")):
+        moments.plot(azimuth, data["hub_moment"][:, k], style, color="tab:red", label=label)
+    finish(axs[1, 1], "Hub loads", "Force [N]", xlabel="Azimuth of the first blade [deg]", shade=False)
+    legend(axs[1, 1], moments)
+
+    # Section properties
+    axs[1, 2].plot(r, data["mass_per_length"] * 1000, color="tab:brown", label="Mass per length [g/m]")
+    stiffness = twin(axs[1, 2], "Second moment [mm^4]", "tab:gray")
+    stiffness.plot(r, data["I_xx"] * 1e12, color="tab:gray", label="I_xx (flap)")
+    stiffness.plot(r, data["I_zz"] * 1e12, color="tab:gray", linestyle="--", label="I_zz (edgewise)")
+    stiffness.set_yscale("log")
+    finish(axs[1, 2], "Section properties", "Mass per length [g/m]")
+    legend(axs[1, 2], stiffness)
+
+    fig.tight_layout()
+    if show:
+        plt.show(block=False)
+    return fig
+
 def debug_diagnostics_plot(params, cond_idx, show=True, fig=None, usetex=True, data=None):
     '''
     Generates a 2x2 diagnostic plot window for a specific flight condition.
@@ -624,6 +813,9 @@ if __name__ == "__main__":
         for idx, row in enumerate(rows):
             print(f"Cond: {idx:<3} | Omega: {row['omega']:<6.2f} | Motor Pwr: {row['motor_power']:<8.4f} | "
                   f"Thrust: {row['thrust']:<8.4f} | T-Err: {row['thrust_err_pct']:+.2f}%")
+        material = prop.material()
+        for idx, params in enumerate(evaluated_conditions):
+            print(structural_summary(structural_data(params, material), idx))
 
         # Post-Processing User Directives
         user_input = input("\nWould you like to plot solver outputs? (y/n): ")

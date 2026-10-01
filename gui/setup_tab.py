@@ -96,6 +96,25 @@ BLADE_GROUPS = [
         Field("cst_bound", "CST weight bound (+/-)", "float"),
         Field("min_tc", "Min t/c", "float"),
     ]),
+    ("Sweep and rake", [
+        Field("offset_r", "Control radii [m]", "floats",
+              tooltip="Radii where the pitch-axis offsets below are given, strictly increasing. Empty: an unswept blade"),
+        Field("offset_y", "Sweep [m]", "floats",
+              tooltip="Tangential offset of the pitch axis, positive toward the direction of rotation (APC SWEEP): "
+                      "a backswept tip is negative. One value per control radius, or empty for none"),
+        Field("offset_z", "Rake [m]", "floats",
+              tooltip="Axial offset of the pitch axis, positive toward the thrust direction (APC RAKE). "
+                      "One value per control radius, or empty for none"),
+    ]),
+    ("Structure", [
+        Field("mat_density", "Density [kg/m^3]", "float"),
+        Field("mat_E", "Young's modulus E [Pa]", "float"),
+        Field("mat_G", "Shear modulus G [Pa]", "float"),
+        Field("mat_sigma_allow", "Allowable normal stress [Pa]", "float"),
+        Field("mat_tau_allow", "Allowable shear stress [Pa]", "float", tooltip="0: allowable normal stress / sqrt(3)"),
+        Field("fill_factor", "Fill factor", "float",
+              tooltip="Share of the section outline that is material: 1 is solid, below 1 is a homogenised infill"),
+    ]),
 ]
 
 
@@ -124,7 +143,7 @@ class SetupTab(QWidget):
         for editor in [self.conditions, self.freeze] + [form for _, form in self.input_forms + self.blade_forms]:
             editor.edited.connect(self._mark_pending)
 
-        (blade_title, blade_form), (design_title, design_form) = self.blade_forms
+        (blade_title, blade_form), (design_title, design_form), *extra_blade_forms = self.blade_forms
         design_box = self._group(design_title, design_form)
         design_box.layout().addWidget(QLabel("Frozen radial ranges (held at their seed values)"))
         design_box.layout().addWidget(self.freeze)
@@ -135,6 +154,8 @@ class SetupTab(QWidget):
             left.addWidget(self._group(title, form))
         right.addWidget(self._group(blade_title, blade_form))
         right.addWidget(design_box)
+        for title, form in extra_blade_forms:
+            right.addWidget(self._group(title, form))
         for title, form in self.input_forms[3:]:
             right.addWidget(self._group(title, form))
         left.addStretch()

@@ -24,6 +24,9 @@ By leveraging [JAX](https://github.com/google/jax) for automatic differentiation
   * Multi-condition optimisation of motor power subject to thrust, motor power, section thickness and NeuralFoil confidence constraints, using SLSQP (SciPy) or penalised L-BFGS-B (`JAXopt` [8])
   * The induced velocity is solved with blockwise Newton and differentiated exactly by implicit differentiation, so gradients are accurate to machine precision
   * Optimises blade twist ($\beta$), chord ($c$), spanwise CST airfoil sections and operational RPM ($\omega$) simultaneously, with radial ranges of the blade optionally frozen for design purposes.
+* **Structural Loads:**
+  * Evaluates the shear, bending, torque and axial force along the blade, the pitch-change torque of a constant-speed unit (CSU) and the loads at the hub, for a swept blade or a straight one. It covers rotation, section second moments, aerodynamic loads, and Coriolis and gyroscopic terms (see [Structural Loads](#6-structural-loads)).
+  * Adds sweep and rake of the pitch axis, with a matching correction in the BEMT.
 
 ---
 
@@ -74,7 +77,7 @@ Proptimiser is designed to be configured centrally and executed from the command
 A run is described by three classes in `init.py`:
 
 * **`Inputs`**: solver settings, discretisation, model selection, cost penalties and the flight conditions (one array entry per condition).
-* **`BladeSpec`**: the blade definition. `r_foils = [0, r_hub, r_aero, r_mid..., r_tip]` splits the blade into a structural hub (`r < r_hub`, outside the BEMT domain), a blend zone (`r_hub <= r < r_aero`, a structural transition that the BEMT does not solve and that carries no force) and the aerodynamic zone, where CST airfoil sections are defined at `r_foils[2:]` and interpolated along the span. `freeze` holds radial ranges (m) where chord, twist or CST sections keep their seed values during optimisation.
+* **`BladeSpec`**: the blade definition. `r_foils = [0, r_hub, r_aero, r_mid..., r_tip]` splits the blade into a structural hub (`r < r_hub`, outside the BEMT domain), a blend zone (`r_hub <= r < r_aero`, a structural transition that the BEMT does not solve and that carries no force) and the aerodynamic zone, where CST airfoil sections are defined at `r_foils[2:]` and interpolated along the span. `freeze` holds radial ranges (m) where chord, twist or CST sections keep their seed values during optimisation. `offset_r`, `offset_y` and `offset_z` give the sweep and rake of the pitch axis (see [Structural Loads](#6-structural-loads)), and `mat_*` and `fill_factor` give the blade material.
 * **`Propeller`**: a design (chord, twist, CST sections) plus the `Inputs` and `BladeSpec` it is analysed with. It builds the solver parameters and handles all saving and loading.
 
 ```python
@@ -141,10 +144,11 @@ python app.py Currawong_V1    # open propellers/Currawong_V1.json
 
 The window has three tabs sharing one propeller, with a log panel underneath that shows everything the solvers print:
 
-* **Setup:** edit the flight conditions, solver, model, motor and penalty settings (`Inputs`) and the blade definition, bounds and frozen ranges (`BladeSpec`). **Apply** rebuilds the propeller, and invalid settings are reported next to the Apply button.
+* **Setup:** edit the flight conditions, solver, model, motor and penalty settings (`Inputs`) and the blade definition, bounds, frozen ranges, sweep and rake, and material (`BladeSpec`). **Apply** rebuilds the propeller, and invalid settings are reported next to the Apply button.
 * **Design:**
   * **Evaluate all conditions** solves every flight condition and shows thrust, power and efficiency per condition.
   * The results are shown as the live-plot panels, the 2x2 diagnostics, and a per-station table (angles, C_L, C_D, Re, dT, dQ) that can be copied or exported as CSV.
+  * **Structural** shows the loads along the blade and at the hub, the stress and safety factor, and a per-station table. The **Motion** fields set the spin acceleration, the pitch rate and acceleration of the blade, and the airframe rates. **Recalculate** reruns the structural loads only.
   * **Planform** lets you drag spline control points to reshape chord and twist.
   * **3D & Export** renders the blade and writes the Creo `.ibl` mold, core insert and parting surface.
   * **Blend saved propellers** averages saved designs.
@@ -161,7 +165,7 @@ python init.py
 ```
 
 * **Live plots:** A Matplotlib window updates the convergence plots, induced velocity fields, airfoil sections and blade shape at every reported solver step.
-* **Terminal Output:** An aligned table reports the objective (power relative to ideal), the largest constraint violation, the relative change and, for each flight condition, omega, thrust against target, motor power and P/P_ideal, followed by a final summary. Press Ctrl+C once to stop after the current iteration.
+* **Terminal Output:** An aligned table reports the objective (power relative to ideal), the largest constraint violation, the relative change and, for each flight condition, omega, thrust against target, motor power and P/P_ideal, followed by a final summary. Press Ctrl+C once to stop after the current iteration. `python results.py` also prints a structural summary for each flight condition.
 * **Exporting:** Upon convergence (or hitting the maximum iteration limit), the CLI will prompt: `Save Propeller? (y/n)`. Selecting `y` saves the propeller, its `Inputs` and `BladeSpec` to `propellers/<name>.json`.
 
 Saved propellers are reloaded with `Propeller.load("<name>")`. Files are plain JSON with named fields, so they can be read and diffed, and new fields never break old files. `prop.with_inputs(...)` and `prop.with_blade(...)` re-use a saved design with new flight conditions, discretisation or blade zones. Propellers saved in the old `.eqx` format are converted once with `Propeller.from_legacy_eqx("<name>").save("<name>")`.
@@ -192,6 +196,69 @@ Converts propeller geometry into CAD exports and 3D solid mesh generation.
 * *Aerodynamic Mold:* The exact external outer mold line (OML) boundary.
 * *Internal Insert:* An automatically offset internal core dimension adjusted for composite skin laminate thickness, used for a 3D printed insert.
 * *Parting Surface:* The 3D leading and trailing edge spatial trace defining the split line for molding halves.
+
+The exporters place every section's pitch-axis point on the swept axis (`offsets`). They cut the sections at constant radius, in the plane normal to the radial line, while the aerodynamic sections are normal to the swept span. The exported chord of a section whose span turns by an angle $L$ away from the radial line is therefore longer by $1/\cos L$ (1.5% at 10 deg, 15% at 30 deg).
+
+---
+
+### 6. Structural Loads
+
+`structure.py` evaluates the loads along the blade and at the hub of the solved flight conditions. It solves nothing itself. The aerodynamic loads come from the stored induced velocity. The cost is about one evaluation of the airfoil coefficients: 2 ms at 20 radial and 12 azimuthal stations with NeuralFoil. A cold BEMT solve takes 63 ms and a warm-started one 3 ms. All functions are `jit`, `vmap` and `grad` safe, so a structural limit can become an optimiser constraint later.
+
+```python
+import propmodel, results, structure
+
+prop, params_list, rows = results.evaluate_conditions(prop)                # solves the induced velocity
+data = results.structural_data(params_list[0], prop.material())            # numpy arrays for plots and tables
+print(results.structural_summary(data, 0))
+
+# differentiable form, one flight condition
+V_i, _ = propmodel.induced_velocity(params)
+result = structure.structural_loads(params, prop.material(), V_i=V_i)       # loads along the blade and at the hub
+stress = structure.stress_fields(result, prop.material())                   # stress and safety factor
+```
+
+#### Method
+
+| Part | Method | Result |
+|---|---|---|
+| Section | Strip integrals of the CST outline (Gauss nodes in the chordwise angle) | Area, centroid, $I_{xx}$, $I_{zz}$, $I_{xz}$, torsion constant $J = A^4/(40 I_p)$ |
+| Inertia | Every blade slice is a rigid body that follows the hub (spin, airframe rates) and the pitch change. $F = -m'a$ and $M = -(J'\dot\omega_s + \omega_s \times J'\omega_s)$, with $a = \dot\omega_h \times p + \omega_h \times (\omega_h \times p) + 2\,\omega_h \times (\nu \times p) + \dot\nu \times p + \nu \times (\nu \times p)$ | Centrifugal, Euler, Coriolis and gyroscopic loads, and the centrifugal twisting moment $\tfrac12 \omega^2 (I_{zz}-I_{xx})\sin 2\beta$ |
+| Statics | Force summation from the tip to the root with 3D position vectors (trapezoid rule). It is exact for any sweep, because a cantilever blade is statically determinate | Axial force, shear, flap and edgewise moment, torque at every station and azimuth |
+| Hub | The root loads of the $N$ blades, summed on the hub frame by Fourier series over the azimuth (only multiples of $N$ per revolution survive) | Thrust, torque, side forces, hub moments and their $N$/rev amplitudes |
+| Stress | $\sigma = N/A + a_x x + a_z z$ at the outline points (the product of inertia is included), torsion $T t_{max}/J$ and shear, von Mises, divided by the fill factor | Safety factor against `mat_sigma_allow` and `mat_tau_allow` |
+
+The pitch-change torque of a CSU is the moment about the radial axis through the hub centre. It has an aerodynamic part (ATM) and an inertial part. The inertial part holds the centrifugal twisting moment (CTM) and the pitch-acceleration terms. The hold torque is $-(\text{ATM} + \text{CTM})$.
+
+A rigid blade in steady rotation has no Coriolis load. The term is nonzero for the pitch rate (a CSU at work, set in `structure.Kinematics`) and for the airframe rates (gyroscopic loads). It would also be nonzero for flap and lag rates. Those need an aeroelastic time model that this code does not have.
+
+#### Frames and signs
+
+* Blade frame $(e_r, e_t, e_z)$, right-handed: $e_r$ radial at the root azimuth, $e_t$ the direction of blade motion, $e_z$ the thrust direction. The shaft turns at $+\omega\,e_z$.
+* Section axes $(x_s, s, z_s)$: the chord direction at the section twist (leading to trailing edge), the span direction, and the normal toward the suction side. They match the CAD axes of the exported blade (X chordwise, Y radial, Z thrust).
+* Positive twist $\beta$ and positive $C_M$ are nose-up, a rotation about $+s$. Positive twist lifts the leading edge toward $+e_z$.
+* Hub frame: $x$ at azimuth 0, $y$ at 90 deg, $z = e_z$. The hub loads are the loads of the blades on the hub, so the torque the shaft supplies is minus the hub moment about $z$.
+* `structural_loads` returns the force and moment that the blade outboard of each station applies to the blade inboard of it. Axial force is positive in tension.
+
+#### Inputs
+
+* **Material** (`BladeSpec`): one isotropic material over the CST outline. The fields are `mat_density` (kg/m³), `mat_E` and `mat_G` (Pa), the allowables `mat_sigma_allow` and `mat_tau_allow` (Pa, 0 means $\sigma/\sqrt3$) and `fill_factor`. The defaults follow the APC propeller files (specific gravity 1.7, E 19.7 GPa). The allowables are placeholders: set them from the real material. A fill factor below 1 is a homogenised infill. Mass and stiffness scale with it, and the stress in the material is the gross stress divided by it. A hollow moulded shell is stiffer for its mass than this, so the model is conservative for it.
+* **Sweep and rake** (`BladeSpec`): `offset_r` (control radii, m), `offset_y` (tangential offset of the pitch axis, positive toward the direction of rotation, as APC `SWEEP`: a backswept tip has a negative offset) and `offset_z` (axial offset, positive toward the thrust side, as APC `RAKE`). Empty offsets are an unswept blade. The offsets are fixed geometry, not optimiser variables. A PCHIP spline joins the control points. The offsets are held outboard of the last point and taper to zero at the hub centre inboard of the first point. `Propeller.from_apc(path, use_apc_sweep=True)` takes them from an APC file. It puts the pitch axis a quarter chord behind the leading-edge parting line.
+* **Motion** (`structure.Kinematics`): spin acceleration, pitch rate and acceleration of the blade about its axis, and the airframe rates (p, q, r). All are zero by default.
+
+#### Sweep in the BEMT
+
+The station radius stays the polar radius from the rotation axis, so the BEMT annuli keep their radii. A swept blade (`ModelConfig.swept`) takes a section frame normal to its pitch axis. The relative velocity along the span is dropped (the independence principle, as in AeroDyn 15). Lift and drag act normal to the span. The load per unit radius carries the factor $ds/dr$ of the span. With zero offsets the formulas equal the unswept ones, and a test pins this. An unswept blade runs the original code. The correction is first order. It has no vortex-method validation. It uses the polar radius in the Du-Selig and tip-loss corrections. The effect on thrust is second order in the sweep angle. The moment arms of the loads are exact.
+
+#### Limits
+
+* The blade is rigid. There is no elastic deflection, centrifugal stiffening or untwist, and no fatigue, vibration or flutter model.
+* The shear centre is the centroid, and $J$ is an approximation (within 10% for a thin section). The model has no laminate: use `fill_factor` for an equivalent solid.
+* The hub stub inside `r_hub` has no mass. The root station carries the root loads, and the blade root is the first station.
+* The section area of the CST model sits about 6% below the APC 10x6 Clark-Y sections outboard, and lower in the thick moulded root and the rounded tip. Check the root, which governs the safety factor.
+* With the Prandtl loss on, the blade-element loads have no loss factor, so the structural thrust is above `thrust()` near the tip. This is conservative.
+* The azimuth grid resolves the harmonics below `n_psi / 2`. Use 24 or more azimuth stations for hub spectra.
+* `tilt` is not wired into the aerodynamics, so it does not change the loads.
 
 ---
 

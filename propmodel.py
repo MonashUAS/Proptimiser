@@ -1,6 +1,8 @@
 ## Define All Physical Properties for Given Propeller Geometry
 
 # External Libraries
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 import equinox as eqx
@@ -9,6 +11,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Internal Libraries
+import geometry
 from init import Inputs, BladeSpec, Params, Propeller
 from airfoil import aero_coeffs
 from airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskEfficiency, resultantVelocityComponents, high_induction_correction
@@ -38,7 +41,96 @@ def motorPower(torque: float, omega: float, I_0: float = 0.7, R_m: float = 0.120
 
     return P_in
 
+## Azimuthal averaging
+
+def azimuth_mean(x: jnp.ndarray, axis: int = 1) -> jnp.ndarray:
+    '''
+    Average over one rotation of a field sampled on the azimuth grid. psi is a uniform periodic grid that stops one
+    step short of 2 pi, so the rule for a full turn is the plain mean. jnp.trapezoid(x, x=psi) would end at
+    psi[-1] and drop the last interval: a constant field would integrate to (n_psi - 1) / n_psi of its true value.
+    The integral over a turn is 2 pi * azimuth_mean(x).
+    '''
+    return jnp.mean(x, axis=axis)
+
+
 ## Blade Element Theory
+
+class BladeForces(NamedTuple):
+    '''
+    Aerodynamic loads of ONE blade per unit polar radius at every (station, azimuth), each of shape (n_r, n_psi).
+    The force components are on the air basis (rho, t, a) of the swept section frame (geometry.SectionFrame), with
+    f_z the thrust (along e_z = -a). They are N/m, and the pitching moment m_s about the pitch axis (nose-up
+    positive, along the span direction s) is N m/m.
+    '''
+    f_rho: jnp.ndarray
+    f_t: jnp.ndarray
+    f_z: jnp.ndarray
+    m_s: jnp.ndarray
+    C_L: jnp.ndarray
+    C_D: jnp.ndarray
+    C_M: jnp.ndarray
+    V_R: jnp.ndarray
+    phi: jnp.ndarray
+
+def _force_components(V_i: jnp.ndarray, params: Params) -> BladeForces:
+    '''
+    Blade-element loads of one blade from the section flow (V_R, phi) and coefficients. The section sees the flow
+    normal to the span, with lift normal to it and drag along it; the load per unit polar radius carries the factor
+    ds/dr of the span. The pitching moment uses the section chord and C_M about the quarter chord, which is the pitch
+    axis of the aerodynamic zone. Unswept (arc = 1, c = t, n = a), these reduce to dT_blade and dH_blade.
+    '''
+    V_R, phi = resultantVelocityComponents(V_i, params)
+    C_L, C_D, C_M = aero_coeffs(V_i, params)
+
+    frame = geometry.section_frame(params.r, params.offsets)
+    col = lambda x: x[:, None]
+    q_c = 0.5 * params.rho * params.c[:, None] * V_R ** 2 * col(frame.arc)
+    cos_phi, sin_phi = jnp.cos(phi), jnp.sin(phi)
+
+    # drag along d = cos(phi) c + sin(phi) n, lift along l = sin(phi) c - cos(phi) n
+    f_rho = q_c * (C_L * (sin_phi * col(frame.c_rho) - cos_phi * col(frame.n_rho))
+                   + C_D * (cos_phi * col(frame.c_rho) + sin_phi * col(frame.n_rho)))
+    f_t = q_c * col(frame.c_t) * (C_L * sin_phi + C_D * cos_phi)
+    f_a = q_c * (C_L * (sin_phi * col(frame.c_a) - cos_phi * col(frame.n_a))
+                 + C_D * (cos_phi * col(frame.c_a) + sin_phi * col(frame.n_a)))
+    m_s = q_c * params.c[:, None] * C_M
+    return BladeForces(f_rho, f_t, -f_a, m_s, C_L, C_D, C_M, V_R, phi)
+
+class SectionalLoads(NamedTuple):
+    '''
+    Loads of ONE blade per unit polar radius at every (station, azimuth), on the blade frame (e_r, e_t, e_z):
+    f (n_r, n_psi, 3) in N/m, m (n_r, n_psi, 3) in N m/m (the pitching moment about the pitch axis, along the span
+    direction), and the section flow and coefficients. The azimuth grid is that of the pitch-axis point of each
+    station: the blade root is at psi - g(r), with g the sweep angle of the station. Zero in the blend zone.
+    '''
+    f: jnp.ndarray
+    m: jnp.ndarray
+    C_L: jnp.ndarray
+    C_D: jnp.ndarray
+    C_M: jnp.ndarray
+    V_R: jnp.ndarray
+    phi: jnp.ndarray
+
+def sectional_forces(V_i: jnp.ndarray, params: Params) -> SectionalLoads:
+    '''
+    Aerodynamic loads of one blade at every station and azimuth for the induced velocity V_i (3, n_r, n_psi), as the
+    blade-element side of the BEMT sees them (no Prandtl loss factor). The aerodynamic zone only: the blend zone
+    carries no force. Averaged over azimuth and times N, f gives dT_blade and dH_blade.
+    '''
+    b = _force_components(V_i, params)
+    frame = geometry.section_frame(params.r, params.offsets)
+    sin_g, cos_g = frame.sin_g[:, None], frame.cos_g[:, None]
+
+    # air basis (rho, t, a) -> blade frame: rho = cos g e_r + sin g e_t, t = sin g e_r - cos g e_t, a = -e_z
+    f = jnp.stack([cos_g * b.f_rho + sin_g * b.f_t, sin_g * b.f_rho - cos_g * b.f_t, b.f_z], axis=-1)
+
+    # span direction on the blade frame, from its components on (rho, tau, e_z) with tau = -sin g e_r + cos g e_t
+    s = jnp.stack([frame.cos_g * frame.s_rho - frame.sin_g * frame.s_tau,
+                   frame.sin_g * frame.s_rho + frame.cos_g * frame.s_tau, frame.s_z], axis=-1)
+    m = b.m_s[..., None] * s[:, None, :]
+
+    aero = aero_zone(params)[:, None, None]
+    return SectionalLoads(jnp.where(aero, f, 0.0), jnp.where(aero, m, 0.0), b.C_L, b.C_D, b.C_M, b.V_R, b.phi)
 
 def dT_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
     """
@@ -61,20 +153,24 @@ def dT_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
     the inclusion of the prandtl loss parameter 'F'
     """
     # Unpack parameters
-    N, c, psi = params.N, params.c, params.psi # geometric and positional values
+    N, c = params.N, params.c # geometric values
     rho = params.rho # air density
 
-    # Calculate Local Flow Properties
-    V_R, phi = resultantVelocityComponents(V_i, params)
+    if params.cfg.swept:
+        # Thrust of the section in the swept frame, per unit polar radius
+        dT_blade_instantaneous = _force_components(V_i, params).f_z
+    else:
+        # Calculate Local Flow Properties
+        V_R, phi = resultantVelocityComponents(V_i, params)
 
-    # Get Aerodynamic Coefficients
-    C_L, C_D, _ = aero_coeffs(V_i, params)
+        # Get Aerodynamic Coefficients
+        C_L, C_D, _ = aero_coeffs(V_i, params)
 
-    # Blade Element Theory instantaneous thrust element
-    dT_blade_instantaneous = 0.5 * rho * c[:, None] * (V_R**2) * (C_L * jnp.cos(phi) - C_D * jnp.sin(phi))
-    
-    # Average thrust in each annulus over one rotation
-    dT_blade_ave = N / (2 * jnp.pi) * jnp.trapezoid(dT_blade_instantaneous, x=psi, axis=1)
+        # Blade Element Theory instantaneous thrust element
+        dT_blade_instantaneous = 0.5 * rho * c[:, None] * (V_R**2) * (C_L * jnp.cos(phi) - C_D * jnp.sin(phi))
+
+    # Average thrust in each annulus over one rotation, summed over the N blades
+    dT_blade_ave = N * azimuth_mean(dT_blade_instantaneous)
 
     if params.cfg.V_i_0_verbose >= 2:
         jax.debug.print("  [BEMT] dT_blade: {dT_blade_ave}", dT_blade_ave=dT_blade_ave)
@@ -104,20 +200,24 @@ def dH_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
     side; it is applied to the momentum thrust and torque in thrust() and torque().
     """
     # Unpack parameters
-    N, c, psi = params.N, params.c, params.psi # geometric and positional values
+    N, c = params.N, params.c # geometric values
     rho = params.rho # air density
 
-    # Calculate Local Flow Properties
-    V_R, phi = resultantVelocityComponents(V_i, params)
-    
-    # Get Aerodynamic Coefficients
-    C_L, C_D, _ = aero_coeffs(V_i, params)
+    if params.cfg.swept:
+        # In-plane force of the section normal to the polar radius, in the swept frame, per unit polar radius
+        dH_blade_ave = N * azimuth_mean(_force_components(V_i, params).f_t)
+    else:
+        # Calculate Local Flow Properties
+        V_R, phi = resultantVelocityComponents(V_i, params)
 
-    # Inner integral term
-    inner = (V_R**2) * (C_L * jnp.sin(phi) + C_D * jnp.cos(phi))
+        # Get Aerodynamic Coefficients
+        C_L, C_D, _ = aero_coeffs(V_i, params)
 
-    # Average hub force per annulus over one rotation
-    dH_blade_ave = N / (4 * jnp.pi) * rho * c * jnp.trapezoid(inner, x=psi, axis=1)
+        # Inner integral term
+        inner = (V_R**2) * (C_L * jnp.sin(phi) + C_D * jnp.cos(phi))
+
+        # Average hub force per annulus over one rotation, summed over the N blades
+        dH_blade_ave = N / 2 * rho * c * azimuth_mean(inner)
 
     if debug:
         print("------dH_blade DEBUG------")
@@ -190,7 +290,7 @@ def dT_momentum(V_i: jnp.ndarray, params: Params, debug: bool = False, apply_tip
     V_ia = V_i[0]
 
     # Momentum theory about annular element
-    r, psi = params.r, params.psi
+    r = params.r
     V_x, V_yz = params.V_x, params.V_yz
     rho = params.rho
 
@@ -210,8 +310,8 @@ def dT_momentum(V_i: jnp.ndarray, params: Params, debug: bool = False, apply_tip
     # Route through lax.switch inside airflow.py for conditional modifications
     dT_element_corrected = high_induction_correction(dT_element_classical, V_ia, F, params)
 
-    # Integrate over psi to get the average thrust per annulus
-    dT_momentum_ave = jnp.trapezoid(dT_element_corrected, x=psi, axis=1)
+    # Integrate over one full turn of psi to get the thrust per annulus
+    dT_momentum_ave = 2 * jnp.pi * azimuth_mean(dT_element_corrected)
 
     if debug:
         print("------dT_momentum DEBUG------")
@@ -245,12 +345,12 @@ def dQ_momentum(V_i, params, debug=False, apply_tip_loss=True):
     V_it = V_i[1]  # shape (n_r, n_psi)
 
     # Momentum theory about annular element
-    r, psi = params.r, params.psi
+    r = params.r
     V_x, V_yz = params.V_x, params.V_yz
     rho = params.rho
 
     V_R, phi = resultantVelocityComponents(V_i, params)
-   
+
     if apply_tip_loss:
         tip_loss, root_loss = tip_root_loss_factors(phi, params)
         F = jnp.multiply(tip_loss, root_loss)
@@ -265,8 +365,8 @@ def dQ_momentum(V_i, params, debug=False, apply_tip_loss=True):
     # dQ element per radian (omitting dr to match dT_momentum format)
     dQ_element_classical = 2 * rho * (r[:, None] ** 2) * V_it * V_prime * F
 
-    # Integrate over psi to get the average torque per annulus
-    dQ_momentum_ave = jnp.trapezoid(dQ_element_classical, x=psi, axis=1)
+    # Integrate over one full turn of psi to get the torque per annulus
+    dQ_momentum_ave = 2 * jnp.pi * azimuth_mean(dQ_element_classical)
 
     if debug:
         print("------dQ_momentum DEBUG------")
@@ -383,8 +483,9 @@ def _station_subset(params, idx):
     Params holding only the radial stations idx. The BEMT residuals of a station depend on no other station, so
     the subset gives the same residuals for those stations.
     '''
-    return eqx.tree_at(lambda p: (p.r, p.dr, p.c, p.beta, p.V_i_0), params,
-                       (params.r[idx], params.dr[idx], params.c[idx], params.beta[idx], params.V_i_0[:, idx]))
+    return eqx.tree_at(lambda p: (p.r, p.dr, p.c, p.beta, p.offsets, p.V_i_0), params,
+                       (params.r[idx], params.dr[idx], params.c[idx], params.beta[idx], params.offsets[idx],
+                        params.V_i_0[:, idx]))
 
 def _bracketed_root(f, x0, aux0, todo, ftol, h0=0.25, max_expand=12, max_iter=100):
     '''

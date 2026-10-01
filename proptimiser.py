@@ -96,6 +96,13 @@ def _trapezoid_weights(x):
     dx = jnp.diff(x)
     return jnp.concatenate([dx[:1], dx[1:] + dx[:-1], dx[-1:]]) / 2
 
+def _periodic_weights(x):
+    """
+    Weights of the full-turn rule on a uniform periodic grid that stops one step short of its period (the azimuth
+    grid): every sample carries one step. _trapezoid_weights would halve the first and last samples.
+    """
+    return jnp.full_like(x, 2 * jnp.pi / x.shape[0])
+
 def condition_outputs(params) -> ConditionOutputs:
     """
     Physical outputs of ONE flight condition.
@@ -116,7 +123,7 @@ def condition_outputs(params) -> ConditionOutputs:
     # it; the floor on V_R matches the Reynolds number in aero_coeffs
     V_R, _ = airfoil.resultantVelocityComponents(V_i, params)
     log_load = (2 * jnp.log(jnp.maximum(V_R, 1e-6)) + jnp.log(_trapezoid_weights(params.r))[:, None]
-                + jnp.log(_trapezoid_weights(params.psi))[None, :])
+                + jnp.log(_periodic_weights(params.psi))[None, :])
     return ConditionOutputs(motor_power, thrust, propmodel.actuator_disk_power(params.thrust_target, params),
                             jax.nn.logsumexp(log_load, axis=1), jax.nn.logsumexp(log_load + log_confidence, axis=1),
                             V_i_0)
@@ -180,13 +187,6 @@ def planform_penalty(params_struct):
     """
     Chord smoothness penalty: w_smooth times the mean, over aerodynamic-zone stations, of the squared second
     difference of log(chord). Zero for a geometric (exponential) taper.
-
-    The BEMT annuli are independent, so nothing in the physics couples neighbouring chords, and the energy ratio
-    is nearly flat along the span (power per unit thrust within about 25% at every station). A station can then
-    sit at the minimum chord. Its thrust and power both scale with its chord, so the objective's gradient in that
-    chord stays finite as the chord goes to zero, and a penalty that is quadratic in chord (bounded gradient) can
-    lose to it. The gradient of a log-chord penalty grows as 1/chord, so it always wins near the bound, while a
-    smooth taper (second differences of log c of a few percent) costs almost nothing.
     """
     cfg = params_struct.cfg
     log_c, r = jnp.log(params_struct.c[0]), params_struct.r[0]      # geometry is shared by every flight condition

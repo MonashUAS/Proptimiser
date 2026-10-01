@@ -16,6 +16,7 @@ from PySide6.QtCore import Qt
 # Internal Imports
 import geometry
 import results
+import structure
 from init import PROP_DIR
 from gui.setup_tab import MODEL_CHOICES
 from gui.widgets import FloatEdit, LivePlotCanvas, MplCanvas, make_table, fill_table, fit_table_height
@@ -34,6 +35,14 @@ SECTION_COLUMNS = (
     ("V_R [m/s]", "V_R", 1.0, "{:.2f}"), ("Mach", "Mach", 1.0, "{:.3f}"), ("Re", "Re", 1.0, "{:.3g}"),
     ("CL", "CL", 1.0, "{:.4f}"), ("CD", "CD", 1.0, "{:.5f}"), ("dT [N/m]", "dT", 1.0, "{:.3f}"),
     ("dQ [Nm/m]", "dQ", 1.0, "{:.4f}"),
+)
+
+# (header, structural_data key, scale, format): the largest value over the azimuth, or that of the chosen azimuth
+STRUCTURE_COLUMNS = (
+    ("r [mm]", "r", 1000.0, "{:.1f}"), ("N [N]", "N", 1.0, "{:.1f}"), ("Shear x [N]", "V_x", 1.0, "{:.2f}"),
+    ("Shear z [N]", "V_z", 1.0, "{:.2f}"), ("Flap M [N m]", "M_x", 1.0, "{:.4f}"), ("Edge M [N m]", "M_z", 1.0, "{:.4f}"),
+    ("Torque [N m]", "T", 1.0, "{:.4f}"), ("Von Mises [MPa]", "sigma_vm", 1e-6, "{:.2f}"),
+    ("Shear stress [MPa]", "tau", 1e-6, "{:.2f}"), ("Safety factor", "safety_factor", 1.0, "{:.2f}"),
 )
 
 STALE_STYLE = "color: #d35400;"
@@ -146,6 +155,7 @@ class DesignTab(QWidget):
         self.views.addTab(self.perf_canvas, "Performance")
         self.views.addTab(self.diag_canvas, "Diagnostics")
         self.views.addTab(self._build_sections_view(), "Sectional data")
+        self.views.addTab(self._build_structural_view(), "Structural")
         self.views.addTab(self._build_planform_view(), "Planform")
         self.export_view = self._build_export_view()
         self.views.addTab(self.export_view, "3D && Export")
@@ -161,7 +171,7 @@ class DesignTab(QWidget):
         layout.addWidget(left)
         layout.addWidget(right, 1)
 
-        for canvas in (self.perf_canvas, self.diag_canvas):
+        for canvas in (self.perf_canvas, self.diag_canvas, self.struct_canvas):
             canvas.message("Evaluate the design to see results")
 
         session.propeller_changed.connect(self._propeller_changed)
@@ -184,6 +194,68 @@ class DesignTab(QWidget):
         view = QWidget()
         layout = QVBoxLayout(view)
         layout.addWidget(self.section_table)
+        layout.addLayout(buttons)
+        return view
+
+    def _build_structural_view(self):
+        self.struct_canvas = MplCanvas(figsize=(14, 8))
+        self.struct_summary = QLabel("Evaluate the design to see the structural loads")
+        self.struct_summary.setWordWrap(True)
+        self.struct_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        # Motion beyond steady rotation (structure.Kinematics): all zero for a steady operating point
+        self.omega_dot = FloatEdit(0.0)
+        self.pitch_rate = FloatEdit(0.0)
+        self.pitch_accel = FloatEdit(0.0)
+        self.body_rates = [FloatEdit(0.0) for _ in range(3)]
+        self.omega_dot.setToolTip("Shaft spin acceleration")
+        self.pitch_rate.setToolTip("Rate of change of the blade pitch about its axis (a constant-speed unit at work)")
+        self.pitch_accel.setToolTip("Acceleration of the pitch change")
+        for name, edit in zip("pqr", self.body_rates):
+            edit.setToolTip(f"Airframe angular rate {name} about the hub axes (x at azimuth 0, y at 90 deg, z along the thrust)")
+        self.azimuth_choice = QComboBox()
+        self.azimuth_choice.addItem("Envelope")
+        self.azimuth_choice.currentIndexChanged.connect(self._draw_structural_current)
+        self.recalc_button = QPushButton("Recalculate")
+        self.recalc_button.setToolTip("Recalculates the structural loads of the evaluated design with the motion set here. "
+                                      "Change the material in Setup, then evaluate again.")
+        self.recalc_button.clicked.connect(self.recalculate_structure)
+
+        controls = QFormLayout()
+        controls.addRow("Spin acceleration [rad/s^2]", self.omega_dot)
+        controls.addRow("Pitch rate [deg/s]", self.pitch_rate)
+        controls.addRow("Pitch acceleration [deg/s^2]", self.pitch_accel)
+        body = QHBoxLayout()
+        for name, edit in zip("pqr", self.body_rates):
+            edit.setMaximumWidth(60)
+            body.addWidget(QLabel(name))
+            body.addWidget(edit)
+        controls.addRow("Airframe rates [deg/s]", body)
+        controls.addRow("Blade azimuth", self.azimuth_choice)
+        controls.addRow(self.recalc_button)
+        controls_box = QGroupBox("Motion")
+        controls_box.setLayout(controls)
+        controls_box.setMaximumWidth(330)
+
+        self.struct_table = make_table([h for h, *_ in STRUCTURE_COLUMNS])
+        copy_button = QPushButton("Copy table")
+        copy_button.clicked.connect(self.copy_structure)
+        csv_button = QPushButton("Export CSV...")
+        csv_button.clicked.connect(self.export_structure)
+        buttons = QHBoxLayout()
+        buttons.addWidget(QLabel("Blade loads: largest over the azimuth (or the chosen azimuth), per radial station"))
+        buttons.addStretch()
+        buttons.addWidget(copy_button)
+        buttons.addWidget(csv_button)
+
+        top = QHBoxLayout()
+        top.addWidget(controls_box)
+        top.addWidget(self.struct_summary, 1)
+        view = QWidget()
+        layout = QVBoxLayout(view)
+        layout.addLayout(top)
+        layout.addWidget(self.struct_canvas, 3)
+        layout.addWidget(self.struct_table, 1)
         layout.addLayout(buttons)
         return view
 
@@ -283,7 +355,7 @@ class DesignTab(QWidget):
         self.eval_status.setText(message)
 
     def _busy_changed(self, busy, _):
-        for button in (self.eval_button, self.refresh_3d_button, self.export_button):
+        for button in (self.eval_button, self.refresh_3d_button, self.export_button, self.recalc_button):
             button.setEnabled(not busy)
 
     def _view_changed(self, index):
@@ -293,10 +365,26 @@ class DesignTab(QWidget):
                 self.update_3d()
 
     ## Evaluation
+    def _kinematics(self):
+        '''
+        structure.Kinematics from the Motion fields (deg and rad/s in the GUI, SI inside); ValueError on bad input.
+        '''
+        degrees = np.pi / 180.0
+        return structure.Kinematics(
+            omega_dot=np.asarray(self.omega_dot.value()), pitch_rate=np.asarray(self.pitch_rate.value() * degrees),
+            pitch_accel=np.asarray(self.pitch_accel.value() * degrees),
+            body_rates=np.array([edit.value() for edit in self.body_rates]) * degrees)
+
     def evaluate(self):
+        try:
+            kin = self._kinematics()
+        except ValueError as e:
+            QMessageBox.warning(self, "Motion", str(e))
+            return
         if not self.session.try_begin("Evaluating flight conditions"):
             return
         prop = self.session.prop
+        material = prop.material()
         started = time.time()
         self.eval_status.setStyleSheet("")
         self.eval_status.setText("Evaluating... (the first run compiles the model, which can take a minute)")
@@ -305,7 +393,8 @@ class DesignTab(QWidget):
             prop_warm, params_list, rows = results.evaluate_conditions(prop)
             snaps = [results.plot_snapshot(p) for p in params_list]
             diags = [results.diagnostics_data(p) for p in params_list]
-            return prop, prop_warm, rows, snaps, diags, time.time() - started
+            structural = [results.structural_data(p, material, kin) for p in params_list]
+            return prop, prop_warm, rows, snaps, diags, (params_list, material, structural), time.time() - started
 
         task = Task(work, self)
         task.done.connect(self._evaluated)
@@ -314,8 +403,9 @@ class DesignTab(QWidget):
         task.start()
 
     def _evaluated(self, result):
-        source, prop_warm, rows, snaps, diags, seconds = result
-        self.evaluation = dict(rows=rows, snaps=snaps, diags=diags)
+        source, prop_warm, rows, snaps, diags, (params_list, material, structural), seconds = result
+        self.evaluation = dict(rows=rows, snaps=snaps, diags=diags, params=params_list, material=material,
+                               structural=structural)
 
         if self.session.prop is source:
             # Keep the solved induced velocity as the warm start; the design itself is unchanged
@@ -358,6 +448,92 @@ class DesignTab(QWidget):
         fill_table(self.section_table, [
             [diag[key][i] * scale for _, key, scale, _ in SECTION_COLUMNS] for i in range(len(diag["r"]))
         ], formats=[fmt for *_, fmt in SECTION_COLUMNS])
+
+        n_psi = len(self.evaluation["structural"][idx]["psi"])
+        if self.azimuth_choice.count() != n_psi + 1:
+            self.azimuth_choice.blockSignals(True)
+            self.azimuth_choice.clear()
+            self.azimuth_choice.addItem("Envelope")
+            self.azimuth_choice.addItems([f"{np.degrees(a):.0f} deg" for a in self.evaluation["structural"][idx]["psi"]])
+            self.azimuth_choice.blockSignals(False)
+        self._draw_structural(idx)
+
+    ## Structural loads
+    def _draw_structural_current(self, *_):
+        self._draw_structural(self.condition.currentIndex())
+
+    def _draw_structural(self, idx):
+        if self.evaluation is None or idx < 0:
+            return
+        data = self.evaluation["structural"][idx]
+        psi_index = None if self.azimuth_choice.currentIndex() <= 0 else self.azimuth_choice.currentIndex() - 1
+        results.structural_plot(data, idx, show=False, fig=self.struct_canvas.figure, psi_index=psi_index)
+        self.struct_canvas.draw()
+        self.struct_summary.setText(results.structural_summary(data, idx))
+
+        def column(key):
+            values = np.asarray(data[key])
+            if key == "r":
+                return values
+            if key == "safety_factor":
+                safety = values.min(axis=0) if psi_index is None else values[psi_index]
+                return np.where(safety > 1e3, np.nan, safety)           # the unloaded tip
+            if key in ("sigma_vm", "tau"):
+                return values.max(axis=0) if psi_index is None else values[psi_index]
+            return results.structural_peak(values, psi_index)
+
+        columns = [column(key) * scale for _, key, scale, _ in STRUCTURE_COLUMNS]
+        fill_table(self.struct_table, [list(row) for row in zip(*columns)],
+                   formats=[fmt for *_, fmt in STRUCTURE_COLUMNS])
+
+    def recalculate_structure(self):
+        if self.evaluation is None:
+            QMessageBox.information(self, "Structural loads", "Evaluate the design first")
+            return
+        try:
+            kin = self._kinematics()
+        except ValueError as e:
+            QMessageBox.warning(self, "Motion", str(e))
+            return
+        if not self.session.try_begin("Recalculating the structural loads"):
+            return
+        params_list, material = self.evaluation["params"], self.evaluation["material"]
+
+        def work(report):
+            return [results.structural_data(p, material, kin) for p in params_list]
+
+        task = Task(work, self)
+        task.done.connect(self._structure_recalculated)
+        task.failed.connect(self._task_failed)
+        task.finished.connect(self.session.end)
+        task.start()
+
+    def _structure_recalculated(self, structural):
+        if self.evaluation is None:
+            return
+        self.evaluation["structural"] = structural
+        self._draw_structural(self.condition.currentIndex())
+
+    def _structure_rows(self):
+        headers = [h for h, *_ in STRUCTURE_COLUMNS]
+        rows = [[self.struct_table.item(i, j).text() for j in range(len(headers))]
+                for i in range(self.struct_table.rowCount())]
+        return headers, rows
+
+    def copy_structure(self):
+        headers, rows = self._structure_rows()
+        QApplication.clipboard().setText("\n".join("\t".join(row) for row in [headers] + rows))
+
+    def export_structure(self):
+        if self.evaluation is None:
+            return
+        default = geometry.EXPORT_DIR / f"{self.session.name}_C{self.condition.currentIndex()}_structure.csv"
+        path, _ = QFileDialog.getSaveFileName(self, "Export structural loads", str(default), "CSV (*.csv)")
+        if not path:
+            return
+        headers, rows = self._structure_rows()
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows([headers] + rows)
 
     ## Sectional data
     def _section_rows(self):
@@ -448,8 +624,9 @@ class DesignTab(QWidget):
 
         def work(report):
             geom = geometry.blade_export_geometry(prop)
-            r, c, beta, pitch_axis, coords = geom
-            mesh = geometry.build_propeller_mesh(r, c, beta, coords, pitch_axis=pitch_axis, num_blades=prop.blade.N)
+            r, c, beta, pitch_axis, coords, offsets = geom
+            mesh = geometry.build_propeller_mesh(r, c, beta, coords, pitch_axis=pitch_axis, num_blades=prop.blade.N,
+                                                 offsets=offsets)
             return prop, geom, mesh
 
         task = Task(work, self)
@@ -501,17 +678,18 @@ class DesignTab(QWidget):
         n_camber = self.n_camber.value()
 
         def work(report):
-            r, c, beta, pitch_axis, coords = cached if cached is not None else geometry.blade_export_geometry(prop)
+            r, c, beta, pitch_axis, coords, offsets = cached if cached is not None else geometry.blade_export_geometry(prop)
             written = []
             for kind, name in targets:
                 if kind == "parting":
                     written.append(geometry.export_parting_surface_ibl(
                         r, c, beta, coords, np.array(prop.blade.r_foils), name, pitch_axis=pitch_axis,
-                        x_margin=x_margin, y_margin=y_margin, n_camber_points=n_camber, out_dir=out_dir))
+                        x_margin=x_margin, y_margin=y_margin, n_camber_points=n_camber, out_dir=out_dir,
+                        offsets=offsets))
                 else:
                     written.append(geometry.export_to_creo_ibl(
                         r, c, beta, coords, name, pitch_axis=pitch_axis,
-                        skin_thickness=laminate if kind == "insert" else 0.0, out_dir=out_dir))
+                        skin_thickness=laminate if kind == "insert" else 0.0, out_dir=out_dir, offsets=offsets))
             return written
 
         task = Task(work, self)
