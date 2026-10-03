@@ -1,0 +1,52 @@
+schema: prop-performance
+schema_version: 1
+producer: APC-geometry-via-Proptimiser
+kind: muas_bemt
+prop_id: APC_20x8E_nr50
+source:
+  repository: Propcalc-2_prop-er_faster_stronger
+  commit: apc
+  files:
+  - 20x8E-PERF.PE0
+  note: Chord and twist from the APC file. Default blade and inputs of apc_model.
+    The number of radial stations is 50. The design points are the default flight
+    conditions, not APC design points. Solver code from commit 8d23f17.
+D_m: 0.508
+blades: 2
+rho: 1.225
+model:
+  inflow_model: 0
+  coeff_method: 3
+  tip_loss_model: 0
+  root_loss_model: 0
+  rot_corr_model: 0
+  bemt_type:
+  - true
+  - true
+  - false
+  n_r: 50
+  n_psi: 12
+  V_yz_mps: 0.0
+design_points:
+- thrust_target_N: 15.9
+  thrust_solved_N: 22.296279497110167
+  omega_rad_s: 588.0
+  V_x_mps: 18.0
+  V_yz_mps: 3.0
+  shaft_power_W: 548.7972973381413
+  motor_power_W: 620.279965886992
+- thrust_target_N: 60.0
+  thrust_solved_N: 66.16474085728328
+  omega_rad_s: 650.0
+  V_x_mps: 0.8
+  V_yz_mps: 3.0
+  shaft_power_W: 972.4384105158604
+  motor_power_W: 1078.0694933198672
+motor_assumed:
+  kv: 220
+  rm: 0.037
+  i0: 2.0
+V_x_min_converged_mps: 0.0
+generated: '2026-10-03'
+exporter: export_performance.py 1.0
+csv_sha256: 7ddba2807e953ab2ed2d93c7b8e1d6c30e70de146a33b32ef12aebd53a8af3e1
