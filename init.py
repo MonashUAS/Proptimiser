@@ -24,10 +24,6 @@ import geometry
 PROP_DIR = Path(__file__).resolve().parent / "propellers"
 FORMAT_VERSION = 3
 
-# Inputs whose meaning changed in format 3 (Newton BEMT solve, relative-change stopping test): older files take
-# the new defaults for these
-_RESET_FROM_V2 = ("V_i_0_eps", "V_i_0_max_iter", "opt_tol")
-
 # Inputs fields holding one entry per flight condition
 CONDITION_FIELDS = ("thrust_target", "V_x", "V_yz", "omega", "tilt", "solve_omega", "solve_tilt", "objective_weight")
 
@@ -465,22 +461,10 @@ class Propeller:
     @classmethod
     def from_dict(cls, data: dict, name=None) -> "Propeller":
         version = data.get("format_version")
-        if version not in (2, FORMAT_VERSION):
+        if version != FORMAT_VERSION:
             raise ValueError(f"Unsupported propeller file format_version {version} (expected {FORMAT_VERSION})")
 
-        inputs_data = dict(data["inputs"])
-        if version == 2:
-            defaults = Inputs()
-            reset = [k for k in _RESET_FROM_V2 if k in inputs_data and inputs_data[k] != getattr(defaults, k)]
-            for k in reset:
-                del inputs_data[k]
-            if reset:
-                warnings.warn(f"Format 2 propeller file: {', '.join(reset)} reset to the defaults of the Newton BEMT "
-                              f"solve and relative-change stopping test")
-        if "verbose" in inputs_data:
-            # Files saved before the per-solver verbosity levels: the old flag drove the induced velocity solver
-            inputs_data.setdefault("V_i_0_verbose", int(inputs_data.pop("verbose")))
-        inputs = _dataclass_from_dict(Inputs, inputs_data, "inputs")
+        inputs = _dataclass_from_dict(Inputs, data["inputs"], "inputs")
         blade = _dataclass_from_dict(BladeSpec, data["blade"], "blade")
 
         state = data["state"]
@@ -491,56 +475,6 @@ class Propeller:
         if unknown:
             warnings.warn(f"Ignoring unknown state fields in propeller file: {unknown}")
         return cls(inputs, blade, name=name, **{k: state[k] for k in STATE_FIELDS if k in state})
-
-    @classmethod
-    def from_legacy_eqx(cls, name, airfoil_name: str = "arad10") -> "Propeller":
-        '''
-        Migrates prop_params_<name>.eqx from the old positional format.
-
-        The old prop_inputs_<name>.eqx is not read: it never stored flight conditions, and the physics
-        always ran on the class defaults rather than the loaded values, so Inputs() defaults (with n_r and
-        n_psi from the saved grid) reproduce the old results. The saved radial grid is kept exactly: the hub
-        sits at the first saved station with its saved chord and twist, and every section uses airfoil_name
-        (the old model used one airfoil for the whole blade).
-        '''
-        params_path = PROP_DIR / f"prop_params_{name}.eqx"
-        leaves = _read_eqx_leaves(params_path)
-        layout = _LEGACY_PARAMS_LAYOUTS.get(len(leaves))
-        if layout is None:
-            raise ValueError(f"{params_path.name} holds {len(leaves)} arrays; known legacy layouts hold {sorted(_LEGACY_PARAMS_LAYOUTS)}")
-        p = dict(zip(layout, leaves))
-
-        r, c, beta = p["r"], p["c"], p["beta"]
-        inputs = Inputs(n_r=len(r), n_psi=len(p["psi"]))
-        warnings.warn(f"{name}: legacy propeller files store no flight conditions; using the Inputs() defaults")
-
-        seed = geometry.kulfan_from_name(airfoil_name)
-        r_hub, r_tip = float(r[0]), float(r[-1])
-        r_aero = 0.5 * float(r[0] + r[1])
-        blade = BladeSpec(
-            N=int(np.ravel(p["N"])[0]),
-            r_foils=(0.0, r_hub, r_aero, 0.5 * (r_aero + r_tip), r_tip),
-            airfoils=(airfoil_name,),
-            hub_chord=float(c[0]),
-            hub_twist_deg=float(np.degrees(beta[0])),
-            hub_cst=tuple(seed.tolist()),
-        )
-
-        r_new, _ = geometry.radial_stops(blade.R_tip, blade.R_hub, inputs.n_r)
-        prop = cls(
-            inputs, blade,
-            c=np.interp(r_new, r, c),
-            beta=np.interp(r_new, r, beta),
-            cst=np.tile(seed, (blade.n_aero, 1)),
-            error_log=p["error_log"],
-            time_log=p["time_log"],
-            name=name,
-        )
-
-        # The saved induced velocity was solved for the first flight condition only
-        if p["V_i_0"].shape == prop.V_i_0[0].shape and np.all(np.isfinite(p["V_i_0"])):
-            prop = prop.with_state(V_i_0=prop.V_i_0.at[0].set(p["V_i_0"]))
-        return prop
 
     ## Derived propellers
     def with_state(self, **arrays) -> "Propeller":
@@ -742,30 +676,6 @@ def _format_json(obj, indent=0):
         items = [f"{pad}  {_format_json(v, indent + 2)}" for v in obj]
         return "[\n" + ",\n".join(items) + f"\n{pad}]"
     return json.dumps(obj)
-
-
-## Legacy .eqx reader (migration only)
-# Field order of the old params files: equinox serialised array leaves positionally, skipping strings.
-_LEGACY_PARAMS_FIELDS = (
-    "r", "dr", "psi", "dpsi", "N", "c", "beta", "c_scale", "beta_scale", "V_x", "V_yz", "omega", "omega_max",
-    "tilt", "tilt_scale", "objective_thrust", "objective_MIL", "objective_power", "objective_weight",
-    "thrust_target", "V_i_0", "error_log", "time_log", "rho", "mu", "a",
-)
-# Files written before tilt was added hold 24 arrays
-_LEGACY_PARAMS_LAYOUTS = {
-    26: _LEGACY_PARAMS_FIELDS,
-    24: tuple(f for f in _LEGACY_PARAMS_FIELDS if f not in ("tilt", "tilt_scale")),
-}
-
-def _read_eqx_leaves(path):
-    leaves = []
-    with open(path, "rb") as f:
-        while True:
-            try:
-                leaves.append(np.load(f))
-            except (EOFError, ValueError):
-                break
-    return leaves
 
 
 if __name__ == "__main__":

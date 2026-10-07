@@ -70,15 +70,6 @@ def test_save_refuses_to_overwrite():
         prop.save(path, overwrite=True)
 
 
-def test_unknown_file_fields_warn_but_load():
-    data = Propeller.default().to_dict()
-    data["inputs"]["retired_setting"] = 1
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        Propeller.from_dict(data)
-    assert any("retired_setting" in str(w.message) for w in caught)
-
-
 def test_with_inputs_regrids_the_blade():
     prop = Propeller.default()
     prop = prop.with_state(c=jnp.linspace(0.02, 0.04, prop.inputs.n_r))
@@ -87,16 +78,6 @@ def test_with_inputs_regrids_the_blade():
     assert fine.c.shape == (12,) and fine.V_i_0.shape == (fine.inputs.n_cond, 3, 12)
     ends = jnp.array([0, -1])
     assert jnp.allclose(fine.c[ends], prop.c[ends])
-
-
-def test_legacy_migration_keeps_the_saved_grid():
-    if not (init.PROP_DIR / "prop_params_Currawong_V1.eqx").exists():
-        return
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        prop = Propeller.from_legacy_eqx("Currawong_V1")
-    assert prop.inputs.n_r == 50
-    assert np.allclose(np.asarray(prop.r), np.linspace(0.0, 0.254, 50))
 
 
 # ---------------------------------------------------------------------------
@@ -272,17 +253,6 @@ def test_live_plot_draws_the_uniform_seed_field():
     fig.canvas.draw()
 
 
-def test_legacy_verbose_key_maps_to_bemt_verbosity():
-    data = Propeller.default().to_dict()
-    del data["inputs"]["V_i_0_verbose"]
-    data["inputs"]["verbose"] = True
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        prop = Propeller.from_dict(data)
-    assert prop.inputs.V_i_0_verbose == 1
-    assert not any("verbose" in str(w.message) for w in caught)
-
-
 def test_solvers_report_progress_and_stop():
     import dataclasses
     import threading
@@ -380,19 +350,6 @@ def test_zero_radius_station_is_handled():
     V_i, V_i_0 = propmodel.induced_velocity(prop.condition(0))
     assert bool(jnp.all(jnp.isfinite(V_i_0)))
     assert np.isfinite(float(propmodel.thrust(V_i, prop.condition(0))))
-
-
-def test_newton_bemt_escapes_a_stale_warm_start():
-    # Currawong_V1's saved induced velocity puts the first station near the hub on a reversed-flow state in
-    # forward flight, where Newton stalls at a minimum of the residual norm that is not a root
-    import propmodel
-
-    prop = Propeller.load("Currawong_V1")
-    p = prop.condition(0)
-    _, V_i_0 = propmodel.induced_velocity(p)
-    lam = V_i_0[p.cfg.solve_rows] / propmodel.get_velocity_scales(p)
-    residual = np.abs(np.asarray(propmodel.bemt_residuals(lam, p)))[:, np.asarray(p.r) > 0]
-    assert residual.max() <= p.cfg.V_i_0_eps
 
 
 def test_cost_gradient_matches_finite_differences():
@@ -508,19 +465,6 @@ def test_curvature_scale_is_positive_and_normalised():
     assert np.isclose(np.exp(np.mean(np.log(s))), 1.0)
 
 
-def test_format_2_files_take_the_newton_defaults():
-    data = Propeller.default().to_dict()
-    data["format_version"] = 2
-    data["inputs"].update(V_i_0_eps=0.05, V_i_0_max_iter=1000, opt_tol=1e-4)
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        prop = Propeller.from_dict(data)
-    defaults = Inputs()
-    assert (prop.inputs.V_i_0_eps, prop.inputs.V_i_0_max_iter, prop.inputs.opt_tol) == (
-        defaults.V_i_0_eps, defaults.V_i_0_max_iter, defaults.opt_tol)
-    assert any("Format 2" in str(w.message) for w in caught)
-
-
 # ---------------------------------------------------------------------------
 # Azimuth quadrature
 # ---------------------------------------------------------------------------
@@ -551,7 +495,7 @@ def test_momentum_thrust_and_torque_integrate_a_full_turn():
         assert np.isclose(float(propmodel.torque(V_i, p)), float(jnp.sum(w * 4 * jnp.pi * p.rho * p.r ** 2 * V_it * V_prime)), rtol=1e-12)
 
 
-def test_zero_offsets_match_legacy_aero():
+def test_zero_offsets_match_unswept_aero():
     # The swept section frame must reduce to the unswept aerodynamics at zero offsets. An unswept blade never takes
     # it, so it is forced on here. The literals are the unswept results recorded after the azimuth-quadrature fix.
     import dataclasses

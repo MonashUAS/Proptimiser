@@ -321,15 +321,6 @@ def test_offsets_and_material_json():
     assert back.blade.mat_density == 1500.0 and back.blade.fill_factor == 0.6
     assert np.array_equal(np.asarray(back.offsets), np.asarray(prop.offsets))
 
-    # A file written before these fields existed loads as an unswept blade with the default material
-    data = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6)).to_dict()
-    for key in ("offset_r", "offset_y", "offset_z", "mat_density", "mat_E", "mat_G", "mat_sigma_allow", "mat_tau_allow",
-                "fill_factor"):
-        del data["blade"][key]
-    old = Propeller.from_dict(data)
-    assert not old.blade.swept and not old.cfg.swept and old.blade.mat_density == BladeSpec().mat_density
-    assert not np.any(np.asarray(old.offsets))
-
 
 # ---------------------------------------------------------------------------
 # Section properties
