@@ -108,7 +108,7 @@ def test_design_yaml_rejects_a_missing_key():
 
 def test_design_yaml_rejects_another_format_version():
     data = _design_data()
-    data["format_version"] = 2
+    data["format_version"] = 99
     _raises_value_error(lambda: init.design_from_dict(data), "format_version")
 
 
@@ -126,7 +126,7 @@ def test_state_json_rejects_unknown_keys_and_other_units():
     prop = Propeller.default(inputs=Inputs(n_r=6, coeff_method=0))
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "s.state.json"
-        for change in ({"spare": 1}, {"units": {**init.STATE_UNITS, "beta": "deg"}}, {"format_version": 2}):
+        for change in ({"spare": 1}, {"units": {**init.STATE_UNITS, "beta": "deg"}}, {"format_version": 99}):
             path.write_text(json.dumps({**prop.state_dict(), **change}))
             _raises_value_error(lambda: init.load_state(path))
         data = prop.state_dict()
