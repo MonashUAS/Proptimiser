@@ -17,18 +17,34 @@ from pathlib import Path
 import equinox as eqx
 import jax.numpy as jnp
 import numpy as np
+import yaml
 
 # Internal Imports
 import geometry
 
-PROP_DIR = Path(__file__).resolve().parent / "propellers"
-FORMAT_VERSION = 3
+ROOT = Path(__file__).resolve().parent
+DESIGN_DIR = ROOT / "designs"           # hand design files: <name>.yaml
+PROP_DIR = ROOT / "propellers"          # solved state files: <name>.state.json
+DESIGN_FORMAT = 1
+STATE_FORMAT = 1
 
 # Inputs fields holding one entry per flight condition
 CONDITION_FIELDS = ("thrust_target", "V_x", "V_yz", "omega", "tilt", "solve_omega", "solve_tilt", "objective_weight")
 
 # Propeller arrays saved in the "state" section of a propeller file
 STATE_FIELDS = ("c", "beta", "cst", "omega", "tilt", "V_i_0", "error_log", "time_log")
+
+# Unit of each state array (nd: dimensionless). beta and tilt are in radians: the solver works in radians.
+STATE_UNITS = {
+    "c": "m",                   # chord at the BEMT stations, shape (n_r,)
+    "beta": "rad",              # twist at the BEMT stations, shape (n_r,)
+    "cst": "nd",                # CST weights of the aero sections, shape (n_aero, N_CST)
+    "omega": "rad/s",           # rotor speed for each flight condition, shape (n_cond,)
+    "tilt": "rad",              # blade tilt for each flight condition, shape (n_cond,)
+    "V_i_0": "m/s",             # induced velocity warm start, shape (n_cond, 3, n_r)
+    "error_log": "nd",          # relative change of the merit function for each optimiser iteration
+    "time_log": "s",            # wall time of each optimiser iteration
+}
 
 
 def _array(values, dtype=None):
@@ -76,8 +92,8 @@ class Inputs:
     # Motor Information
     I_0: float = 2.0
     R_m: float = 0.037
-    kV: float = 220
-    P_max: float = 3300
+    kV: float = 220.0
+    P_max: float = 3300.0
 
     # Cost Penalties
     # Constraint limits (every solver) and penalty weights (L-BFGS-B only; SLSQP treats the constraints exactly)
@@ -451,30 +467,12 @@ class Propeller:
     @classmethod
     def load(cls, name) -> "Propeller":
         '''
-        Loads propellers/<name>.json (or name itself when it is a path).
+        Loads the design designs/<name>.yaml and its solved state propellers/<name>.state.json.
+        A name with a folder reads <folder>/<name>.yaml and <folder>/<name>.state.json (see design_paths).
         '''
-        path = prop_path(name)
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        return cls.from_dict(data, name=path.stem)
-
-    @classmethod
-    def from_dict(cls, data: dict, name=None) -> "Propeller":
-        version = data.get("format_version")
-        if version != FORMAT_VERSION:
-            raise ValueError(f"Unsupported propeller file format_version {version} (expected {FORMAT_VERSION})")
-
-        inputs = _dataclass_from_dict(Inputs, data["inputs"], "inputs")
-        blade = _dataclass_from_dict(BladeSpec, data["blade"], "blade")
-
-        state = data["state"]
-        missing = {"c", "beta", "cst"} - set(state)
-        if missing:
-            raise ValueError(f"Propeller file state is missing {sorted(missing)}")
-        unknown = sorted(set(state) - set(STATE_FIELDS))
-        if unknown:
-            warnings.warn(f"Ignoring unknown state fields in propeller file: {unknown}")
-        return cls(inputs, blade, name=name, **{k: state[k] for k in STATE_FIELDS if k in state})
+        design_path, state_path = design_paths(name)
+        inputs, blade = load_design(design_path)
+        return cls(inputs, blade, name=design_path.stem, **load_state(state_path))
 
     ## Derived propellers
     def with_state(self, **arrays) -> "Propeller":
@@ -594,50 +592,177 @@ class Propeller:
         return jnp.where(bad[:, None, None], seed, V_i_0)
 
     ## File I/O
-    def to_dict(self) -> dict:
-        return {
-            "format_version": FORMAT_VERSION,
-            "saved": datetime.now().isoformat(timespec="seconds"),
-            "inputs": _to_json({f.name: getattr(self.inputs, f.name) for f in dataclasses.fields(self.inputs)}),
-            "blade": _to_json({f.name: getattr(self.blade, f.name) for f in dataclasses.fields(self.blade)}),
-            "state": _to_json({k: getattr(self, k) for k in STATE_FIELDS}),
-        }
+    def design_dict(self) -> dict:
+        '''
+        The design as written to designs/<name>.yaml: Inputs and BladeSpec in SI units, angles in degrees.
+        '''
+        return design_to_dict(self.inputs, self.blade)
+
+    def state_dict(self) -> dict:
+        '''
+        The solved state as written to propellers/<name>.state.json (units in STATE_UNITS).
+        '''
+        return {"format_version": STATE_FORMAT, "units": dict(STATE_UNITS),
+                **_to_json({k: getattr(self, k) for k in STATE_FIELDS})}
 
     def save(self, name=None, overwrite: bool = False) -> Path:
         '''
-        Writes the propeller to propellers/<name>.json (or to name itself when it is a path).
-        Refuses to replace an existing file unless overwrite=True. Returns the path written.
+        Writes designs/<name>.yaml and propellers/<name>.state.json (see design_paths for a name with a folder).
+        Refuses to replace an existing file unless overwrite=True. Returns the path of the design file.
         '''
         name = self.name if name is None else name
         if not name:
             raise ValueError("No propeller name given")
-        path = prop_path(name)
-        if path.exists() and not overwrite:
-            raise FileExistsError(f"{path} already exists; pass overwrite=True to replace it")
+        design_path, state_path = design_paths(name)
+        for path in (design_path, state_path):
+            if path.exists() and not overwrite:
+                raise FileExistsError(f"{path} already exists; pass overwrite=True to replace it")
 
-        # Write to a temporary file first so an interrupted save never corrupts an existing propeller
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(_format_json(self.to_dict()) + "\n")
-        os.replace(tmp, path)
+        _write_atomic(design_path, design_yaml(self.inputs, self.blade, design_path.stem))
+        _write_atomic(state_path, _format_json(self.state_dict()) + "\n")
 
-        self.name = path.stem
-        print(f"Propeller successfully written to: {path}")
-        return path
+        self.name = design_path.stem
+        print(f"Propeller written to: {design_path} and {state_path}")
+        return design_path
 
 
-def prop_path(name) -> Path:
+def design_paths(name) -> tuple:
     '''
-    propellers/<name>.json for a bare name; a name with a directory is used as given.
+    (design YAML, state JSON) paths of a propeller.
+    A bare name, or a path in designs/ or propellers/, gives designs/<name>.yaml and propellers/<name>.state.json.
+    A path in another folder gives <folder>/<name>.yaml and <folder>/<name>.state.json.
+    The suffixes .yaml and .state.json are removed from the name.
     '''
     path = Path(name)
-    if not path.name.endswith(".json"):
-        path = path.with_name(path.name + ".json")
-    return PROP_DIR / path if path.parent == Path(".") else path
+    stem = path.name
+    for suffix in (".state.json", ".yaml"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+    folder = path.parent
+    if folder == Path(".") or folder.resolve() in (DESIGN_DIR.resolve(), PROP_DIR.resolve()):
+        return DESIGN_DIR / f"{stem}.yaml", PROP_DIR / f"{stem}.state.json"
+    return folder / f"{stem}.yaml", folder / f"{stem}.state.json"
 
 
-## JSON helpers
+## Design YAML
+# Inputs fields that hold an angle in radians: the design YAML gives them in degrees, under the key <name>_deg
+_INPUT_ANGLES = ("tilt",)
+
+DESIGN_HEADER = """\
+# Proptimiser design: {name}
+# Units: SI. Lengths m, speeds m/s, omega rad/s, thrust N, power W, I_0 A, R_m ohm, kV rpm/V,
+# density kg/m^3, E, G and allowable stresses Pa. Angles in degrees: every key that ends in _deg.
+# Dimensionless (nd): weights, tolerances, ratios, CST weights, fill_factor.
+# Every key is required. An unknown key is an error. Write floats with a dot (1.0e-8, not 1e-8).
+"""
+
+
+def _design_keys(cls) -> list:
+    names = [f.name for f in dataclasses.fields(cls)]
+    if cls is Inputs:
+        names = [f"{n}_deg" if n in _INPUT_ANGLES else n for n in names]
+    return names
+
+
+def design_to_dict(inputs: Inputs, blade: BladeSpec) -> dict:
+    '''
+    The design YAML content as plain Python values.
+    '''
+    inputs_d = {}
+    for f in dataclasses.fields(inputs):
+        value = getattr(inputs, f.name)
+        if f.name in _INPUT_ANGLES:
+            inputs_d[f"{f.name}_deg"] = _to_json(np.degrees(np.asarray(value)))
+        else:
+            inputs_d[f.name] = _to_json(value)
+    blade_d = _to_json({f.name: getattr(blade, f.name) for f in dataclasses.fields(blade)})
+    return {"format_version": DESIGN_FORMAT, "inputs": inputs_d, "blade": blade_d}
+
+
+def design_yaml(inputs: Inputs, blade: BladeSpec, name: str = "") -> str:
+    '''
+    The text of a design YAML file: the units comment block, then the values.
+    '''
+    body = yaml.safe_dump(design_to_dict(inputs, blade), sort_keys=False, default_flow_style=None, width=1000)
+    return DESIGN_HEADER.format(name=name) + body
+
+
+def design_from_dict(data: dict, source="design") -> tuple:
+    '''
+    (Inputs, BladeSpec) from the design YAML content. Rejects a missing key, an unknown key and a format_version
+    that is not DESIGN_FORMAT.
+    '''
+    if not isinstance(data, dict):
+        raise ValueError(f"{source}: the design file must hold a mapping")
+    _check_keys(data, ["format_version", "inputs", "blade"], source)
+    if data["format_version"] != DESIGN_FORMAT:
+        raise ValueError(f"{source}: format_version {data['format_version']!r} is not supported "
+                         f"(expected {DESIGN_FORMAT})")
+
+    sections = {}
+    for section, cls in (("inputs", Inputs), ("blade", BladeSpec)):
+        values = data[section]
+        if not isinstance(values, dict):
+            raise ValueError(f"{source}: '{section}' must be a mapping")
+        _check_keys(values, _design_keys(cls), f"{source} {section}")
+        kwargs = {}
+        for f in dataclasses.fields(cls):
+            if cls is Inputs and f.name in _INPUT_ANGLES:
+                kwargs[f.name] = np.radians(np.asarray(values[f"{f.name}_deg"], dtype=float))
+            elif isinstance(f.default, float) and not isinstance(values[f.name], bool):
+                kwargs[f.name] = float(values[f.name])
+            else:
+                kwargs[f.name] = values[f.name]
+        sections[section] = cls(**kwargs)
+    return sections["inputs"], sections["blade"]
+
+
+def load_design(path) -> tuple:
+    '''
+    (Inputs, BladeSpec) from a design YAML file.
+    '''
+    path = Path(path)
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    return design_from_dict(data, path.name)
+
+
+## State JSON
+def load_state(path) -> dict:
+    '''
+    The solved state arrays (STATE_FIELDS) from a state JSON file. Rejects a missing or unknown key, other units
+    and a format_version that is not STATE_FORMAT.
+    '''
+    path = Path(path)
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    _check_keys(data, ["format_version", "units", *STATE_FIELDS], path.name)
+    if data["format_version"] != STATE_FORMAT:
+        raise ValueError(f"{path.name}: format_version {data['format_version']!r} is not supported "
+                         f"(expected {STATE_FORMAT})")
+    if data["units"] != STATE_UNITS:
+        raise ValueError(f"{path.name}: units {data['units']} differ from {STATE_UNITS}")
+    return {k: data[k] for k in STATE_FIELDS}
+
+
+## File helpers
+def _check_keys(data: dict, expected, source):
+    missing = [k for k in expected if k not in data]
+    unknown = sorted(set(data) - set(expected))
+    if missing or unknown:
+        raise ValueError(f"{source}: missing keys {missing}, unknown keys {unknown}")
+
+
+def _write_atomic(path, text):
+    # Write to a temporary file first so an interrupted save never corrupts an existing file
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
 def _checked(name, value, shape):
     array = jnp.asarray(value, dtype=float)
     if array.shape != tuple(shape):
@@ -654,13 +779,6 @@ def _to_json(value):
     if isinstance(value, np.generic):
         return value.item()
     return value
-
-def _dataclass_from_dict(cls, data: dict, section: str):
-    known = {f.name for f in dataclasses.fields(cls)}
-    unknown = sorted(set(data) - known)
-    if unknown:
-        warnings.warn(f"Ignoring unknown {section} fields in propeller file: {unknown}")
-    return cls(**{k: v for k, v in data.items() if k in known})
 
 def _format_json(obj, indent=0):
     '''

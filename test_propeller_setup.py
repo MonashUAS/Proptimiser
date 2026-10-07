@@ -1,7 +1,7 @@
 """
 test_propeller_setup.py
 
-Checks for the run-setup refactor: JSON propeller files, Inputs reaching the physics,
+Checks for the run setup: design YAML and state JSON files, Inputs reaching the physics,
 spanwise CST sections, the NeuralFoil port, the optimiser design space (radial mask + blend zone),
 live plotting of the seed state, verbosity settings, optimiser progress reporting, the Newton BEMT
 solve and the normalised constrained problem.
@@ -34,7 +34,7 @@ import proptimiser
 # File I/O and run setup
 # ---------------------------------------------------------------------------
 
-def test_json_roundtrip_is_exact():
+def test_design_and_state_roundtrip_is_exact():
     prop = Propeller.default(blade=BladeSpec(freeze={"c": [(0.1, 0.2)]}))
     prop = prop.with_state(c=jnp.linspace(0.02, 0.04, prop.inputs.n_r))
     with tempfile.TemporaryDirectory() as tmp:
@@ -44,7 +44,8 @@ def test_json_roundtrip_is_exact():
         assert jnp.array_equal(getattr(prop, k), getattr(back, k)), k
     assert back.blade == prop.blade
     assert back.cfg == prop.cfg
-    assert back.to_dict()["inputs"] == prop.to_dict()["inputs"]
+    assert back.design_dict() == prop.design_dict()
+    assert back.state_dict() == prop.state_dict()
 
 
 def test_loaded_inputs_reach_the_physics():
@@ -68,6 +69,80 @@ def test_save_refuses_to_overwrite():
         else:
             raise AssertionError("save() replaced an existing file without overwrite=True")
         prop.save(path, overwrite=True)
+
+
+def _design_data():
+    import yaml
+    prop = Propeller.default(inputs=Inputs(n_r=6, coeff_method=0))
+    return yaml.safe_load(init.design_yaml(prop.inputs, prop.blade, "t"))
+
+
+def _raises_value_error(fn, *words):
+    try:
+        fn()
+    except ValueError as e:
+        assert all(w in str(e) for w in words), str(e)
+    else:
+        raise AssertionError("no ValueError")
+
+
+def test_design_yaml_rejects_an_unknown_key():
+    for section in ("inputs", "blade"):
+        data = _design_data()
+        data[section]["retired_setting"] = 1
+        _raises_value_error(lambda: init.design_from_dict(data), "retired_setting")
+    data = _design_data()
+    data["extra"] = {}
+    _raises_value_error(lambda: init.design_from_dict(data), "extra")
+
+
+def test_design_yaml_rejects_a_missing_key():
+    for section, key in (("inputs", "V_x"), ("inputs", "kV"), ("blade", "r_foils"), ("blade", "mat_E")):
+        data = _design_data()
+        del data[section][key]
+        _raises_value_error(lambda: init.design_from_dict(data), key)
+    data = _design_data()
+    del data["blade"]
+    _raises_value_error(lambda: init.design_from_dict(data), "blade")
+
+
+def test_design_yaml_rejects_another_format_version():
+    data = _design_data()
+    data["format_version"] = 2
+    _raises_value_error(lambda: init.design_from_dict(data), "format_version")
+
+
+def test_design_yaml_gives_angles_in_degrees():
+    data = _design_data()
+    assert "tilt" not in data["inputs"] and data["inputs"]["tilt_deg"] == [0.0, 0.0]
+    data["inputs"]["tilt_deg"] = [90.0, 0.0]
+    data["inputs"]["V_i_0_eps"] = "1e-8"            # PyYAML reads 1e-8 as a string: float fields convert it
+    inputs, _ = init.design_from_dict(data)
+    assert np.isclose(float(inputs.tilt[0]), np.pi / 2) and inputs.V_i_0_eps == 1e-8
+
+
+def test_state_json_rejects_unknown_keys_and_other_units():
+    import json
+    prop = Propeller.default(inputs=Inputs(n_r=6, coeff_method=0))
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "s.state.json"
+        for change in ({"spare": 1}, {"units": {**init.STATE_UNITS, "beta": "deg"}}, {"format_version": 2}):
+            path.write_text(json.dumps({**prop.state_dict(), **change}))
+            _raises_value_error(lambda: init.load_state(path))
+        data = prop.state_dict()
+        del data["V_i_0"]
+        path.write_text(json.dumps(data))
+        _raises_value_error(lambda: init.load_state(path), "V_i_0")
+
+
+def test_saved_designs_load():
+    names = sorted(p.stem for p in init.DESIGN_DIR.glob("*.yaml"))
+    assert {"Currawong_V1", "currawong_v2", "currawong_v2_solved", "currawong_v2_structural"} <= set(names)
+    for name in names:
+        design_path, state_path = init.design_paths(name)
+        inputs, blade = init.load_design(design_path)
+        state = init.load_state(state_path)
+        assert np.shape(state["c"]) == (inputs.n_r,) and np.shape(state["cst"]) == (blade.n_aero, geometry.N_CST)
 
 
 def test_with_inputs_regrids_the_blade():
