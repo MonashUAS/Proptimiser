@@ -373,7 +373,7 @@ class Propeller:
 
     Holds the Inputs, the BladeSpec, the design arrays (c and beta at the BEMT stations, cst at r_foils[2:])
     and the per-condition operating state (omega, tilt, V_i_0). Builds Params for the solver and handles
-    all file I/O, one JSON file per propeller in propellers/.
+    all file I/O: designs/<name>.yaml (Inputs, BladeSpec) and propellers/<name>.state.json (the arrays).
     '''
     def __init__(self, inputs: Inputs, blade: BladeSpec, c, beta, cst, omega=None, tilt=None, V_i_0=None,
                  error_log=None, time_log=None, name=None):
