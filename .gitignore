@@ -8,6 +8,9 @@ tensorboard_logs/
 /tmp/
 /logs/
 
+# Generated files: Creo .ibl geometry and contract A .h5 exports
+/exports/
+
 # C extensions
 *.so
 
