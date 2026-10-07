@@ -5,6 +5,8 @@ import sys
 import warnings
 from pathlib import Path
 
+import yaml
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QFontDatabase, QKeySequence, QTextCursor
 from PySide6.QtWidgets import (
@@ -12,7 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 # Internal Imports
-from init import PROP_DIR, Propeller
+from init import DESIGN_DIR, Propeller
 from gui.design_tab import DesignTab
 from gui.optimise_tab import OptimiseTab
 from gui.setup_tab import SetupTab
@@ -129,12 +131,12 @@ class MainWindow(QMainWindow):
     def open(self):
         if not self._discard_ok():
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Open propeller", str(PROP_DIR), "Propeller (*.json)")
+        path, _ = QFileDialog.getOpenFileName(self, "Open design", str(DESIGN_DIR), "Design (*.yaml)")
         if not path:
             return
         try:
             prop = Propeller.load(path)
-        except (OSError, ValueError, KeyError) as e:
+        except (OSError, ValueError, KeyError, yaml.YAMLError) as e:
             QMessageBox.critical(self, "Open failed", f"{Path(path).name}: {e}")
             return
         self._replace(prop, Path(path), dirty=False)
@@ -163,8 +165,8 @@ class MainWindow(QMainWindow):
         return self._write(self.session.path)
 
     def save_as(self) -> bool:
-        default = PROP_DIR / f"{self.session.name}.json"
-        path, _ = QFileDialog.getSaveFileName(self, "Save propeller", str(default), "Propeller (*.json)")
+        default = DESIGN_DIR / f"{self.session.name}.yaml"
+        path, _ = QFileDialog.getSaveFileName(self, "Save design", str(default), "Design (*.yaml)")
         return bool(path) and self._write(Path(path))
 
     def _write(self, path) -> bool:

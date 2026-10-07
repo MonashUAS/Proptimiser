@@ -2,6 +2,7 @@
 Proptimiser graphical interface.
 
     python app.py                   # start from the default propeller
+    python app.py currawong_v2      # open designs/currawong_v2.yaml and propellers/currawong_v2.state.json
 
 '''
 
@@ -35,8 +36,8 @@ def main(argv):
     app.setApplicationName("Proptimiser")
 
     if len(argv) > 1:
-        path = init.prop_path(argv[1])
-        prop = init.Propeller.load(path)
+        prop = init.Propeller.load(argv[1])
+        path = init.design_paths(argv[1])[0]
     else:
         path, prop = None, init.Propeller.default()
 

@@ -17,7 +17,7 @@ from PySide6.QtCore import Qt
 import geometry
 import results
 import structure
-from init import PROP_DIR
+from init import DESIGN_DIR
 from gui.setup_tab import MODEL_CHOICES
 from gui.widgets import FloatEdit, LivePlotCanvas, MplCanvas, make_table, fill_table, fit_table_height
 from gui.workers import Task
@@ -68,7 +68,7 @@ class BlendDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Blend saved propellers")
-        self.names = sorted(p.stem for p in PROP_DIR.glob("*.json"))
+        self.names = sorted(p.stem for p in DESIGN_DIR.glob("*.yaml"))
 
         self.table = make_table(["Propeller", "Weight"])
         self.table.setRowCount(len(self.names))

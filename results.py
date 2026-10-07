@@ -793,7 +793,7 @@ if __name__ == "__main__":
 
     from matplotlib.animation import FuncAnimation
 
-    # propellers/<name>.json to evaluate, blended by weight
+    # designs/<name>.yaml (with propellers/<name>.state.json) to evaluate, blended by weight
     prop_names = ["Currawong_V1"]
     weights = np.array([1.0])
     # unit test propeller

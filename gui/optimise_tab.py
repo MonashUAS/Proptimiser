@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 # Internal Imports
 import proptimiser
 import results
-from init import PROP_DIR
+from init import DESIGN_DIR
 from gui.widgets import LivePlotCanvas, make_table, fill_table, fit_table_height
 from gui.workers import Task
 
@@ -270,8 +270,8 @@ class OptimiseTab(QWidget):
     def save_result(self):
         if self.result is None:
             return
-        default = PROP_DIR / f"{self.result.name or 'prop'}_{datetime.now().strftime('%Y%m%d-%H%M')}.json"
-        path, _ = QFileDialog.getSaveFileName(self, "Save optimised propeller", str(default), "Propeller (*.json)")
+        default = DESIGN_DIR / f"{self.result.name or 'prop'}_{datetime.now().strftime('%Y%m%d-%H%M')}.yaml"
+        path, _ = QFileDialog.getSaveFileName(self, "Save optimised design", str(default), "Design (*.yaml)")
         if not path:
             return
         try:
