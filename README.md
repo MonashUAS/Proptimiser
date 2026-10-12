@@ -219,6 +219,52 @@ Limits:
 - The material allowables are placeholders. Set them from the real material.
 - `tilt` does not change the aerodynamics, so it does not change the loads.
 
+## Use a propeller in a CasADi problem
+
+`casadi_prop.PropellerModel` puts a solved propeller in an AeroSandbox (or CasADi) `Opti` problem.
+Use it to size a quadcopter, a quadplane or a fixed-wing UAV with a real BEMT propeller model.
+
+```python
+import aerosandbox as asb
+from casadi_prop import PropellerModel
+from init import Propeller
+
+model = PropellerModel.from_propeller(Propeller.load("currawong_v2_solved"), n_psi=1)   # axial flight
+
+opti = asb.Opti()
+omega = opti.variable(init_guess=500.0, lower_bound=100.0)                 # rad/s
+rotor = model.add_to(opti, omega_rad_s=omega, V_x_m_s=18.0, V_yz_m_s=0.0, thrust_scale_N=5.0)
+model.warm_start(opti, rotor, 500.0, 18.0, 0.0, 5.0)                       # optional: start at the JAX solution
+opti.subject_to(rotor.thrust_N == 4.0)
+opti.minimize(rotor.shaft_power_W)
+sol = opti.solve()
+```
+
+- The geometry is fixed: chord, twist and sections come from the `Propeller`.
+- The flight state is free. Pass numbers or Opti expressions for `omega_rad_s`, `V_x_m_s`, `V_yz_m_s` and the air
+  properties `rho_kg_m3`, `mu_Pa_s` and `a_m_s`.
+- `add_to` adds the induced velocity ratios as variables and the BEMT residuals as equality constraints.
+  IPOPT solves the BEMT together with the vehicle. Call `add_to` once for each rotor and each flight state.
+- `thrust_scale_N` scales the unknowns and the residuals. It is not a constraint. Use the thrust you expect.
+- `add_to` returns `thrust_N`, `torque_Nm` and `shaft_power_W` as expressions.
+- Use `n_psi=1` when `V_yz` is zero. The model is about 9 times faster and gives the same loads.
+  Use the default azimuth grid for edgewise flight (a lift rotor in forward flight).
+- `warm_start` runs the JAX solver at a numeric flight state and starts the variables there.
+  The solve from the default start takes 4 IPOPT iterations in the tests. The warm start takes 0.
+
+Limits:
+
+- The CasADi backend runs the parametric and NeuralFoil section models (`coeff_method` 0 and 3).
+  The table models (1 and 2) run on JAX only.
+- Chord, twist and sections are constants. The CasADi problem cannot size the blade.
+- The model gives thrust, torque and power. It does not give the in-plane hub force or the side force.
+- The airfoil model is NeuralFoil, trained for Reynolds numbers of about 1e4 to 1e7.
+  Check the confidence output (`airfoil.aero_coeffs(..., return_log_confidence=True)`) on JAX for a new design.
+
+The BEMT physics is written against one array namespace (`backend.py`).
+`ModelConfig.backend` selects `"jax"` or `"casadi"`. The Newton solver stays on JAX.
+`tests/test_backend_parity.py` checks that both backends give the same residuals, loads and coefficients.
+
 ## Tests
 
 ```bash
