@@ -38,6 +38,36 @@ def angular_stops(n_psi):
     dpsi = jnp.ones_like(psi) * (2 * jnp.pi) / n_psi
     return psi, dpsi
 
+def point_layout(r, psi):
+    """
+    Constants of the flat point layout: a field on the (n_r, n_psi) grid is one vector of p = n_r * n_psi points,
+    ordered station by station (point k sits at station k // n_psi, azimuth k % n_psi).
+
+    Returns (E_r, M_psi, r_pt, psi_pt) as NumPy arrays:
+        E_r (p, n_r)      expands a per-station vector to the points
+        M_psi (n_r, p)    averages the points of each station over one turn
+        r_pt, psi_pt (p,) radius and azimuth of each point
+    """
+    r, psi = np.asarray(r, dtype=float), np.asarray(psi, dtype=float)
+    n_r, n_psi = r.shape[0], psi.shape[0]
+    E_r = np.kron(np.eye(n_r), np.ones((n_psi, 1)))
+    M_psi = E_r.T / n_psi
+    return E_r, M_psi, E_r @ r, np.tile(psi, n_r)
+
+def cst_station_weights(r, r_cst):
+    """
+    Matrix W (n_r, n_cst) with W @ cst equal to cst_at_stations(r, r_cst, cst): the linear interpolation onto
+    the stations, with the end sections held outside [r_cst[0], r_cst[-1]]. A constant, so it works on any backend.
+    """
+    r, r_cst = np.asarray(r, dtype=float), np.asarray(r_cst, dtype=float)
+    W = np.zeros((r.shape[0], r_cst.shape[0]))
+    for i, ri in enumerate(r):
+        for j in range(r_cst.shape[0]):
+            e = np.zeros(r_cst.shape[0])
+            e[j] = 1.0
+            W[i, j] = np.interp(ri, r_cst, e)
+    return W
+
 ### CST (Kulfan) Airfoil Functions
 def kulfan_from_name(name, n_weights_per_side=N_CST_WEIGHTS):
     """
