@@ -701,7 +701,7 @@ def aero_coeffs(V_i, params, return_log_confidence=False):
 
     # Section shape and thickness at each radial station, then at each point
     kulfan = xp.matmul(params.W_cst, params.cst)
-    t_over_c = pt(max_thickness(kulfan))
+    t_over_c = pt(xp.const(max_thickness(kulfan)))
 
     # Natively calls the instantiated class
     outputs = params.airfoil_interp(AoA_eff, Re, Mach, kulfan=xp.matmul(params.E_r, kulfan), t_over_c=t_over_c,

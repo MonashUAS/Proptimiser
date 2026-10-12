@@ -53,6 +53,13 @@ def equivelantActuatorDiskEfficiency(T, params):
 
     return eta_actuator_disk
 
+def section_frame_of(params):
+    """
+    geometry.section_frame of the stations of params, as constants of the backend array type.
+    """
+    xp = ops(params.cfg)
+    return geometry.SectionFrame(*(xp.const(v) for v in geometry.section_frame(params.r, params.offsets)))
+
 def station_to_points(x, params):
     '''
     Expands a per-station quantity (n_r,) to the flat point layout (p,), p = n_r * n_psi (see geometry.point_layout).
@@ -77,7 +84,7 @@ def swept_section_velocity(V_axial_net, V_norml_net, V_radial_net, params):
     The component along the span is dropped (independence principle): only the velocity normal to the
     pitch axis makes lift. Unswept: (u_n, u_c) = (V_axial_net, V_norml_net).
     '''
-    frame = geometry.section_frame(params.r, params.offsets)
+    frame = section_frame_of(params)
     pt = lambda x: station_to_points(x, params)
     u_c = pt(frame.c_rho) * V_radial_net + pt(frame.c_t) * V_norml_net + pt(frame.c_a) * V_axial_net
     u_n = pt(frame.n_rho) * V_radial_net + pt(frame.n_a) * V_axial_net
@@ -106,9 +113,9 @@ def resultantVelocityComponents(V_i, params, plotting=False):
     r_pt, psi_pt = station_to_points(params.r, params), params.psi_pt
 
     # Extract the induced velocity components from the state vector
-    V_i_a = V_i[0] # Axial induced velocity
-    V_i_t = V_i[1] # Tangential induced velocity
-    V_i_r = V_i[2] # Radial induced velocity (unused in 2D section V_R and phi)
+    V_i_a = xp.row(V_i, 0) # Axial induced velocity
+    V_i_t = xp.row(V_i, 1) # Tangential induced velocity
+    V_i_r = xp.row(V_i, 2) # Radial induced velocity (unused in 2D section V_R and phi)
 
     # Calculate the normal component of V_yz from the total V_yz
     V_yz_perp = V_yz * xp.sin(psi_pt)
@@ -157,11 +164,12 @@ def pitt_peters(V_i_0, params):
     r_pt = station_to_points(params.r, params)
 
     V_i_pt = simple_inflow(V_i_0, params)                       # shape (3, p)
-    xi = xp.arctan2(V_yz, V_x + V_i_pt[0])                      # shape (p,), local per point
+    V_i_a, V_i_t, V_i_r = (xp.row(V_i_pt, i) for i in range(3))
+    xi = xp.arctan2(V_yz, V_x + V_i_a)                      # shape (p,), local per point
 
     skew_factor = 1.0 + ((15.0*jnp.pi)/32.0) * xp.tan(xi/2.0) * (r_pt/R) * xp.cos(psi_pt)
 
-    return xp.stack([V_i_pt[0] * skew_factor, V_i_pt[1], V_i_pt[2]], axis=0)
+    return xp.stack([V_i_a * skew_factor, V_i_t, V_i_r], axis=0)
 
 def peters_he_model(V_i_0, params):
     '''
@@ -192,7 +200,7 @@ def no_loss(phi, params):
     Returns a unity loss factor (no loss applied).
     Outputs shape matching phi: (p,)
     '''
-    return jnp.ones_like(phi)
+    return ops(params.cfg).ones_like(phi)
 
 def _smooth_floor(f, xp, eps=1e-2):
     '''

@@ -10,6 +10,7 @@ equinox==0.13.8
 interpax==0.3.14
 NeuralFoil==0.3.2
 AeroSandbox==4.2.9
+casadi==3.7.2
 PyYAML==6.0.3
 h5py==3.16.0
 pytest==9.1.1

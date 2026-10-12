@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import geometry
 from init import Inputs, BladeSpec, Params, Propeller
 from airfoil import aero_coeffs
-from airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskEfficiency, resultantVelocityComponents, high_induction_correction, station_to_points, to_grid
+from airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskEfficiency, resultantVelocityComponents, high_induction_correction, station_to_points, to_grid, section_frame_of
 from backend import JAX_OPS, ops
 
 jax.config.update("jax_enable_x64", True)
@@ -84,7 +84,7 @@ def _force_components(V_i: jnp.ndarray, params: Params) -> BladeForces:
     V_R, phi = resultantVelocityComponents(V_i, params)
     C_L, C_D, C_M = aero_coeffs(V_i, params)
 
-    frame = geometry.section_frame(params.r, params.offsets)
+    frame = section_frame_of(params)
     pt = lambda x: station_to_points(x, params)
     c_pt = pt(params.c)
     q_c = 0.5 * params.rho * c_pt * V_R ** 2 * pt(frame.arc)
@@ -125,7 +125,7 @@ def sectional_forces(V_i: jnp.ndarray, params: Params) -> SectionalLoads:
     b = _force_components(V_i, params)
     grid = lambda x: to_grid(x, params)
     f_rho, f_t, f_z, m_s = grid(b.f_rho), grid(b.f_t), grid(b.f_z), grid(b.m_s)
-    frame = geometry.section_frame(params.r, params.offsets)
+    frame = section_frame_of(params)
     sin_g, cos_g = frame.sin_g[:, None], frame.cos_g[:, None]
 
     # air basis (rho, t, a) -> blade frame: rho = cos g e_r + sin g e_t, t = sin g e_r - cos g e_t, a = -e_z
@@ -293,7 +293,7 @@ def dT_momentum(V_i: jnp.ndarray, params: Params, debug: bool = False, apply_tip
     xp = ops(params.cfg)
 
     # Unpack axial induced velocity component
-    V_ia = V_i[0]
+    V_ia = xp.row(V_i, 0)
 
     # Momentum theory about annular element
     r_pt = station_to_points(params.r, params)
@@ -348,8 +348,8 @@ def dQ_momentum(V_i, params, debug=False, apply_tip_loss=True):
     xp = ops(params.cfg)
 
     # Extract velocity components
-    V_ia = V_i[0]  # shape (p,)
-    V_it = V_i[1]  # shape (p,)
+    V_ia = xp.row(V_i, 0)  # shape (p,)
+    V_it = xp.row(V_i, 1)  # shape (p,)
 
     # Momentum theory about annular element
     r_pt = station_to_points(params.r, params)
@@ -403,6 +403,24 @@ def torque_residual(V_i, params):
     dQ_MMNT_avg = dQ_momentum(V_i, params, debug=False, apply_tip_loss=False)
     return dQ_BEMT_avg - dQ_MMNT_avg
 
+def inflow_from_lambda(lambda_i_0_guess, params):
+    """
+    The induced velocity field V_i (3, p) of the non-dimensional inflow ratios lambda_i_0_guess (k, n_r), one row for
+    each solved component. The components that are not solved are zero.
+    """
+    xp = ops(params.cfg)
+    n_r = params.r.shape[0]
+
+    # Retrieve scales and Re-dimensionalise
+    V_scale = get_velocity_scales(params)
+    V_i_0_guess_dim = lambda_i_0_guess * xp.matmul(V_scale, np.ones((1, n_r)))
+
+    # Introduce zero for non-solved components to maintain shape (3, n_r)
+    V_i_0_full = xp.matmul(np.eye(3)[:, list(params.cfg.solve_idx)], V_i_0_guess_dim)
+
+    # Expand to the point layout
+    return inflow_model(V_i_0_full, params)
+
 def bemt_residuals(lambda_i_0_guess, params):
     """
     Evaluates the coupled BEMT residuals.
@@ -411,17 +429,7 @@ def bemt_residuals(lambda_i_0_guess, params):
     """
     xp = ops(params.cfg)
     solve_idx = params.cfg.solve_idx
-    n_r = params.r.shape[0]
-
-    # Retrieve scales and Re-dimensionalise
-    V_scale = get_velocity_scales(params)
-    V_i_0_guess_dim = lambda_i_0_guess * xp.matmul(V_scale, np.ones((1, n_r)))
-
-    # Introduce zero for non-solved components to maintain shape (3, n_r)
-    V_i_0_full = xp.matmul(np.eye(3)[:, list(solve_idx)], V_i_0_guess_dim)
-
-    # Expand to the point layout
-    V_i = inflow_model(V_i_0_full, params)
+    V_i = inflow_from_lambda(lambda_i_0_guess, params)
 
     # Axial Residual (Scale by Thrust Target); Tangential Residual (Scale by Approximate Ideal Torque, to make O(1))
     Q_ref = params.thrust_target * params.cfg.R_tip
@@ -432,7 +440,7 @@ def bemt_residuals(lambda_i_0_guess, params):
         elif i == 1:
             rows.append(torque_residual(V_i, params) / Q_ref)
         else:
-            rows.append(xp.zeros_like(lambda_i_0_guess[0]))     # Radial Residual (Already O(1)) TODO:
+            rows.append(xp.zeros_like(xp.row(lambda_i_0_guess, 0)))     # Radial Residual (Already O(1)) TODO:
 
     return xp.stack(rows, axis=0)
 
@@ -741,7 +749,8 @@ def torque(V_i, params, debug=False):
     dQ_blade_ave = dQ_momentum(V_i, params, debug, apply_tip_loss=True)   # accurate, applied post-solve
 
     # Use trapezoidal integration over the aerodynamic zone to compute the total torque
-    Q = ops(params.cfg).sum(dQ_blade_ave * radial_weights(params))
+    xp = ops(params.cfg)
+    Q = xp.sum(dQ_blade_ave * xp.const(radial_weights(params)))
 
     return Q
 
@@ -752,7 +761,8 @@ def thrust(V_i, params):
     dT = dT_momentum(V_i, params, apply_tip_loss=True)   # accurate, applied post-solve
 
     # Numerically Compute Double Integral (over the aerodynamic zone) to Solve for Thrust
-    T = ops(params.cfg).sum(dT * radial_weights(params))
+    xp = ops(params.cfg)
+    T = xp.sum(dT * xp.const(radial_weights(params)))
 
     return T
 

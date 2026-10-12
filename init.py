@@ -292,10 +292,11 @@ class ModelConfig:
     w_confidence: float
     w_smooth: float
     min_confidence: float
+    backend: str = "jax"           # array namespace of the physics: "jax" or "casadi" (backend.py)
 
     @classmethod
     def build(cls, inputs: Inputs, blade: BladeSpec) -> "ModelConfig":
-        copied = [f.name for f in dataclasses.fields(cls) if f.name not in ("R_hub", "R_aero", "R_tip", "solve_idx", "swept")]
+        copied = [f.name for f in dataclasses.fields(cls) if f.name not in ("R_hub", "R_aero", "R_tip", "solve_idx", "swept", "backend")]
         return cls(
             R_hub=blade.R_hub,
             R_aero=blade.R_aero,
