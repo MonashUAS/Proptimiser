@@ -116,7 +116,7 @@ def test_rake_turns_the_normal_velocity():
     assert p.cfg.swept and np.allclose(np.asarray(p.offsets[:, 3]), m) and np.allclose(np.asarray(p.offsets[:, 0]), 0.0)
 
     rng = np.random.default_rng(3)
-    u_a, u_t, u_rho = (jnp.asarray(rng.uniform(1.0, 20.0, (6, 4))) for _ in range(3))
+    u_a, u_t, u_rho = (jnp.asarray(rng.uniform(1.0, 20.0, p.psi_pt.shape)) for _ in range(3))
     u_n, u_c = airflow.swept_section_velocity(u_a, u_t, u_rho, p)
     assert np.allclose(np.asarray(u_n), np.asarray(m * u_rho + u_a) / np.sqrt(1 + m ** 2), atol=1e-13)
     assert np.allclose(np.asarray(u_c), np.asarray(u_t), atol=1e-13)

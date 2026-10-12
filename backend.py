@@ -22,8 +22,11 @@ JAX_OPS = SimpleNamespace(
     sin=jnp.sin, cos=jnp.cos, tan=jnp.tan, arctan2=jnp.arctan2, arccos=jnp.arccos,
     sqrt=jnp.sqrt, exp=jnp.exp, log=jnp.log, tanh=jnp.tanh, abs=jnp.abs,
     maximum=jnp.maximum, minimum=jnp.minimum, clip=jnp.clip, where=jnp.where,
-    sum=jnp.sum, mean=jnp.mean,
-    concatenate=jnp.concatenate, stack=jnp.stack,
+    sum=jnp.sum, mean=jnp.mean, matmul=jnp.matmul,
+    concatenate=jnp.concatenate, stack=jnp.stack, column_stack=jnp.column_stack,
+    ones_like=jnp.ones_like, zeros_like=jnp.zeros_like,
+    vstack_scalars=lambda items: jnp.stack(items)[:, None],   # list of scalars -> column (k, 1)
+    row_add=lambda x, row: x + row,        # (p, n) + (n,): CasADi does not broadcast
     swish=jax.nn.swish,
     log_sigmoid=jax.nn.log_sigmoid,
     logaddexp=_logsumexp2,

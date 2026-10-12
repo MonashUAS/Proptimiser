@@ -320,7 +320,7 @@ class Params(eqx.Module):
     shape(psi, dpsi) = (N_psi,)
     shape(offsets) = (N_r, 4) [sweep y, rake z, dy/dr, dz/dr]
     shape(cst) = (N_foils + 1, N_CST) [hub section, then aero sections at r_foils[2:]]
-    shape(V_i) = (3, N_r, N_psi) [axial, tangential, radial]
+    shape(V_i) = (3, p) [axial, tangential, radial] on the flat point layout, p = N_r * N_psi
     '''
     # Domain of Integration
     r: jnp.ndarray          # radial stations
@@ -335,6 +335,12 @@ class Params(eqx.Module):
     cst: jnp.ndarray        # CST sections [lower x8, upper x8, LE weight, TE thickness] at r_cst
     r_cst: jnp.ndarray      # radii of the CST sections (r_foils[1:]) (m)
     offsets: jnp.ndarray    # pitch-axis offsets (N_r, 4): [y_sw, z_rk, dy_sw/dr, dz_rk/dr] (m, m, -, -), see geometry.station_offsets
+
+    # Flat point layout constants (geometry.point_layout, geometry.cst_station_weights), p = N_r * N_psi
+    E_r: jnp.ndarray        # (p, N_r) expands a per-station vector to the points
+    M_psi: jnp.ndarray      # (N_r, p) averages the points of each station over one turn
+    psi_pt: jnp.ndarray     # (p,) azimuth of each point
+    W_cst: jnp.ndarray      # (N_r, N_foils + 1) interpolates the CST sections onto the stations
 
     # Inflow / rotor state
     V_x: jnp.ndarray        # axial inflow velocity (ms^{-1})
@@ -544,6 +550,7 @@ class Propeller:
 
     def _params(self, idx, V_i_0) -> Params:
         inputs = self.inputs
+        layout = geometry.point_layout(self.r, self.psi)
         return Params(
             r=self.r, dr=self.dr,
             psi=self.psi, dpsi=self.dpsi,
@@ -553,6 +560,8 @@ class Propeller:
             cst=jnp.concatenate([jnp.asarray(self.blade.hub_cst)[None, :], self.cst]),
             r_cst=jnp.asarray(self.blade.r_cst),
             offsets=self.offsets,
+            E_r=jnp.asarray(layout[0]), M_psi=jnp.asarray(layout[1]), psi_pt=jnp.asarray(layout[3]),
+            W_cst=jnp.asarray(geometry.cst_station_weights(self.r, self.blade.r_cst)),
             V_x=inputs.V_x[idx],
             V_yz=inputs.V_yz[idx],
             omega=self.omega[idx],

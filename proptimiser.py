@@ -115,6 +115,7 @@ def condition_outputs(params) -> ConditionOutputs:
 
     if cfg.coeff_method == 3:
         _, _, _, log_confidence = airfoil.aero_coeffs(V_i, params, return_log_confidence=True)
+        log_confidence = airflow.to_grid(log_confidence, params)
     else:
         log_confidence = jnp.zeros((params.r.shape[0], params.psi.shape[0]))
 
@@ -122,6 +123,7 @@ def condition_outputs(params) -> ConditionOutputs:
     # the chord: a chord factor would let the optimiser drop a poorly modelled station from the average by shrinking
     # it; the floor on V_R matches the Reynolds number in aero_coeffs
     V_R, _ = airfoil.resultantVelocityComponents(V_i, params)
+    V_R = airflow.to_grid(V_R, params)
     log_load = (2 * jnp.log(jnp.maximum(V_R, 1e-6)) + jnp.log(_trapezoid_weights(params.r))[:, None]
                 + jnp.log(_periodic_weights(params.psi))[None, :])
     return ConditionOutputs(motor_power, thrust, propmodel.actuator_disk_power(params.thrust_target, params),

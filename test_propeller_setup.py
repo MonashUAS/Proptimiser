@@ -196,7 +196,7 @@ def test_neuralfoil_port_matches_reference():
                                leading_edge_weight=kulfan[16], TE_thickness=kulfan[17]),
         alpha=alpha_deg, Re=Re, model_size="large",
     )
-    CL, CD, CM, log_confidence = airfoil.load_airfoil_data(3).raw(jnp.radians(alpha_deg), jnp.full(4, Re), jnp.asarray(kulfan))
+    CL, CD, CM, log_confidence = airfoil.load_airfoil_data(3).raw(jnp.radians(alpha_deg), jnp.full(4, Re), jnp.tile(jnp.asarray(kulfan), (4, 1)))
 
     assert np.allclose(CL, ref["CL"], rtol=1e-8)
     assert np.allclose(CD, ref["CD"], rtol=1e-8)
@@ -227,7 +227,7 @@ def test_post_stall_blend_matches_aerosandbox():
     CD_ref = np.exp(anp.blend(separated, np.log(CD_sep + Cf_flat_plate(Re_L=Re, method="turbulent")), np.log(raw["CD"])))
 
     n = alpha_deg.size
-    CL, CD, _ = airfoil.load_airfoil_data(3)(jnp.radians(alpha_deg), jnp.full(n, Re), jnp.zeros(n), kulfan=jnp.asarray(kulfan))
+    CL, CD, _ = airfoil.load_airfoil_data(3)(jnp.radians(alpha_deg), jnp.full(n, Re), jnp.zeros(n), kulfan=jnp.tile(jnp.asarray(kulfan), (n, 1)))
     assert np.allclose(CL, CL_ref, rtol=1e-8, atol=1e-10)
     assert np.allclose(CD, CD_ref, rtol=1e-8)
 
@@ -237,10 +237,10 @@ def test_swirl_reduces_the_tangential_velocity():
     import airflow
 
     params = Propeller.default(inputs=Inputs(coeff_method=0, n_r=8, V_yz=[0.0, 0.0])).condition(0)
-    V_i = jnp.zeros((3, 8, params.psi.shape[0])).at[0].set(2.0)
+    V_i = jnp.zeros((3, params.psi_pt.shape[0])).at[0].set(2.0)
     _, phi_0 = airflow.resultantVelocityComponents(V_i, params)
     V_R, phi = airflow.resultantVelocityComponents(V_i.at[1].set(3.0), params)
-    V_t = params.omega * params.r[:, None] - 3.0
+    V_t = params.omega * (params.E_r @ params.r) - 3.0
     assert np.allclose(np.tan(phi), (params.V_x + 2.0) / V_t)
     assert np.allclose(V_R, np.hypot(params.V_x + 2.0, V_t))
     assert bool(jnp.all(phi > phi_0))
@@ -463,8 +463,10 @@ def test_confidence_constraint_is_load_weighted_and_keeps_its_gradient():
     g = np.asarray(proptimiser.constraint_values(proptimiser.evaluate_all_conditions(ps), ps, space))
     p = prop.condition(0)
     V_i, _ = propmodel.induced_velocity(p)
+    import airflow
     V_R, _ = airfoil.resultantVelocityComponents(V_i, p)
-    confidence = np.exp(np.asarray(airfoil.aero_coeffs(V_i, p, return_log_confidence=True)[3]))
+    V_R = airflow.to_grid(V_R, p)
+    confidence = np.exp(np.asarray(airflow.to_grid(airfoil.aero_coeffs(V_i, p, return_log_confidence=True)[3], p)))
     w = (np.asarray(V_R) ** 2 * np.asarray(proptimiser._trapezoid_weights(p.r))[:, None]
          * np.asarray(proptimiser._periodic_weights(p.psi))[None, :])[np.array(space.aero_stations)]
     expected = np.sum(w * confidence[np.array(space.aero_stations)]) / np.sum(w)
@@ -473,9 +475,9 @@ def test_confidence_constraint_is_load_weighted_and_keeps_its_gradient():
     # Far outside NeuralFoil's training data the confidence saturates at zero; its log still has a gradient
     raw = airfoil.load_airfoil_data(3).raw
     kulfan = jnp.asarray(geometry.kulfan_from_name("arad10"))
-    alpha = jnp.radians(-80.0)
-    d_log = jax.grad(lambda a: raw(a, 5e5, kulfan)[3])(alpha)
-    d_conf = jax.grad(lambda a: jnp.exp(raw(a, 5e5, kulfan)[3]))(alpha)
+    alpha, re, kulfan = jnp.radians(jnp.array([-80.0])), jnp.array([5e5]), kulfan[None, :]
+    d_log = jax.grad(lambda a: raw(a, re, kulfan)[3][0])(alpha)[0]
+    d_conf = jax.grad(lambda a: jnp.exp(raw(a, re, kulfan)[3][0]))(alpha)[0]
     assert np.isfinite(d_log) and abs(d_log) > 1.0 and abs(d_conf) < 1e-6
 
 
@@ -485,9 +487,9 @@ def test_prandtl_loss_follows_the_closed_form_and_vanishes_at_the_ends():
     prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=20, tip_loss_model=1, root_loss_model=1))
     p = prop.condition(0)
     r = np.asarray(p.r)
-    phi = jnp.full((len(r), 1), 0.35)
+    phi = jnp.full(p.psi_pt.shape, 0.35)
     tip, root = airflow.tip_root_loss_factors(phi, p)
-    tip, root = np.asarray(tip)[:, 0], np.asarray(root)[:, 0]
+    tip, root = np.asarray(tip).reshape(len(r), -1)[:, 0], np.asarray(root).reshape(len(r), -1)[:, 0]
     B, R_aero, R_tip = float(p.N[0]), p.cfg.R_aero, 1.05 * p.cfg.R_tip
     exact = lambda f: 2 / np.pi * np.arccos(np.exp(-f))
 
@@ -502,8 +504,8 @@ def test_prandtl_loss_follows_the_closed_form_and_vanishes_at_the_ends():
     # The root factor is small at the inboard end of the loaded blade and rises with radius; it is not floored near 0.67
     first = int(np.argmax(r >= R_aero))
     assert root[first] < 0.3 and np.isclose(root[first], exact(max(f_root[first], 0.0)), atol=0.05)
-    assert float(airflow.prandtl_root_loss(jnp.full((len(r), 1), 0.35), eqx.tree_at(
-        lambda q: q.r, p, jnp.full_like(p.r, R_aero)))[0, 0]) < 0.15       # f = 0 exactly at R_aero
+    assert float(airflow.prandtl_root_loss(phi, eqx.tree_at(
+        lambda q: q.r, p, jnp.full_like(p.r, R_aero)))[0]) < 0.15       # f = 0 exactly at R_aero
     assert np.all(np.diff(root[first:]) > 0)
     assert np.all(np.isfinite(np.asarray(jax.grad(lambda ph: jnp.sum(airflow.prandtl_root_loss(ph, p)))(phi))))
 
@@ -549,10 +551,11 @@ def test_azimuth_mean_is_the_full_turn_rule():
 
     for n_psi in (6, 12, 25):
         psi = jnp.linspace(0.0, 2 * jnp.pi, n_psi, endpoint=False)
-        assert np.isclose(float(propmodel.azimuth_mean(jnp.ones((3, n_psi)))[0]), 1.0, rtol=0, atol=1e-15)
+        p = Propeller.default(inputs=Inputs(coeff_method=0, n_r=3, n_psi=n_psi)).condition(0)
+        assert np.isclose(float(propmodel.azimuth_mean(jnp.ones(3 * n_psi), p)[0]), 1.0, rtol=0, atol=1e-15)
         # harmonics below n_psi leave only the constant term (the old trapezoid rule gave (n_psi - 1) / n_psi of it)
         field = 2.0 + jnp.sin(psi + 0.3) + 0.5 * jnp.cos(2 * psi)
-        assert np.isclose(float(propmodel.azimuth_mean(field[None, :])[0]), 2.0, rtol=0, atol=1e-14)
+        assert np.isclose(float(propmodel.azimuth_mean(jnp.tile(field, 3), p)[0]), 2.0, rtol=0, atol=1e-14)
         assert np.allclose(np.asarray(proptimiser._periodic_weights(psi)), 2 * np.pi / n_psi)
 
 
@@ -563,7 +566,7 @@ def test_momentum_thrust_and_torque_integrate_a_full_turn():
     for n_psi in (12, 24):
         p = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6, n_psi=n_psi)).condition(0)
         V_i, _ = propmodel.induced_velocity(p)
-        V_ia, V_it = V_i[0, :, 0], V_i[1, :, 0]
+        V_ia, V_it = V_i[0][::n_psi], V_i[1][::n_psi]
         V_prime = jnp.sqrt((p.V_x + V_ia) ** 2 + p.V_yz ** 2)
         w = propmodel.radial_weights(p)
         assert np.isclose(float(propmodel.thrust(V_i, p)), float(jnp.sum(w * 4 * jnp.pi * p.rho * p.r * V_ia * V_prime)), rtol=1e-12)

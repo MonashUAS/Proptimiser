@@ -222,8 +222,8 @@ def _flow_fields(params):
     y_upper, y_lower = geometry.kulfan_coordinates(params.cst, x_foil)
     kulfan_r = geometry.cst_at_stations(params.r, params.r_cst, params.cst)
     return dict(
-        V_i=V_i,
-        F=jnp.mean(tip_loss * root_loss, axis=1),
+        V_i=airflow.to_grid(V_i, params),
+        F=jnp.mean(airflow.to_grid(tip_loss * root_loss, params), axis=1),
         y_upper=y_upper,
         y_lower=y_lower,
         tc=geometry.max_thickness(kulfan_r),
@@ -477,8 +477,9 @@ def _diagnostics_fields(params):
     V_R, phi = airflow.resultantVelocityComponents(V_i, params)
     C_L, C_D, _ = airfoil.aero_coeffs(V_i, params)
 
-    VR_mean = jnp.mean(V_R, axis=1)
-    phi_deg = jnp.degrees(jnp.mean(phi, axis=1))
+    grid = lambda x: airflow.to_grid(x, params)
+    VR_mean = jnp.mean(grid(V_R), axis=1)
+    phi_deg = jnp.degrees(jnp.mean(grid(phi), axis=1))
     beta_deg = jnp.degrees(params.beta)
     flow = dict(
         phi_deg=phi_deg,
@@ -486,8 +487,8 @@ def _diagnostics_fields(params):
         V_R=VR_mean,
         Mach=VR_mean / params.a,
         Re=airflow.calc_reynolds(params.rho, jnp.maximum(VR_mean, 1e-6), params.c, params.mu),
-        CL=jnp.mean(C_L, axis=1),
-        CD=jnp.mean(C_D, axis=1),
+        CL=jnp.mean(grid(C_L), axis=1),
+        CD=jnp.mean(grid(C_D), axis=1),
         dT=propmodel.dT_blade(V_i, params),
         dQ=propmodel.dQ_blade(V_i, params),
     )

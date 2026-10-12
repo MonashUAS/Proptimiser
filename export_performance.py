@@ -84,7 +84,7 @@ def _point(params, guess):
     lam = V_i_0[params.cfg.solve_rows] / propmodel.get_velocity_scales(params)
     residual = jnp.abs(propmodel.bemt_residuals(lam, params))
     V_R, _ = airflow.resultantVelocityComponents(V_i, params)
-    reynolds = airflow.calc_reynolds(params.rho, jnp.mean(V_R, axis=1), params.c, params.mu)
+    reynolds = airflow.calc_reynolds(params.rho, jnp.mean(airflow.to_grid(V_R, params), axis=1), params.c, params.mu)
     reynolds_75 = jnp.interp(0.75 * params.cfg.R_tip, params.r, reynolds)
     return thrust, torque, jnp.max(jnp.where(propmodel.aero_zone(params), residual, 0.0)), V_i_0, reynolds_75
 

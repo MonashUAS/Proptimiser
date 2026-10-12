@@ -6,15 +6,15 @@ import numpy as np
 
 import jax
 from jax import numpy as jnp
-from jax import lax
 import matplotlib.pyplot as plt
 import interpax
 from scipy.ndimage import gaussian_filter
 import neuralfoil as nf
 from pathlib import Path
 
-from airflow import resultantVelocityComponents, calc_reynolds
-from geometry import N_CST, cst_at_stations, max_thickness
+from airflow import resultantVelocityComponents, calc_reynolds, station_to_points
+from backend import JAX_OPS, ops
+from geometry import N_CST, max_thickness
 
 from aerosandbox.geometry.airfoil.airfoil_families import (
     get_kulfan_parameters,
@@ -175,37 +175,37 @@ class ParametricInterpolator:
     def __init__(self, Cl_alpha=5.7, Cd0=0.035, AoA_0=-10.0, alpha_stall=20.0, k_smooth=30.0):
         self.Cl_alpha = Cl_alpha
         self.Cd0 = Cd0
-        self.AoA_0 = jnp.radians(AoA_0)
-        self.alpha_stall = jnp.radians(alpha_stall)
+        self.AoA_0 = np.radians(AoA_0)
+        self.alpha_stall = np.radians(alpha_stall)
         self.k_smooth = k_smooth
 
-    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_log_confidence=False):
+    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_log_confidence=False, xp=JAX_OPS):
         # Apply the zero-lift offset internally
         alpha_eff = alpha - self.AoA_0
         Cd90 = 1.98
         
         # Unstalled Regime
         Cl_lin = self.Cl_alpha * alpha_eff
-        Ct_lin = self.Cd0 * jnp.cos(alpha_eff)
-        Cn_lin = (Cl_lin + Ct_lin * jnp.sin(alpha_eff)) / jnp.cos(alpha_eff)
-        Cd_lin = Cn_lin * jnp.sin(alpha_eff) + Ct_lin * jnp.cos(alpha_eff)
+        Ct_lin = self.Cd0 * xp.cos(alpha_eff)
+        Cn_lin = (Cl_lin + Ct_lin * xp.sin(alpha_eff)) / xp.cos(alpha_eff)
+        Cd_lin = Cn_lin * xp.sin(alpha_eff) + Ct_lin * xp.cos(alpha_eff)
         
         # High Angle Regime
-        sin_a = jnp.sin(alpha_eff)
-        Cn_stall = Cd90 * sin_a / (0.56 + 0.44 * jnp.abs(sin_a))
-        Ct_stall = 0.5 * self.Cd0 * jnp.cos(alpha_eff)
+        sin_a = xp.sin(alpha_eff)
+        Cn_stall = Cd90 * sin_a / (0.56 + 0.44 * xp.abs(sin_a))
+        Ct_stall = 0.5 * self.Cd0 * xp.cos(alpha_eff)
         
-        Cl_stall = Cn_stall * jnp.cos(alpha_eff) - Ct_stall * jnp.sin(alpha_eff)
-        Cd_stall = Cn_stall * jnp.sin(alpha_eff) + Ct_stall * jnp.cos(alpha_eff)
+        Cl_stall = Cn_stall * xp.cos(alpha_eff) - Ct_stall * xp.sin(alpha_eff)
+        Cd_stall = Cn_stall * xp.sin(alpha_eff) + Ct_stall * xp.cos(alpha_eff)
         
         # Sigmoid blending
-        transition = 1 / (1 + jnp.exp(-self.k_smooth * (jnp.abs(alpha_eff) - self.alpha_stall)))
+        transition = 1 / (1 + xp.exp(-self.k_smooth * (xp.abs(alpha_eff) - self.alpha_stall)))
         
         Cl = (1 - transition) * Cl_lin + transition * Cl_stall
         Cd = (1 - transition) * Cd_lin + transition * Cd_stall
         
         Cn_final = (1 - transition) * Cn_lin + transition * Cn_stall
-        Cm = -Cn_final * (0.25 - 0.175 * (1 - 2 * jnp.abs(alpha_eff) / jnp.pi))
+        Cm = -Cn_final * (0.25 - 0.175 * (1 - 2 * xp.abs(alpha_eff) / jnp.pi))
 
         return _with_confidence((Cl, Cd, Cm), return_log_confidence)
 
@@ -276,7 +276,8 @@ class AlphaReInterpolator:
         self.cd_grid = jnp.nan_to_num(interp_vmap(self.re_grid_log, log_re_array, cd_array))
         self.cm_grid = jnp.nan_to_num(interp_vmap(self.re_grid_log, log_re_array, cm_array))
 
-    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_log_confidence=False):
+    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_log_confidence=False, xp=JAX_OPS):
+        assert xp is JAX_OPS, 'Table interpolators run on the JAX backend only'
         input_shape = jnp.shape(alpha)
         alpha_flat, re_flat, mach_flat = jnp.ravel(alpha), jnp.ravel(re), jnp.ravel(mach)
 
@@ -366,7 +367,8 @@ class AlphaMachReInterpolator:
         self.cd_grid = jnp.nan_to_num(gaussian_filter(cd_grid, sigma=(1.5, 0.8, 1.0)))
         self.cm_grid = jnp.nan_to_num(gaussian_filter(cm_grid, sigma=(1.5, 0.8, 1.0)))
 
-    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_log_confidence=False):
+    def __call__(self, alpha, re, mach, kulfan=None, t_over_c=0.10, return_log_confidence=False, xp=JAX_OPS):
+        assert xp is JAX_OPS, 'Table interpolators run on the JAX backend only'
         input_shape = jnp.shape(alpha)
         alpha_flat, mach_flat, re_flat = jnp.ravel(alpha), jnp.ravel(mach), jnp.ravel(re)
 
@@ -386,139 +388,128 @@ class AlphaMachReInterpolator:
         coeffs = Cl.reshape(input_shape), Cd.reshape(input_shape), Cm.reshape(input_shape)
         return _with_confidence(coeffs, return_log_confidence)
 
+def _mirror_matrix(n_inputs=25):
+    '''
+    Matrix F with x @ F the NeuralFoil input of the mirrored section (upper and lower surfaces swapped, alpha and the
+    camber-sign inputs negated, the two forced-transition flags swapped), the symmetry NeuralFoil is averaged over.
+    '''
+    F = np.eye(n_inputs)
+    F[:8, :8] = 0.0
+    F[8:16, 8:16] = 0.0
+    F[8:16, :8] = -np.eye(8)
+    F[:8, 8:16] = -np.eye(8)
+    F[16, 16] = -1.0
+    F[18, 18] = -1.0
+    F[23, 23] = F[24, 24] = 0.0
+    F[23, 24] = F[24, 23] = 1.0
+    return F
+
 class NeuralFoilInterpolator:
     '''
     A pure-JAX implementation of the NeuralFoil multi-layer perceptron (MLP) for aerodynamic coefficient prediction.
-    By staying in JAX, this interpolator is 100% compatible with JIT compilation and autodiff.
+    By staying in JAX, this interpolator is 100% compatible with JIT compilation and autodiff. It is written against the
+    xp namespace (backend.py) on 2D arrays, so the same code runs on CasADi.
 
     The section shape is passed on every call as CST vectors [lower x8, upper x8, LE weight, TE thickness]
-    (normalised to unit chord), so each radial station can have its own airfoil and the shape can be optimised.
+    (normalised to unit chord), one row for each point, so each radial station can have its own airfoil and the shape
+    can be optimised.
 
     Implementation mostly cloned from https://github.com/peterdsharpe/NeuralFoil/blob/master/neuralfoil/main.py
     '''
+    N_OUTPUTS = 4       # analysis confidence logit, CL, CD, CM: the network has more outputs, none of them used here
+
     def __init__(self, model_size="large"):
         # Load the pre-trained neural network weights and input scaling distributions from the neuralfoil package
         nn_weights_dir = Path(nf.__file__).parent / "nn_weights_and_biases"
-        self._scaled_input_distribution = {k: jnp.array(v) for k, v in dict(np.load(nn_weights_dir / "scaled_input_distribution.npz")).items()}
-        
-        nn_params_raw = dict(np.load(nn_weights_dir / f"nn-{model_size}.npz"))
-        self.nn_params = {k: jnp.array(v) for k, v in nn_params_raw.items()}
-        
-        self.layer_indices = sorted(list(set([int(key.split(".")[1]) for key in nn_params_raw.keys()])))
-        self.N_inputs = len(self._scaled_input_distribution["mean_inputs_scaled"])
+        self._scaled_input_distribution = {k: np.asarray(v, dtype=float) for k, v in dict(np.load(nn_weights_dir / "scaled_input_distribution.npz")).items()}
 
-    def raw(self, alpha, re, kulfan):
+        nn_params_raw = dict(np.load(nn_weights_dir / f"nn-{model_size}.npz"))
+        self.layer_indices = sorted(list(set([int(key.split(".")[1]) for key in nn_params_raw.keys()])))
+        self.nn_params = {k: np.asarray(v, dtype=float) for k, v in nn_params_raw.items()}
+        last = self.layer_indices[-1]
+        self.nn_params[f"net.{last}.weight"] = self.nn_params[f"net.{last}.weight"][:self.N_OUTPUTS]
+        self.nn_params[f"net.{last}.bias"] = self.nn_params[f"net.{last}.bias"][:self.N_OUTPUTS]
+        self.N_inputs = len(self._scaled_input_distribution["mean_inputs_scaled"])
+        self._mirror = _mirror_matrix(self.N_inputs)
+
+    def raw(self, alpha, re, kulfan, xp=JAX_OPS):
         '''
         Network outputs before the post-stall blend and Mach correction.
-        kulfan (..., N_CST) broadcasts against alpha along a trailing axis.
+        alpha and re have shape (p,), kulfan (p, N_CST).
 
-        Returns CL, CD, CM and the log of the analysis confidence (confidence 0-1), each shaped like alpha.
+        Returns CL, CD, CM and the log of the analysis confidence (confidence 0-1), each of shape (p,).
         The log is taken from the logit (log_sigmoid), so it keeps a useful gradient where the confidence itself
         saturates to zero far outside the training data.
         '''
-        alpha, re = jnp.broadcast_arrays(alpha, re)
-        alpha_deg = jnp.degrees(alpha)
-        k = jnp.broadcast_to(kulfan, alpha_deg.shape + (N_CST,))
+        zero = 0.0 * alpha
 
-        # 1. Assemble the 25-dimensional input vector along the LAST axis (-1)
+        # 1. Assemble the 25-dimensional input matrix (p, 25)
         # NeuralFoil takes the upper surface weights first
-        x = jnp.concatenate([
-            k[..., 8:16],               # upper weights
-            k[..., 0:8],                # lower weights
-            k[..., 16:17],              # leading edge weight
-            k[..., 17:18] * 50,         # TE thickness
-            jnp.stack([
-                jnp.sin(jnp.radians(2 * alpha_deg)),
-                jnp.cos(jnp.radians(alpha_deg)),
-                1 - jnp.cos(jnp.radians(alpha_deg)) ** 2,
-                (jnp.log(re) - 12.5) / 3.5,
-                jnp.zeros_like(alpha_deg), # n_crit scaling
-                jnp.ones_like(alpha_deg),  # forced transition upper
-                jnp.ones_like(alpha_deg),  # forced transition lower
-            ], axis=-1),
-        ], axis=-1) # Shape: (*input_shape, 25)
-        
-        # 2. Leading-dimension safe MLP using jnp.matmul
+        x = xp.concatenate([
+            kulfan[:, 8:16],            # upper weights
+            kulfan[:, 0:8],             # lower weights
+            kulfan[:, 16:17],           # leading edge weight
+            kulfan[:, 17:18] * 50,      # TE thickness
+            xp.column_stack([
+                xp.sin(2 * alpha),
+                xp.cos(alpha),
+                1 - xp.cos(alpha) ** 2,
+                (xp.log(re) - 12.5) / 3.5,
+                zero,                   # n_crit scaling
+                zero + 1.0,             # forced transition upper
+                zero + 1.0,             # forced transition lower
+            ]),
+        ], axis=1)
+
+        # 2. The MLP on 2D arrays
         def net(x_in):
-            layer_indices_to_iterate = self.layer_indices.copy()
-            while len(layer_indices_to_iterate) != 0:
-                i = layer_indices_to_iterate.pop(0)
-                w = self.nn_params[f"net.{i}.weight"]
-                b = self.nn_params[f"net.{i}.bias"]
-                
-                # Using jnp.matmul and w.T allows broadcasting across all leading shapes
-                x_in = jnp.matmul(x_in, w.T) + b
-                if len(layer_indices_to_iterate) != 0:
-                    x_in = jax.nn.swish(x_in)
-            return x_in # Shape: (*input_shape, out_features)
-            
+            for n, i in enumerate(self.layer_indices):
+                x_in = xp.row_add(xp.matmul(x_in, self.nn_params[f"net.{i}.weight"].T), self.nn_params[f"net.{i}.bias"])
+                if n < len(self.layer_indices) - 1:
+                    x_in = xp.swish(x_in)
+            return x_in # Shape: (p, N_OUTPUTS)
+
         def sq_mahalanobis(x_in):
-            mean = self._scaled_input_distribution["mean_inputs_scaled"]
-            inv_cov = self._scaled_input_distribution["inv_cov_inputs_scaled"]
-            
-            x_minus_mean = x_in - mean # Broadcasts mean perfectly across trailing axis
-            # Compute Mahalanobis distance strictly focusing on the final feature axis
-            return jnp.sum(jnp.matmul(x_minus_mean, inv_cov) * x_minus_mean, axis=-1)
+            x_minus_mean = xp.row_add(x_in, -self._scaled_input_distribution["mean_inputs_scaled"])
+            return xp.sum(xp.matmul(x_minus_mean, self._scaled_input_distribution["inv_cov_inputs_scaled"]) * x_minus_mean, axis=1)
 
-        # Evaluate the network
-        y = net(x)
-        y = y.at[..., 0].set(y[..., 0] - sq_mahalanobis(x) / (2 * self.N_inputs))
-        
-        # 3. Enforce symmetric consistency using slice syntax (...)
-        x_flipped = x \
-            .at[..., :8].set(x[..., 8:16] * -1) \
-            .at[..., 8:16].set(x[..., :8] * -1) \
-            .at[..., 16].set(-1 * x[..., 16]) \
-            .at[..., 18].set(-1 * x[..., 18]) \
-            .at[..., 23].set(x[..., 24]) \
-            .at[..., 24].set(x[..., 23])
-        
-        y_flipped = net(x_flipped)
-        y_flipped = y_flipped.at[..., 0].set(y_flipped[..., 0] - sq_mahalanobis(x_flipped) / (2 * self.N_inputs))
-        
-        y_unflipped = y_flipped \
-            .at[..., 1].set(y_flipped[..., 1] * -1) \
-            .at[..., 3].set(y_flipped[..., 3] * -1) \
-            .at[..., 4].set(y_flipped[..., 5]) \
-            .at[..., 5].set(y_flipped[..., 4])
-        
-        y_fused = (y + y_unflipped) / 2
-        
-        # Extract coefficients
-        log_confidence = jax.nn.log_sigmoid(y_fused[..., 0])
-        CL_raw = y_fused[..., 1] / 2
-        CD_raw = jnp.exp((y_fused[..., 2] - 2) * 2)
-        CM_raw = y_fused[..., 3] / 20
-        return CL_raw, CD_raw, CM_raw, log_confidence
+        # 3. Average the network over the section and its mirror image (constant matrix) for symmetric consistency.
+        # The mirror flips the sign of the CL and CM outputs.
+        x_flipped = xp.matmul(x, self._mirror)
+        y, y_flipped = net(x), net(x_flipped)
 
-    def __call__(self, alpha, re, mach, kulfan, t_over_c=0.10, return_log_confidence=False):
-        # 1. Wrap alpha to [-pi, pi] preserving original shape
-        alpha = jnp.mod(alpha + jnp.pi, 2 * jnp.pi) - jnp.pi
+        logit = ((y[:, 0] - sq_mahalanobis(x) / (2 * self.N_inputs))
+                 + (y_flipped[:, 0] - sq_mahalanobis(x_flipped) / (2 * self.N_inputs))) / 2
+        CL_raw = (y[:, 1] - y_flipped[:, 1]) / 2 / 2
+        CD_raw = xp.exp(((y[:, 2] + y_flipped[:, 2]) / 2 - 2) * 2)
+        CM_raw = (y[:, 3] - y_flipped[:, 3]) / 2 / 20
+        return CL_raw, CD_raw, CM_raw, xp.log_sigmoid(logit)
 
-        # Broadcast arrays together to unify their shapes automatically
-        alpha, re = jnp.broadcast_arrays(alpha, re)
+    def __call__(self, alpha, re, mach, kulfan, t_over_c=0.10, return_log_confidence=False, xp=JAX_OPS):
+        # 1. Wrap alpha to [-pi, pi]
+        alpha = xp.arctan2(xp.sin(alpha), xp.cos(alpha))
 
-        CL_raw, CD_raw, CM_raw, log_confidence = self.raw(alpha, re, kulfan)
-        CL_sep, CD_sep, CM_sep = post_stall_coefficients(alpha)
+        CL_raw, CD_raw, CM_raw, log_confidence = self.raw(alpha, re, kulfan, xp)
+        CL_sep, CD_sep, CM_sep = post_stall_coefficients(alpha, xp)
 
         # Separation blend of AeroSandbox (KulfanAirfoil.get_aero_from_neuralfoil with include_360_deg_effects):
         # NeuralFoil predicts stall itself and extrapolates well past it, so it is trusted up to about +/-20 deg and
         # hands over to the 360 deg model over about +/-6 deg. separated = 1/2 (1 + tanh(softmax(a - 20, -20 - a) / 3))
         # with a in degrees and a softmax softness of 1 deg.
-        alpha_deg = jnp.degrees(alpha)
-        switch = jax.nn.logsumexp(jnp.stack([alpha_deg - 20.0, -20.0 - alpha_deg]), axis=0) / 3.0
-        separated = 0.5 * (1.0 + jnp.tanh(switch))
+        alpha_deg = alpha * (180.0 / np.pi)
+        switch = xp.logaddexp(alpha_deg - 20.0, -20.0 - alpha_deg) / 3.0
+        separated = 0.5 * (1.0 + xp.tanh(switch))
 
         CL_inc = separated * CL_sep + (1 - separated) * CL_raw
         # Drag blends in log space; the separated drag carries turbulent flat-plate skin friction
-        CD_inc = jnp.exp(separated * jnp.log(CD_sep + 0.074 / re ** 0.2) + (1 - separated) * jnp.log(CD_raw))
+        CD_inc = xp.exp(separated * xp.log(CD_sep + 0.074 / re ** 0.2) + (1 - separated) * xp.log(CD_raw))
         CM_inc = separated * CM_sep + (1 - separated) * CM_raw
 
-        # Apply Mach corrections (which handles shapes smoothly natively)
-        coeffs = apply_mach_corrections(CL_inc, CD_inc, CM_inc, mach, t_over_c)
+        # Apply Mach corrections
+        coeffs = apply_mach_corrections(CL_inc, CD_inc, CM_inc, mach, t_over_c, xp)
         return coeffs + (log_confidence,) if return_log_confidence else coeffs
 
-def post_stall_coefficients(alpha):
+def post_stall_coefficients(alpha, xp=JAX_OPS):
     '''
     Fully separated section coefficients over 360 deg of angle of attack (rad): Truong, "An analytical model for
     airfoil aerodynamic characteristics over the entire 360 deg angle of attack range", J. Renewable Sustainable
@@ -528,20 +519,20 @@ def post_stall_coefficients(alpha):
     CM, which AeroSandbox leaves at zero, puts the normal force at a centre of pressure that moves from 0.325c to 0.5c
     behind the leading edge as the section goes from edgewise to broadside.
     '''
-    sin_a, cos_a = jnp.sin(alpha), jnp.cos(alpha)
+    sin_a, cos_a = xp.sin(alpha), xp.cos(alpha)
     Cd90 = 2.08 + 8.36e-2 * cos_a + 4.06e-1 * cos_a**2
     CN = Cd90 * sin_a
     CT = (9.00e-2 - 1.78e-1 * cos_a - 2.98e-1 * cos_a**3) * sin_a**2
     CL = CN * cos_a + CT * sin_a
     CD = CN * sin_a - CT * cos_a
-    CM = -CN * (0.25 - 0.175 * (1 - 2 * jnp.abs(alpha) / jnp.pi))
+    CM = -CN * (0.25 - 0.175 * (1 - 2 * xp.abs(alpha) / jnp.pi))
     return CL, CD, CM
 
 def _with_confidence(coeffs, return_log_confidence):
     '''
     Table and parametric models have no confidence estimate; report full confidence (log 0) when one is requested.
     '''
-    return coeffs + (jnp.zeros_like(coeffs[0]),) if return_log_confidence else coeffs
+    return coeffs + (0.0 * coeffs[0],) if return_log_confidence else coeffs
 
 ### Data Loading/Grid Utilities
 
@@ -612,44 +603,45 @@ def du_selig_correction(operands):
     Modifies C_L and C_D based on local chord-to-radius ratios.
     '''
     C_L_2D, C_D_2D, C_M, V_i, params = operands
-    
+    xp = ops(params.cfg)
+
     # Extract geometry and prevent division by zero at the exact root
-    c = params.c[:, None]
-    r = params.r[:, None]
+    c = station_to_points(params.c, params)
+    r = station_to_points(params.r, params)
     R = params.cfg.R_tip*1.05
-    
-    r_safe = jnp.maximum(r, 1e-6)
+
+    r_safe = xp.maximum(r, 1e-6)
     c_over_r = c / r_safe
     r_over_R = r_safe / R
-    
+
     # Calculate Effective Angle of Attack (AoA_eff)
-    geometric_angle = params.beta[:, None]
+    geometric_angle = station_to_points(params.beta, params)
     _, phi = resultantVelocityComponents(V_i, params)
     AoA_eff = geometric_angle - phi
-    
+
     # Calculate Du-Selig empirical factor (f1 = f2)
     denominator = 0.1267 * c_over_r + (1 - r_over_R**2) / r_over_R
-    f1 = (1 / (2 * jnp.pi)) * (1.6 * c_over_r) / jnp.maximum(denominator, 1e-6)
+    f1 = (1 / (2 * jnp.pi)) * (1.6 * c_over_r) / xp.maximum(denominator, 1e-6)
 
     tip_fade = 1.0 - (r_over_R ** 2)
     f1 = f1 * tip_fade
-    
+
     # Correct Lift
     # C_L_inv is the theoretical 2D inviscid lift (2 * pi * AoA_eff)
     C_L_inv = 2 * jnp.pi * (AoA_eff + 0.035) # Estimate zero-lift angle
     C_L_3D = C_L_2D + f1 * (C_L_inv - C_L_2D)
-    
+
     # Correct Drag
     C_D0 = 0.015 # zero-lift drag
     C_D_3D = C_D_2D - f1 * (C_D_2D - C_D0)
-    
+
     # Ensure physical drag bounds (prevents f1 from forcing drag below baseline)
-    C_D_3D = jnp.maximum(C_D_3D, C_D0)
-    
+    C_D_3D = xp.maximum(C_D_3D, C_D0)
+
     return C_L_3D, C_D_3D, C_M
 
 
-def apply_mach_corrections(cl_inc, cd_inc, cm_inc, mach, t_over_c=0.10):
+def apply_mach_corrections(cl_inc, cd_inc, cm_inc, mach, t_over_c=0.10, xp=JAX_OPS):
     """
     Advanced compressibility correction handling high-subsonic drag rise.
     
@@ -662,12 +654,12 @@ def apply_mach_corrections(cl_inc, cd_inc, cm_inc, mach, t_over_c=0.10):
     t_over_c : float
         Airfoil thickness-to-chord ratio (e.g., 0.10 for a 10% thick blade section).
     """
-    mach_abs = jnp.abs(mach)
-    mach_safe = jnp.clip(mach_abs, 0.0, 0.98)
-    beta = jnp.sqrt(1.0 - mach_safe**2)
+    mach_abs = xp.abs(mach)
+    mach_safe = xp.clip(mach_abs, 0.0, 0.98)
+    beta = xp.sqrt(1.0 - mach_safe**2)
     
     # Lift and Moment corrections (Standard Karman-Tsien / PG)
-    cl_comp = cl_inc / (beta + (mach_safe**2 / (1.0 + beta)) * (jnp.abs(cl_inc) / 2.0))
+    cl_comp = cl_inc / (beta + (mach_safe**2 / (1.0 + beta)) * (xp.abs(cl_inc) / 2.0))
     cm_comp = cm_inc / beta
     
     # High-Subsonic Drag Correction
@@ -677,11 +669,11 @@ def apply_mach_corrections(cl_inc, cd_inc, cm_inc, mach, t_over_c=0.10):
     # Estimate the Critical Mach Number (M_crit) where local flow hits Mach 1.
     # Thicker airfoils and higher operating lift coefficients lower M_crit.
     m_crit_0 = 0.90 - 1.4 * t_over_c  # Zero-lift critical Mach (e.g., 0.76 for 10% thickness)
-    m_crit = m_crit_0 - 0.12 * jnp.abs(cl_comp)
+    m_crit = m_crit_0 - 0.12 * xp.abs(cl_comp)
     
     # Smoothly calculate how far past M_crit the flow is operating
     delta_m = mach_abs - m_crit
-    delta_m_positive = jnp.maximum(0.0, delta_m)
+    delta_m_positive = xp.maximum(0.0, delta_m)
     
     # Empirical wave drag penalty (cubic rise once past M_crit)
     cd_wave = 2.5 * (delta_m_positive ** 3)
@@ -694,34 +686,31 @@ def apply_mach_corrections(cl_inc, cd_inc, cm_inc, mach, t_over_c=0.10):
 # Aerodynamic Coefficient Pipeline
 def aero_coeffs(V_i, params, return_log_confidence=False):
     '''
-    Universal Aerodynamic pipeline.
+    Universal Aerodynamic pipeline on the flat point layout: V_i has shape (3, p), every output shape (p,).
 
     Each radial station uses its own section, interpolated along the span from the CST sections in params.cst.
-    With return_log_confidence=True the log NeuralFoil analysis confidence (n_r, n_psi) is returned as a 4th output.
+    With return_log_confidence=True the log NeuralFoil analysis confidence (p,) is returned as a 4th output.
     '''
-    geometric_angle = params.beta[:, None]
+    xp = ops(params.cfg)
+    pt = lambda x: station_to_points(x, params)
     V_R, phi = resultantVelocityComponents(V_i, params)
-    AoA_eff = geometric_angle - phi
+    AoA_eff = pt(params.beta) - phi
 
-    Re = calc_reynolds(params.rho, jnp.maximum(V_R, 1e-6), params.c[:, None], params.mu)
+    Re = calc_reynolds(params.rho, xp.maximum(V_R, 1e-6), pt(params.c), params.mu)
     Mach = V_R / params.a
 
-    # Section shape and thickness at each radial station
-    kulfan = cst_at_stations(params.r, params.r_cst, params.cst)
-    t_over_c = max_thickness(kulfan)[:, None]
+    # Section shape and thickness at each radial station, then at each point
+    kulfan = xp.matmul(params.W_cst, params.cst)
+    t_over_c = pt(max_thickness(kulfan))
 
     # Natively calls the instantiated class
-    outputs = params.airfoil_interp(AoA_eff, Re, Mach, kulfan=kulfan[:, None, :], t_over_c=t_over_c,
-                                    return_log_confidence=return_log_confidence)
+    outputs = params.airfoil_interp(AoA_eff, Re, Mach, kulfan=xp.matmul(params.E_r, kulfan), t_over_c=t_over_c,
+                                    return_log_confidence=return_log_confidence, xp=xp)
     C_L_2D, C_D_2D, C_M = outputs[:3]
 
     # Apply 3D Rotational Corrections
     operands = (C_L_2D, C_D_2D, C_M, V_i, params)
-    C_L_final, C_D_final, C_M_final = lax.switch(
-        params.cfg.rot_corr_model,
-        [no_3d_correction, du_selig_correction],
-        operands
-    )
+    C_L_final, C_D_final, C_M_final = (no_3d_correction, du_selig_correction)[params.cfg.rot_corr_model](operands)
 
     if return_log_confidence:
         return C_L_final, C_D_final, C_M_final, outputs[3]
@@ -754,9 +743,14 @@ if __name__ == "__main__":
     cl_xf, cd_xf, cm_xf = xfoil_interp(aoa_rad_360, re_fixed, mach_fixed)
 
     # Evaluate NeuralFoil (section shape passed as CST weights)
-    from functools import partial
     from geometry import kulfan_from_name
-    nf_interp = partial(load_airfoil_data(3), kulfan=jnp.asarray(kulfan_from_name("arad10")))
+    nf_model, nf_kulfan = load_airfoil_data(3), jnp.asarray(kulfan_from_name("arad10"))
+    def nf_interp(alpha, re, mach):
+        # The model takes flat vectors with one section row for each point
+        shape = jnp.shape(alpha)
+        flat = lambda x: jnp.ravel(jnp.broadcast_to(x, shape))
+        coeffs = nf_model(flat(alpha), flat(re), flat(mach), kulfan=jnp.tile(nf_kulfan, (flat(alpha).size, 1)))
+        return tuple(c.reshape(shape) for c in coeffs)
     cl_nf, cd_nf, cm_nf = nf_interp(aoa_rad_360, re_fixed, mach_fixed)
 
     active_interp = nf_interp
