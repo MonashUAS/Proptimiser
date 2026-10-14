@@ -11,11 +11,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Internal Libraries
-import geometry
-from init import Inputs, BladeSpec, Params, Propeller
-from airfoil import aero_coeffs
-from airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskEfficiency, resultantVelocityComponents, high_induction_correction, station_to_points, to_grid, section_frame_of
-from backend import JAX_OPS, ops
+from . import geometry
+from .init import Inputs, BladeSpec, Params, Propeller
+from .airfoil import aero_coeffs
+from .airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskEfficiency, resultantVelocityComponents, high_induction_correction, station_to_points, to_grid, section_frame_of
+from .backend import JAX_OPS, ops
 
 jax.config.update("jax_enable_x64", True)
 
@@ -806,7 +806,7 @@ def apc_model(filepath, plot=True):
     Returns (prop, params, V_i_0, T) where prop is the Propeller built from the APC file.
     '''
     import queue
-    import results
+    from . import results
     from matplotlib.animation import FuncAnimation
 
     print(f"Loading APC Propeller geometry from: {filepath}")

@@ -6,11 +6,9 @@ Repository rules: no link to other repositories, no legacy loaders, contract A a
 import ast
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
 
 OTHER_REPOS = ("aerolink", "aeroplan", "propalyser")
 THIS_FILE = Path(__file__).resolve()
@@ -69,9 +67,9 @@ def test_saved_files_use_format_version_1():
 
 
 def test_exporter_writes_schema_version_1_only():
-    import export_performance as ep
+    from proptimiser import export_performance as ep
 
     assert ep.SCHEMA == "prop-performance" and ep.SCHEMA_VERSION == 1
-    source = (ROOT / "export_performance.py").read_text(encoding="utf-8")
+    source = (ROOT / "src" / "proptimiser" / "export_performance.py").read_text(encoding="utf-8")
     assert len(re.findall(r'attrs\["schema_version"\]', source)) == 1
     assert "schema_version = 2" not in source and "SCHEMA_VERSION = 2" not in source

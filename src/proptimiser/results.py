@@ -13,13 +13,13 @@ import equinox as eqx
 from scipy.interpolate import make_interp_spline
 
 # Internal Imports
-import propmodel
-import proptimiser
-from init import Inputs, Propeller
-import geometry
-import airfoil
-import airflow
-import structure
+from . import propmodel
+from . import optimiser
+from .init import Inputs, Propeller
+from . import geometry
+from . import airfoil
+from . import airflow
+from . import structure
 
 class DraggableSplineEditor:
     '''
@@ -436,7 +436,7 @@ def _condition_performance(params):
     '''
     Motor power, thrust, shaft power, ideal (actuator disk) power and solved V_i_0 of one flight condition.
     '''
-    motor_power, thrust, V_i_0 = proptimiser.objectives(params)
+    motor_power, thrust, V_i_0 = optimiser.objectives(params)
     V_i = propmodel.inflow_model(V_i_0, params)
     shaft_power = propmodel.mechanicalPower(V_i, params)
     return motor_power, thrust, shaft_power, propmodel.actuator_disk_power(thrust, params), V_i_0

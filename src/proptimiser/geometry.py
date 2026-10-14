@@ -14,8 +14,7 @@ import aerosandbox as asb
 # CST vectors are stored as [lower weights x8, upper weights x8, LE weight, TE thickness]
 N_CST_WEIGHTS = 8
 N_CST = 2 * N_CST_WEIGHTS + 2
-AIRFOIL_DIR = Path(__file__).resolve().parent / "airfoils"
-EXPORT_DIR = Path(__file__).resolve().parent / "exports"
+from .paths import AIRFOIL_DIR, EXPORT_DIR
 
 ### Integrand Functions
 def radial_stops(R, r_hub, n_r):
@@ -857,7 +856,7 @@ if __name__ == "__main__":
     import numpy as np
     import matplotlib.pyplot as plt
     import pyvista as pv
-    from init import Propeller
+    from .init import Propeller
 
     # Load the saved aerodynamic propeller (r_foils, hub and CST sections come from its BladeSpec)
     prop = Propeller.load("Currawong_V1")

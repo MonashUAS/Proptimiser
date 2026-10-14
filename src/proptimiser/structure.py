@@ -19,10 +19,10 @@ import jax.numpy as jnp
 import numpy as np
 
 # Internal Libraries
-import init                 # first: it sets the JAX configuration (float64)
-import geometry
-import propmodel
-from airflow import inflow_model
+from . import init                 # first: it sets the JAX configuration (float64)
+from . import geometry
+from . import propmodel
+from .airflow import inflow_model
 
 N_X = 48                    # chordwise Gauss nodes of the section integrals
 

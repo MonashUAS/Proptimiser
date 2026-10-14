@@ -159,14 +159,14 @@ def parse_apc_dat(filepath):
 
 # Example usage:
 if __name__ == "__main__":
-    from init import Inputs, Params
+    from .init import Inputs, Params
     from datetime import datetime
     # Internal Imports
-    import propmodel
-    import proptimiser
-    import results
-    import geometry
-    from airfoil import load_airfoil_data
+    from . import propmodel
+    from . import optimiser
+    from . import results
+    from . import geometry
+    from .airfoil import load_airfoil_data
 
     ### Import Blade Geometry
     

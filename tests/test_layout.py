@@ -1,7 +1,7 @@
 import numpy as np
 
-import init  # noqa: F401  sets float64 before geometry builds arrays
-import geometry
+from proptimiser import init  # noqa: F401  sets float64 before geometry builds arrays
+from proptimiser import geometry
 
 
 def test_point_layout_mean_and_expand():

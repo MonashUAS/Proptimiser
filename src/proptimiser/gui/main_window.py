@@ -14,13 +14,14 @@ from PySide6.QtWidgets import (
 )
 
 # Internal Imports
-from init import DESIGN_DIR, Propeller
-from gui.design_tab import DesignTab
-from gui.optimise_tab import OptimiseTab
-from gui.setup_tab import SetupTab
-from gui.workers import LogStream
+from ..init import DESIGN_DIR, Propeller
+from ..paths import APC_DIR as APC_DATA_DIR
+from .design_tab import DesignTab
+from .optimise_tab import OptimiseTab
+from .setup_tab import SetupTab
+from .workers import LogStream
 
-APC_DIR = Path(__file__).resolve().parent.parent / "apc_prop_data" / "propgeom_data"
+APC_DIR = APC_DATA_DIR / "propgeom_data"
 
 
 class MainWindow(QMainWindow):

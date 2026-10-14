@@ -12,9 +12,10 @@ from scipy.ndimage import gaussian_filter
 import neuralfoil as nf
 from pathlib import Path
 
-from airflow import resultantVelocityComponents, calc_reynolds, station_to_points
-from backend import JAX_OPS, ops
-from geometry import N_CST, max_thickness
+from .airflow import resultantVelocityComponents, calc_reynolds, station_to_points
+from .backend import JAX_OPS, ops
+from .geometry import N_CST, max_thickness
+from .paths import AIRFOIL_DIR
 
 from aerosandbox.geometry.airfoil.airfoil_families import (
     get_kulfan_parameters,
@@ -211,7 +212,7 @@ class ParametricInterpolator:
 
 class AlphaReInterpolator:
     def __init__(self, airfoilname):
-        files = glob.glob(f"airfoils/{airfoilname}/xfoil/xf-{airfoilname}-il-*.csv")
+        files = glob.glob(str(AIRFOIL_DIR / airfoilname / "xfoil" / f"xf-{airfoilname}-il-*.csv"))
         if not files:
             raise FileNotFoundError(f"No CSVs found for 2D interpolation in airfoils/{airfoilname}/xfoil/")
 
@@ -294,7 +295,7 @@ class AlphaReInterpolator:
 
 class AlphaMachReInterpolator:
     def __init__(self, airfoilname):
-        files = glob.glob(f"airfoils/{airfoilname}/Polars/*.csv")
+        files = glob.glob(str(AIRFOIL_DIR / airfoilname / "Polars" / "*.csv"))
         if not files:
             raise FileNotFoundError(f"No CSVs found for 3D interpolation in airfoils/{airfoilname}/Polars/")
 
@@ -743,7 +744,7 @@ if __name__ == "__main__":
     cl_xf, cd_xf, cm_xf = xfoil_interp(aoa_rad_360, re_fixed, mach_fixed)
 
     # Evaluate NeuralFoil (section shape passed as CST weights)
-    from geometry import kulfan_from_name
+    from .geometry import kulfan_from_name
     nf_model, nf_kulfan = load_airfoil_data(3), jnp.asarray(kulfan_from_name("arad10"))
     def nf_interp(alpha, re, mach):
         # The model takes flat vectors with one section row for each point

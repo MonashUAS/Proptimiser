@@ -11,10 +11,10 @@ from PySide6.QtWidgets import (
 )
 
 # Internal Imports
-import geometry
-import proptimiser
-from init import BladeSpec, Inputs, Propeller, _to_json
-from gui.widgets import ConditionTable, Field, FieldForm, FloatEdit, FreezeTable
+from .. import geometry
+from .. import optimiser
+from ..init import BladeSpec, Inputs, Propeller, _to_json
+from .widgets import ConditionTable, Field, FieldForm, FloatEdit, FreezeTable
 
 MODEL_CHOICES = dict(
     inflow_model=("Simple (uniform)", "Pitt-Peters"),
@@ -27,7 +27,7 @@ MODEL_CHOICES = dict(
 
 INPUT_GROUPS = [
     ("Optimiser", [
-        Field("opt_solver", "Solver", "text_choice", choices=tuple(proptimiser.SOLVERS)),
+        Field("opt_solver", "Solver", "text_choice", choices=tuple(optimiser.SOLVERS)),
         Field("opt_max_iter", "Max iterations", "int", minimum=1),
         Field("opt_tol", "Relative tolerance", "float",
               tooltip="Converged when the objective changes by less than this fraction in one iteration"),

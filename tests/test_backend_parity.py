@@ -7,11 +7,11 @@ import casadi as cas
 import numpy as np
 import pytest
 
-import init  # noqa: F401  sets float64 before the arrays are built
-import airfoil
-import propmodel
-from casadi_prop import casadi_params
-from init import BladeSpec, Inputs, Propeller
+from proptimiser import init  # noqa: F401  sets float64 before the arrays are built
+from proptimiser import airfoil
+from proptimiser import propmodel
+from proptimiser.casadi_prop import casadi_params
+from proptimiser.init import BladeSpec, Inputs, Propeller
 
 import jax.numpy as jnp
 

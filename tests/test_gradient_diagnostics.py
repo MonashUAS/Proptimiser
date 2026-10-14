@@ -25,11 +25,11 @@ from dataclasses import replace
 jax.config.update("jax_enable_x64", True)
 jax.config.update("jax_debug_nans", False)  # keep off for these tests: we WANT to see nan, not crash on it
 
-from init import Inputs, Propeller
-import propmodel
-import airflow
-import airfoil
-import proptimiser
+from proptimiser.init import Inputs, Propeller
+from proptimiser import propmodel
+from proptimiser import airflow
+from proptimiser import airfoil
+from proptimiser import optimiser
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +199,7 @@ def test_level4_objectives():
 
     def f(c):
         p = replace(params, c=c)
-        motor_power, thrust, V_i_0 = proptimiser.objectives(p)
+        motor_power, thrust, V_i_0 = optimiser.objectives(p)
         return motor_power + thrust
 
     val, g = jax.value_and_grad(f)(params.c)
@@ -212,7 +212,7 @@ def test_level5_condition_cost():
 
     def f(c):
         p = replace(params, c=c)
-        cost, V_i_0 = proptimiser.condition_cost(p)
+        cost, V_i_0 = optimiser.condition_cost(p)
         return jnp.sum(cost)
 
     val, g = jax.value_and_grad(f)(params.c)
@@ -226,10 +226,10 @@ def test_level5_condition_cost():
 
 def test_level5b_total_cost():
     """Full multi-condition cost (incl. thickness and confidence penalties) w.r.t. every design variable."""
-    solver = proptimiser.LBFGSBSolver(base_prop())
+    solver = optimiser.LBFGSBSolver(base_prop())
 
     def f(x):
-        cost, V_i_0 = proptimiser.total_cost(x, solver.params_struct, solver.space)
+        cost, V_i_0 = optimiser.total_cost(x, solver.params_struct, solver.space)
         return cost
 
     val, g = jax.value_and_grad(f)(solver.vars_scaled)
@@ -238,7 +238,7 @@ def test_level5b_total_cost():
 
 
 def test_level6_solver_step():
-    solver = proptimiser.LBFGSBSolver(base_prop())
+    solver = optimiser.LBFGSBSolver(base_prop())
     state = solver.init_state()
     vars_scaled, state, V_i_0 = solver.step(solver.vars_scaled, state, solver.params_struct)
 

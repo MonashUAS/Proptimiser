@@ -14,13 +14,13 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 
 # Internal Imports
-import geometry
-import results
-import structure
-from init import DESIGN_DIR
-from gui.setup_tab import MODEL_CHOICES
-from gui.widgets import FloatEdit, LivePlotCanvas, MplCanvas, make_table, fill_table, fit_table_height
-from gui.workers import Task
+from .. import geometry
+from .. import results
+from .. import structure
+from ..init import DESIGN_DIR
+from .setup_tab import MODEL_CHOICES
+from .widgets import FloatEdit, LivePlotCanvas, MplCanvas, make_table, fill_table, fit_table_height
+from .workers import Task
 
 PERFORMANCE_COLUMNS = (
     ("Cond", "{}"), ("Omega [rad/s]", "{:.1f}"), ("Thrust [N]", "{:.3f}"), ("Target [N]", "{:.3f}"),

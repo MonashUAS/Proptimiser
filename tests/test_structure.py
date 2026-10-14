@@ -22,9 +22,9 @@ import numpy as np
 
 jax.config.update("jax_enable_x64", True)
 
-import init
-from init import Inputs, BladeSpec, Propeller
-import geometry
+from proptimiser import init
+from proptimiser.init import Inputs, BladeSpec, Propeller
+from proptimiser import geometry
 
 
 def _swept_blade(scale=1.0, **kwargs):
@@ -107,7 +107,7 @@ def test_section_frame_hand_cases():
 def test_rake_turns_the_normal_velocity():
     # z = m r (a cone toward the thrust side): the normal velocity is (m u_rho + u_a) / sqrt(1 + m^2) and the chordwise
     # velocity is unchanged
-    import airflow
+    from proptimiser import airflow
 
     m = 0.15
     base = BladeSpec()
@@ -166,7 +166,7 @@ def test_offset_interpolation_and_guards():
 # ---------------------------------------------------------------------------
 
 def test_swept_bemt_converges_and_scales_quadratically():
-    import propmodel
+    from proptimiser import propmodel
 
     inputs = Inputs(coeff_method=0, n_r=6, V_yz=[0.0, 0.0])
     thrust = {}
@@ -186,7 +186,7 @@ def test_swept_bemt_converges_and_scales_quadratically():
 def test_station_subset_slices_offsets():
     # With no Newton iterations every station goes to the bracketed fallback, which solves copies of the blade holding
     # only some stations: their offsets must follow them
-    import propmodel
+    from proptimiser import propmodel
 
     p = Propeller.default(inputs=Inputs(coeff_method=0, n_r=8), blade=_swept_blade(1.0)).condition(1)
     _, V_newton = propmodel.induced_velocity(p)
@@ -200,7 +200,7 @@ def test_station_subset_slices_offsets():
 
 
 def test_sectional_loads_integrate_to_the_blade_element_sums():
-    import propmodel
+    from proptimiser import propmodel
 
     for blade in (BladeSpec(), _swept_blade(1.0)):
         p = Propeller.default(inputs=Inputs(coeff_method=0, n_r=8), blade=blade).condition(1)
@@ -223,7 +223,7 @@ def test_sectional_loads_integrate_to_the_blade_element_sums():
 
 
 def test_pitching_moment_acts_about_the_span():
-    import propmodel
+    from proptimiser import propmodel
 
     p = Propeller.default(inputs=Inputs(coeff_method=0, n_r=8), blade=_swept_blade(1.0)).condition(0)
     V_i, _ = propmodel.induced_velocity(p)
@@ -340,7 +340,7 @@ def _polygon_properties(x, z):
 
 
 def test_strip_properties_exact_shapes():
-    import structure
+    from proptimiser import structure
 
     x, w = structure.GAUSS_X, structure.GAUSS_W
     assert np.isclose(w.sum(), 1.0, rtol=0, atol=1e-14)
@@ -358,7 +358,7 @@ def test_strip_properties_exact_shapes():
 
 
 def test_cst_properties_match_a_fine_polygon():
-    import structure
+    from proptimiser import structure
     from aerosandbox.geometry.airfoil.airfoil_families import get_kulfan_coordinates
 
     prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=8), c=0.04)
@@ -386,7 +386,7 @@ def test_cst_properties_match_a_fine_polygon():
 
 
 def test_torsion_constant_of_an_ellipse():
-    import structure
+    from proptimiser import structure
 
     # thin ellipse: half-length a = 1/2, half-thickness b = 0.06 (t/c = 0.12): x = (1 - cos t) / 2, y = 2 b sqrt(x (1 - x))
     b, x, w = 0.06, structure.GAUSS_X, structure.GAUSS_W
@@ -401,7 +401,7 @@ def test_torsion_constant_of_an_ellipse():
 
 
 def test_hub_stadium_section_fit():
-    import structure
+    from proptimiser import structure
 
     # The hub section is a stadium fitted by a CST: its area follows the analytic stadium to a fraction of a percent
     prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=8), c=0.04)
@@ -416,7 +416,7 @@ def test_section_area_matches_apc_outboard():
     # CST section of the same thickness holds a constant 94% of it outboard of 3 in (the APC section is a fuller
     # Clark-Y). Inboard, the moulded root blend is not a CST airfoil, and the rounded tip (chord below 0.25 in) is not
     # either, so the model sits lower there.
-    import structure
+    from proptimiser import structure
 
     path = Path(__file__).resolve().parent / "apc_prop_data" / "propgeom_data" / "10x6-PERF.PE0"
     if not path.exists():
@@ -457,7 +457,7 @@ def test_pitch_axis_fraction_follows_the_planform_blend():
 
 
 def test_material_from_blade():
-    import structure
+    from proptimiser import structure
 
     mat = structure.Material.from_blade(BladeSpec())
     assert float(mat.density) == 1700.0 and float(mat.fill) == 1.0
@@ -467,7 +467,7 @@ def test_material_from_blade():
 
 
 def test_section_properties_vmap_and_gradient():
-    import structure
+    from proptimiser import structure
 
     prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6))
     batched = jax.vmap(structure.section_properties)(prop.batched())
@@ -498,7 +498,7 @@ def _polar_inertia(p, area, mat, N):
 
 
 def test_uniform_load_shear_and_moment():
-    import structure
+    from proptimiser import structure
 
     r = jnp.linspace(0.025, 0.275, 11)
     R, w = float(r[-1]), 3.0
@@ -512,7 +512,7 @@ def test_uniform_load_shear_and_moment():
 
 
 def test_two_station_swept_statics():
-    import structure
+    from proptimiser import structure
 
     # a point load of 1 N along e_z at the tip of a swept blade (the trapezoid weight of the tip value is dr / 2)
     r, dr, y, z = jnp.array([0.1, 0.2]), 0.1, 0.02, 0.01
@@ -528,7 +528,7 @@ def test_two_station_swept_statics():
 
 
 def test_moment_equilibrium():
-    import structure
+    from proptimiser import structure
 
     rng = np.random.default_rng(5)
     r = jnp.linspace(0.03, 0.28, 9)
@@ -542,7 +542,7 @@ def test_moment_equilibrium():
 
 
 def test_uniform_rod_centrifugal_tension():
-    import structure
+    from proptimiser import structure
 
     prop, p = _rod_propeller(n_r=24)
     mat = prop.material()
@@ -556,7 +556,7 @@ def test_uniform_rod_centrifugal_tension():
 
 
 def test_centrifugal_twisting_moment():
-    import structure
+    from proptimiser import structure
 
     # steady rotation: the moment of a section about its centroid along the span is
     #   -rho omega^2 [sin(b) cos(b) (I_zz - I_xx) - I_xz cos(2b)]: the classic twisting moment, toward fine pitch
@@ -584,7 +584,7 @@ def test_centrifugal_twisting_moment():
 
 
 def test_root_moment_is_the_sum_of_section_moments():
-    import structure
+    from proptimiser import structure
 
     prop, p = _rod_propeller(beta_deg=25.0, blade=_swept_blade(1.0))
     mat = prop.material()
@@ -600,7 +600,7 @@ def test_root_moment_is_the_sum_of_section_moments():
 
 
 def test_pitch_rate_coriolis():
-    import structure
+    from proptimiser import structure
 
     prop, p = _rod_propeller(beta_deg=20.0)
     mat, props, axes = prop.material(), structure.section_properties(p), structure.blade_axes(p)
@@ -621,7 +621,7 @@ def test_pitch_rate_coriolis():
 
 
 def test_spin_acceleration_torque():
-    import structure
+    from proptimiser import structure
 
     prop, p = _rod_propeller(n_r=30, N=2, c=0.01)
     mat = prop.material()
@@ -634,7 +634,7 @@ def test_spin_acceleration_torque():
 
 
 def test_gyroscopic_hub_moment():
-    import structure
+    from proptimiser import structure
 
     # a three-blade rotor on an airframe turning at q about y: the blades apply -I_p omega q about x to the hub
     # (the airframe applies the moment I_p omega q that turns the angular momentum I_p omega e_z)
@@ -652,7 +652,7 @@ def test_gyroscopic_hub_moment():
 
 
 def test_hub_harmonics():
-    import structure
+    from proptimiser import structure
 
     n = 24
     psi = jnp.linspace(0.0, 2 * jnp.pi, n, endpoint=False)
@@ -675,7 +675,7 @@ def test_hub_harmonics():
 
 
 def test_azimuth_shift():
-    import structure
+    from proptimiser import structure
 
     n = 24
     psi = np.linspace(0.0, 2 * np.pi, n, endpoint=False)
@@ -690,8 +690,8 @@ def test_azimuth_shift():
 
 def test_hub_loads_close_with_thrust_and_torque():
     # In axial flow, without loss models, the loads of the blades at the hub add up to the thrust and torque of the BEMT
-    import propmodel
-    import structure
+    from proptimiser import propmodel
+    from proptimiser import structure
 
     for blade in (BladeSpec(), _swept_blade(1.0)):
         for blades in (2, 3):
@@ -709,7 +709,7 @@ def test_hub_loads_close_with_thrust_and_torque():
 
 
 def test_stress_pure_tension_is_independent_of_the_fill_factor():
-    import structure
+    from proptimiser import structure
 
     for fill in (1.0, 0.5):
         prop, p = _rod_propeller(blade=BladeSpec(fill_factor=fill))
@@ -725,7 +725,7 @@ def test_stress_pure_tension_is_independent_of_the_fill_factor():
 
 
 def test_unsymmetric_bending_matches_the_moments():
-    import structure
+    from proptimiser import structure
 
     prop, p = _rod_propeller(beta_deg=30.0)
     mat = prop.material()
@@ -761,7 +761,7 @@ def test_unsymmetric_bending_matches_the_moments():
 
 def test_torsion_stress_of_an_ellipse():
     import types
-    import structure
+    from proptimiser import structure
 
     a, b = 0.5, 0.06
     x, w = structure.GAUSS_X, structure.GAUSS_W
@@ -782,7 +782,7 @@ def test_torsion_stress_of_an_ellipse():
 
 
 def test_safety_factor_scales_with_the_square_of_the_speed():
-    import structure
+    from proptimiser import structure
 
     prop, p = _rod_propeller(beta_deg=30.0)
     mat = prop.material()
@@ -795,7 +795,7 @@ def test_safety_factor_scales_with_the_square_of_the_speed():
 
 
 def test_structural_loads_vmap_matches_a_loop():
-    import structure
+    from proptimiser import structure
 
     prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=8), c=0.03, blade=_swept_blade(1.0))
     mat = prop.material()
@@ -808,8 +808,8 @@ def test_structural_loads_vmap_matches_a_loop():
 
 def test_structural_gradients_match_finite_differences():
     # A smooth maximum of the von Mises stress, through the BEMT solve (implicit gradients), against central differences
-    import propmodel
-    import structure
+    from proptimiser import propmodel
+    from proptimiser import structure
 
     for blade in (BladeSpec(), _swept_blade(1.0)):          # the gradient is finite at zero offsets too
         prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=8, n_psi=12), c=0.03, blade=blade)
@@ -834,14 +834,14 @@ def test_structural_gradients_match_finite_differences():
 def test_optimiser_runs_on_a_swept_blade():
     # The offsets are fixed geometry: they travel through the batched parameters, stay untouched, and the optimised
     # design goes straight into the structural loads
-    import proptimiser
-    import structure
+    from proptimiser import optimiser
+    from proptimiser import structure
 
     base = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6, opt_max_iter=2, opt_verbose=0), blade=_swept_blade(1.0))
-    for solver in proptimiser.SOLVERS:
+    for solver in optimiser.SOLVERS:
         prop = base.with_inputs(dataclasses.replace(base.inputs, opt_solver=solver))
         reports = []
-        result = proptimiser.run_optimization(prop, callback=reports.append)
+        result = optimiser.run_optimization(prop, callback=reports.append)
         assert reports and np.isfinite(reports[-1].objective) and reports[-1].objective > 0, solver
         assert result.blade.swept and np.array_equal(np.asarray(result.offsets), np.asarray(base.offsets)), solver
         assert not np.allclose(np.asarray(result.c), np.asarray(base.c)) or not np.allclose(np.asarray(result.beta), np.asarray(base.beta))
@@ -850,8 +850,8 @@ def test_optimiser_runs_on_a_swept_blade():
 
 
 def test_structural_report():
-    import propmodel
-    import results
+    from proptimiser import propmodel
+    from proptimiser import results
 
     prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=8, n_psi=24), c=0.03, blade=_swept_blade(1.0))
     prop, params_list, rows = results.evaluate_conditions(prop)

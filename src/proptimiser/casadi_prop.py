@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-import propmodel
+from . import propmodel
 
 
 def casadi_params(params, **symbols):

@@ -2,8 +2,8 @@
 import jax.numpy as jnp
 
 # internal imports
-import geometry
-from backend import ops
+from . import geometry
+from .backend import ops
 
 ##  Dimensionless Constants
 def calc_mach(V, a):

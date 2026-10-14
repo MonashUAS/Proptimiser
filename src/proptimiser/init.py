@@ -20,11 +20,9 @@ import numpy as np
 import yaml
 
 # Internal Imports
-import geometry
+from . import geometry
 
-ROOT = Path(__file__).resolve().parent
-DESIGN_DIR = ROOT / "designs"           # hand design files: <name>.yaml
-PROP_DIR = ROOT / "propellers"          # solved state files: <name>.state.json
+from .paths import DESIGN_DIR, PROP_DIR      # hand design files <name>.yaml, solved state files <name>.state.json
 DESIGN_FORMAT = 1
 STATE_FORMAT = 1
 
@@ -385,7 +383,7 @@ class Propeller:
     def __init__(self, inputs: Inputs, blade: BladeSpec, c, beta, cst, omega=None, tilt=None, V_i_0=None,
                  error_log=None, time_log=None, name=None):
         # Internal Imports
-        from airfoil import load_airfoil_data
+        from .airfoil import load_airfoil_data
 
         if blade.hub_cst is None:
             blade = dataclasses.replace(blade, hub_cst=tuple(geometry.fit_hub_cst(blade.hub_thickness_ratio).tolist()))
@@ -444,7 +442,7 @@ class Propeller:
         use_apc_sweep also takes the file's sweep and rake, as offsets of the pitch axis (geometry.apc_offsets).
         '''
         # Internal Imports
-        import apcpropanalysis
+        from . import apcpropanalysis
 
         inputs = Inputs() if inputs is None else inputs
         blade = BladeSpec() if blade is None else blade
@@ -531,7 +529,7 @@ class Propeller:
         The blade material as structure.Material, for the structural loads (kept out of Params and ModelConfig, so a
         change of material never recompiles the BEMT).
         '''
-        from structure import Material      # Internal Import: structure imports this module
+        from .structure import Material      # Internal Import: structure imports this module
 
         return Material.from_blade(self.blade)
 
@@ -583,7 +581,7 @@ class Propeller:
         A supplied V_i_0 (n_cond, 3, n_r) is kept, except for conditions that are not finite.
         '''
         # Internal Imports
-        from propmodel import get_velocity_scales
+        from .propmodel import get_velocity_scales
 
         n_r, rows = self.inputs.n_r, self.cfg.solve_rows
         seeds = []
@@ -813,8 +811,8 @@ if __name__ == "__main__":
     from matplotlib.animation import FuncAnimation
 
     # Internal Imports
-    import proptimiser
-    import results
+    from . import optimiser
+    from . import results
 
     inputs = Inputs()
     blade = BladeSpec(
@@ -843,7 +841,7 @@ if __name__ == "__main__":
 
     def optimization_worker():
         # Run optimization on background thread and pass the queue
-        thread_results['prop_opt'] = proptimiser.run_optimization(prop_init, update_queue=gui_queue)
+        thread_results['prop_opt'] = optimiser.run_optimization(prop_init, update_queue=gui_queue)
 
     # Run Optimisation in Background Thread
     opt_thread = threading.Thread(target=optimization_worker, daemon=True)

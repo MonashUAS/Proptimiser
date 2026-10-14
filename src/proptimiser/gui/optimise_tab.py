@@ -15,11 +15,11 @@ from PySide6.QtWidgets import (
 )
 
 # Internal Imports
-import proptimiser
-import results
-from init import DESIGN_DIR
-from gui.widgets import LivePlotCanvas, make_table, fill_table, fit_table_height
-from gui.workers import Task
+from .. import optimiser
+from .. import results
+from ..init import DESIGN_DIR
+from .widgets import LivePlotCanvas, make_table, fill_table, fit_table_height
+from .workers import Task
 
 PROGRESS_COLUMNS = (
     ("Cond", "{}"), ("Omega [rad/s]", "{:.1f}"), ("Thrust [N]", "{:.3f}"), ("Target [N]", "{:.3f}"),
@@ -38,7 +38,7 @@ JAX_TRACE_DIR = "/tmp/jax_trace"
 
 class OptimiseTab(QWidget):
     '''
-    Optimises the session's propeller on a background thread. Progress reports (proptimiser.Progress plus a
+    Optimises the session's propeller on a background thread. Progress reports (optimiser.Progress plus a
     FlowSnapshot per condition, computed off the Qt thread) drive the live plot and the progress table.
     '''
     result_adopted = Signal()       # the optimised design became the session propeller
@@ -114,7 +114,7 @@ class OptimiseTab(QWidget):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             try:
-                space = proptimiser.DesignSpace.build(prop)
+                space = optimiser.DesignSpace.build(prop)
                 text = "Design variables: " + ", ".join(f"{name} {len(idx)}" for name, idx in space.free)
             except ValueError as e:
                 text = str(e)
@@ -192,7 +192,7 @@ class OptimiseTab(QWidget):
             if prop.inputs.jax_tracing:
                 jax.profiler.start_trace(JAX_TRACE_DIR)
             try:
-                return proptimiser.run_optimization(prop, callback=callback, stop_event=stop_event)
+                return optimiser.run_optimization(prop, callback=callback, stop_event=stop_event)
             finally:
                 if prop.inputs.jax_tracing:
                     jax.profiler.stop_trace()

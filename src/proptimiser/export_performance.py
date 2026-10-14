@@ -10,8 +10,8 @@ The script refuses to write when the git tree is dirty, when no author is known,
 not committed. There is no override.
 
 Examples, run from the repository root:
-    python export_performance.py currawong_v2_structural --author "A. Person"
-    python export_performance.py --apc apc_prop_data/propgeom_data/20x8E-PERF.PE0 \
+    proptimiser-export currawong_v2_structural --author "A. Person"
+    proptimiser-export --apc apc_prop_data/propgeom_data/20x8E-PERF.PE0 \
         --compare-apc apc_prop_data/performance_data/PER3_20x8E.dat
 The second example prints a CT and CP comparison with the APC table. It writes no file.
 """
@@ -33,14 +33,14 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 
-import airflow
-import init
-import propmodel
+from . import airflow
+from . import init
+from . import propmodel
+from .paths import HOME
 
 SCHEMA = "prop-performance"
 SCHEMA_VERSION = 1
 GENERATOR = "Proptimiser"
-ROOT = Path(__file__).resolve().parent
 RHO = 1.225                 # air density (kg/m3)
 
 # Columns of /performance: (units, description)
@@ -191,12 +191,12 @@ def _git(repo, *args):
     return out.stdout.strip()
 
 
-def git_state(repo=ROOT):
+def git_state(repo=HOME):
     """(commit, dirty) of the git tree. Dirty means a changed, staged or untracked (not ignored) file."""
     return _git(repo, "rev-parse", "HEAD"), bool(_git(repo, "status", "--porcelain", "--untracked-files=normal"))
 
 
-def git_user_name(repo=ROOT):
+def git_user_name(repo=HOME):
     """git config user.name, or None."""
     try:
         return _git(repo, "config", "user.name") or None
@@ -204,7 +204,7 @@ def git_user_name(repo=ROOT):
         return None
 
 
-def resolve_author(author, repo=ROOT):
+def resolve_author(author, repo=HOME):
     """The author: --author, else git config user.name. Refuse when there is none."""
     author = (author or "").strip() or git_user_name(repo)
     if not author:
@@ -212,7 +212,7 @@ def resolve_author(author, repo=ROOT):
     return author
 
 
-def require_clean(repo=ROOT):
+def require_clean(repo=HOME):
     """The commit of a clean tree. Refuse a dirty tree."""
     commit, dirty = git_state(repo)
     if dirty:
@@ -220,7 +220,7 @@ def require_clean(repo=ROOT):
     return commit
 
 
-def require_tracked(paths, repo=ROOT):
+def require_tracked(paths, repo=HOME):
     """Refuse a design or state file that git does not track."""
     for path in paths:
         try:
@@ -318,7 +318,7 @@ def _columns(group, spec, values):
         ds.attrs["description"] = description
 
 
-def export(name, author=None, out=None, prop_id=None, rho=RHO, omega_list=None, vx_list=None, repo=ROOT):
+def export(name, author=None, out=None, prop_id=None, rho=RHO, omega_list=None, vx_list=None, repo=HOME):
     """
     Export designs/<name>.yaml with its state as contract A. Return the path of the .h5 file.
     Refuse a dirty tree, a missing author and design files that git does not track.

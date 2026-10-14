@@ -5,19 +5,17 @@ Tests for export_performance.py (contract A, prop-performance v1). They run offl
 """
 import math
 import subprocess
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))           # the module lives in the repository root
 
 import h5py
 import numpy as np
 import pytest
 
-import export_performance as ep
-import init
-from init import Inputs, Propeller
+from proptimiser import export_performance as ep
+from proptimiser import init
+from proptimiser.init import Inputs, Propeller
 
 RHO = 1.225
 ROOT_ATTRS = {"schema", "schema_version", "prop_id", "design_sha256", "created_utc", "author", "placeholder"}

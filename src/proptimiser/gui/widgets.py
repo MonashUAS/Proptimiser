@@ -16,8 +16,8 @@ from PySide6.QtWidgets import (
 )
 
 # Internal Imports
-import results
-from init import CONDITION_FIELDS
+from .. import results
+from ..init import CONDITION_FIELDS
 
 
 class MplCanvas(QWidget):

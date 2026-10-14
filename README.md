@@ -25,9 +25,26 @@ Use Python 3.12 and a virtual environment in `.venv`.
 
 ```bash
 python -m venv .venv
-.venv/Scripts/python -m pip install -r requirements.txt      # Windows
-.venv/bin/python -m pip install -r requirements.txt          # Linux or macOS
+.venv/Scripts/python -m pip install -e ".[gui,dev]"      # Windows
+.venv/bin/python -m pip install -e ".[gui,dev]"          # Linux or macOS
 ```
+
+The extra `gui` adds PySide6 and pyvista for the graphical interface. The extra `dev` adds pytest.
+Leave out the extras for the library only.
+`requirements.txt` holds the exact versions of the tested environment.
+
+## Use as a library
+
+```python
+from proptimiser import init, optimiser, results
+prop = init.Propeller.load("currawong_v2")
+```
+
+The package holds only the airfoil data. Your files stay outside the package.
+Designs, solved states and exports are in `designs/`, `propellers/` and `exports/`
+inside the folder in the environment variable `PROPTIMISER_HOME`.
+When the variable is not set, the folder is the current working directory.
+The folder `apc_prop_data/` is also in that folder. It is not part of the package.
 
 For GPU use, install the CUDA version of JAX. Refer to the JAX installation guide.
 
@@ -97,8 +114,8 @@ A new design starts from `Propeller.default(inputs, blade)` or `Propeller.from_a
 ### Graphical interface
 
 ```bash
-python app.py                   # start from the default propeller
-python app.py currawong_v2      # open a design
+proptimiser-gui                 # start from the default propeller
+proptimiser-gui currawong_v2    # open a design
 ```
 
 The window has three tabs and a log panel:
@@ -114,8 +131,8 @@ The **File** menu opens and saves design YAML files (with the state JSON) and im
 ### Command line
 
 ```bash
-python init.py          # optimise the design in the __main__ block of init.py, with live plots
-python results.py       # evaluate a saved design, print the structural summary, smooth it, save it
+python -m proptimiser.init          # optimise the design in the __main__ block of init.py, with live plots
+python -m proptimiser.results       # evaluate a saved design, print the structural summary, smooth it, save it
 ```
 
 Push Ctrl+C one time to stop after the current iteration.
@@ -145,7 +162,7 @@ gives exact gradients. A bracketed fallback solves an annulus where Newton stops
 ## Export for Propalyser (contract A)
 
 ```bash
-python export_performance.py currawong_v2_structural --author "A. Person"
+proptimiser-export currawong_v2_structural --author "A. Person"
 ```
 
 The exporter writes `exports/<prop_id>.h5`. The file follows contract A, `prop-performance` v1:
@@ -167,7 +184,7 @@ The exporter refuses to write in these conditions. There is no override.
 To compare the BEMT with an APC table, run this command. It prints the comparison and writes no file.
 
 ```bash
-python export_performance.py --apc apc_prop_data/propgeom_data/20x8E-PERF.PE0 \
+proptimiser-export --apc apc_prop_data/propgeom_data/20x8E-PERF.PE0 \
     --compare-apc apc_prop_data/performance_data/PER3_20x8E.dat
 ```
 

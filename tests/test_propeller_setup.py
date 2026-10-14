@@ -23,11 +23,11 @@ import numpy as np
 
 jax.config.update("jax_enable_x64", True)
 
-import init
-from init import Inputs, BladeSpec, Propeller
-import geometry
-import airfoil
-import proptimiser
+from proptimiser import init
+from proptimiser.init import Inputs, BladeSpec, Propeller
+from proptimiser import geometry
+from proptimiser import airfoil
+from proptimiser import optimiser
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +234,7 @@ def test_post_stall_blend_matches_aerosandbox():
 
 def test_swirl_reduces_the_tangential_velocity():
     # Swirl V_it > 0 turns with the blade (positive momentum torque), so the blade sees omega r - V_it
-    import airflow
+    from proptimiser import airflow
 
     params = Propeller.default(inputs=Inputs(coeff_method=0, n_r=8, V_yz=[0.0, 0.0])).condition(0)
     V_i = jnp.zeros((3, params.psi_pt.shape[0])).at[0].set(2.0)
@@ -259,7 +259,7 @@ def _masked_prop():
 
 def test_design_space_mask_and_blend():
     prop = _masked_prop()
-    space = proptimiser.DesignSpace.build(prop)
+    space = optimiser.DesignSpace.build(prop)
     r = np.asarray(prop.r)
     free = dict(space.free)
 
@@ -284,7 +284,7 @@ def test_design_space_mask_and_blend():
 
 def test_design_space_roundtrip():
     prop = _masked_prop()
-    space = proptimiser.DesignSpace.build(prop)
+    space = optimiser.DesignSpace.build(prop)
     values = space.values(space.to_unit(prop))
     free_c = np.array(dict(space.free)["c"])
 
@@ -293,8 +293,8 @@ def test_design_space_roundtrip():
 
 
 def test_total_cost_gradients_are_finite():
-    solver = proptimiser.LBFGSBSolver(_masked_prop())
-    grads = jax.grad(lambda x: proptimiser.total_cost(x, solver.params_struct, solver.space)[0])(solver.vars_scaled)
+    solver = optimiser.LBFGSBSolver(_masked_prop())
+    grads = jax.grad(lambda x: optimiser.total_cost(x, solver.params_struct, solver.space)[0])(solver.vars_scaled)
     for name, g in grads.items():
         assert bool(jnp.all(jnp.isfinite(g))), name
 
@@ -304,7 +304,7 @@ def test_total_cost_gradients_are_finite():
 # ---------------------------------------------------------------------------
 
 def test_contour_levels_are_strictly_increasing():
-    import results
+    from proptimiser import results
 
     for values in (np.full((4, 5), 2.5), np.zeros((3, 3)), np.array([[np.nan, 1.0], [1.0, np.nan]]),
                    np.full((2, 2), np.nan), np.linspace(-3.0, 4.0, 12).reshape(3, 4)):
@@ -317,7 +317,7 @@ def test_live_plot_draws_the_uniform_seed_field():
     matplotlib.use("Agg")
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
-    import results
+    from proptimiser import results
 
     params = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6)).condition(0)
     fig = Figure()
@@ -333,11 +333,11 @@ def test_solvers_report_progress_and_stop():
     import threading
 
     base = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6, opt_max_iter=2, opt_print_every=1, opt_verbose=0))
-    for solver in proptimiser.SOLVERS:
+    for solver in optimiser.SOLVERS:
         prop = base.with_inputs(dataclasses.replace(base.inputs, opt_solver=solver))
         reports = []
-        result = proptimiser.run_optimization(prop, callback=reports.append, stop_event=threading.Event())
-        assert reports and all(isinstance(p, proptimiser.Progress) for p in reports), solver
+        result = optimiser.run_optimization(prop, callback=reports.append, stop_event=threading.Event())
+        assert reports and all(isinstance(p, optimiser.Progress) for p in reports), solver
         assert reports[-1].status in ("max_iter", "converged") and reports[-1].iteration <= 2, (solver, reports[-1].status)
         assert len(result.error_log) == reports[-1].iteration + 1 == len(result.time_log), solver
         assert reports[-1].condition(1).omega == prop.omega[1]
@@ -346,7 +346,7 @@ def test_solvers_report_progress_and_stop():
         stop = threading.Event()
         stop.set()
         reports = []
-        result = proptimiser.run_optimization(prop, callback=reports.append, stop_event=stop)
+        result = optimiser.run_optimization(prop, callback=reports.append, stop_event=stop)
         assert reports[-1].status == "stopped" and reports[-1].iteration == 0, solver
         assert result.c.shape == prop.c.shape
 
@@ -356,7 +356,7 @@ def test_solvers_report_progress_and_stop():
 # ---------------------------------------------------------------------------
 
 def test_bemt_jacobian_is_block_diagonal():
-    import propmodel
+    from proptimiser import propmodel
 
     params = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6)).condition(0)
     lam = params.V_i_0[params.cfg.solve_rows] / propmodel.get_velocity_scales(params)
@@ -367,7 +367,7 @@ def test_bemt_jacobian_is_block_diagonal():
 
 def test_newton_bemt_converges_and_matches_a_tighter_solve():
     import dataclasses
-    import propmodel
+    from proptimiser import propmodel
 
     prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=8))
     params = prop.condition(0)
@@ -385,7 +385,7 @@ def test_newton_bemt_converges_and_matches_a_tighter_solve():
 def test_bracketed_fallback_finds_the_newton_roots():
     # With no Newton iterations every station goes to the bracketed fallback, which must reach the same roots
     import dataclasses
-    import propmodel
+    from proptimiser import propmodel
 
     for coeff_method in (0, 3):
         params = Propeller.default(inputs=Inputs(coeff_method=coeff_method, n_r=8)).condition(1)
@@ -401,24 +401,24 @@ def test_bracketed_fallback_finds_the_newton_roots():
 def test_blend_zone_carries_no_force():
     # The blend zone is not solved: its geometry (set by the hub values) must not change thrust or torque
     import dataclasses
-    import propmodel
+    from proptimiser import propmodel
 
     inputs = Inputs(coeff_method=0, n_r=16)
     base = Propeller.default(inputs=inputs)
     wide_hub = Propeller.default(inputs=inputs, blade=dataclasses.replace(base.blade, hub_chord=0.06, hub_twist_deg=20.0))
     assert not bool(jnp.all(propmodel.aero_zone(base.condition(0))))
-    solver = proptimiser.SLSQPSolver(base)
-    solver_wide = proptimiser.SLSQPSolver(wide_hub)
+    solver = optimiser.SLSQPSolver(base)
+    solver_wide = optimiser.SLSQPSolver(wide_hub)
     assert not np.allclose(solver.params_struct.c, solver_wide.params_struct.c)
-    J, g, _ = proptimiser.problem_values(solver.vars_scaled, solver.params_struct, solver.space)
-    J_wide, g_wide, _ = proptimiser.problem_values(solver_wide.vars_scaled, solver_wide.params_struct, solver_wide.space)
+    J, g, _ = optimiser.problem_values(solver.vars_scaled, solver.params_struct, solver.space)
+    J_wide, g_wide, _ = optimiser.problem_values(solver_wide.vars_scaled, solver_wide.params_struct, solver_wide.space)
     assert np.isclose(float(J), float(J_wide), rtol=1e-9)
     assert np.allclose(np.asarray(g), np.asarray(g_wide), rtol=1e-9, atol=1e-12)
 
 
 def test_zero_radius_station_is_handled():
     # A blade whose BEMT grid starts at r = 0 (a zero-area annulus with no momentum equation)
-    import propmodel
+    from proptimiser import propmodel
 
     prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=8), blade=BladeSpec(r_foils=(0.0, 0.0, 0.05, 0.15, 0.275)))
     assert float(prop.r[0]) == 0.0
@@ -428,9 +428,9 @@ def test_zero_radius_station_is_handled():
 
 
 def test_cost_gradient_matches_finite_differences():
-    solver = proptimiser.LBFGSBSolver(Propeller.default(inputs=Inputs(coeff_method=0, n_r=6)))
+    solver = optimiser.LBFGSBSolver(Propeller.default(inputs=Inputs(coeff_method=0, n_r=6)))
     x, ps, space = solver.vars_scaled, solver.params_struct, solver.space
-    f = lambda v: proptimiser.total_cost(v, ps, space)[0]
+    f = lambda v: optimiser.total_cost(v, ps, space)[0]
     g = jax.grad(f)(x)
     rng = np.random.default_rng(1)
     d = {k: jnp.asarray(rng.standard_normal(v.shape)) for k, v in x.items()}
@@ -443,32 +443,32 @@ def test_cost_gradient_matches_finite_differences():
 def test_constraints_match_their_groups():
     for inputs in (Inputs(coeff_method=0, n_r=6), Inputs(coeff_method=3, n_r=6)):
         prop = Propeller.default(inputs=inputs)
-        space = proptimiser.DesignSpace.build(prop)
-        J, g, _ = proptimiser.problem_values(space.to_unit(prop), prop.batched(), space)
+        space = optimiser.DesignSpace.build(prop)
+        J, g, _ = optimiser.problem_values(space.to_unit(prop), prop.batched(), space)
         assert g.shape == (sum(n for _, n in space.constraint_groups(inputs.n_cond)),)
         assert np.isfinite(float(J)) and float(J) > 0
 
 
 def test_confidence_constraint_is_load_weighted_and_keeps_its_gradient():
-    import propmodel
+    from proptimiser import propmodel
 
     x = jnp.array([0.0, 0.1, 0.35, 0.4, 1.0])
-    assert np.isclose(jnp.sum(proptimiser._trapezoid_weights(x) * jnp.sin(3 * x)), jnp.trapezoid(jnp.sin(3 * x), x=x))
+    assert np.isclose(jnp.sum(optimiser._trapezoid_weights(x) * jnp.sin(3 * x)), jnp.trapezoid(jnp.sin(3 * x), x=x))
 
     # One constraint per condition: the confidence averaged over the aerodynamic zone, weighted by V_R^2 dr dpsi
     # (no chord factor, so shrinking a station cannot remove it from the average)
     prop = Propeller.default(inputs=Inputs(coeff_method=3, n_r=6))
-    space = proptimiser.DesignSpace.build(prop)
+    space = optimiser.DesignSpace.build(prop)
     ps = prop.batched()
-    g = np.asarray(proptimiser.constraint_values(proptimiser.evaluate_all_conditions(ps), ps, space))
+    g = np.asarray(optimiser.constraint_values(optimiser.evaluate_all_conditions(ps), ps, space))
     p = prop.condition(0)
     V_i, _ = propmodel.induced_velocity(p)
-    import airflow
+    from proptimiser import airflow
     V_R, _ = airfoil.resultantVelocityComponents(V_i, p)
     V_R = airflow.to_grid(V_R, p)
     confidence = np.exp(np.asarray(airflow.to_grid(airfoil.aero_coeffs(V_i, p, return_log_confidence=True)[3], p)))
-    w = (np.asarray(V_R) ** 2 * np.asarray(proptimiser._trapezoid_weights(p.r))[:, None]
-         * np.asarray(proptimiser._periodic_weights(p.psi))[None, :])[np.array(space.aero_stations)]
+    w = (np.asarray(V_R) ** 2 * np.asarray(optimiser._trapezoid_weights(p.r))[:, None]
+         * np.asarray(optimiser._periodic_weights(p.psi))[None, :])[np.array(space.aero_stations)]
     expected = np.sum(w * confidence[np.array(space.aero_stations)]) / np.sum(w)
     assert np.isclose(np.exp(g[-prop.inputs.n_cond]) * prop.inputs.min_confidence, expected, rtol=1e-6)
 
@@ -482,7 +482,7 @@ def test_confidence_constraint_is_load_weighted_and_keeps_its_gradient():
 
 
 def test_prandtl_loss_follows_the_closed_form_and_vanishes_at_the_ends():
-    import airflow
+    from proptimiser import airflow
 
     prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=20, tip_loss_model=1, root_loss_model=1))
     p = prop.condition(0)
@@ -521,23 +521,23 @@ def test_planform_penalty_couples_neighbouring_chords():
     taper = np.where(aero, 0.06 * np.exp(-6.0 * (r - prop.blade.R_aero)), 0.03)
     spike = taper.copy()
     spike[int(np.argmax(aero)) + 3] = 0.001
-    penalty = lambda c: float(proptimiser.planform_penalty(with_chord(c)))
+    penalty = lambda c: float(optimiser.planform_penalty(with_chord(c)))
 
     assert penalty(taper) < 1e-12                       # geometric taper (the blend-zone steps are not penalised)
     assert penalty(spike) > 100 * max(penalty(taper), 1e-9)
     # Its gradient grows as the station shrinks, so no chord bound is a stationary point
-    grad_at = lambda value: float(jax.grad(lambda c: proptimiser.planform_penalty(with_chord(c)))(
+    grad_at = lambda value: float(jax.grad(lambda c: optimiser.planform_penalty(with_chord(c)))(
         jnp.asarray(spike).at[int(np.argmax(aero)) + 3].set(value))[int(np.argmax(aero)) + 3])
     assert abs(grad_at(0.001)) > 5 * abs(grad_at(0.005))
-    g = jax.grad(lambda c: proptimiser.planform_penalty(with_chord(c)))(jnp.asarray(spike))
+    g = jax.grad(lambda c: optimiser.planform_penalty(with_chord(c)))(jnp.asarray(spike))
     assert np.all(np.isfinite(np.asarray(g)))
 
 
 def test_curvature_scale_is_positive_and_normalised():
     prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6))
-    space = proptimiser.DesignSpace.build(prop)
+    space = optimiser.DesignSpace.build(prop)
     x = space.to_unit(prop)
-    s = proptimiser.curvature_scale(x, space.from_unit(x, prop.batched()), space)
+    s = optimiser.curvature_scale(x, space.from_unit(x, prop.batched()), space)
     assert np.all(np.isfinite(s)) and np.all(s > 0)
     assert np.isclose(np.exp(np.mean(np.log(s))), 1.0)
 
@@ -547,7 +547,7 @@ def test_curvature_scale_is_positive_and_normalised():
 # ---------------------------------------------------------------------------
 
 def test_azimuth_mean_is_the_full_turn_rule():
-    import propmodel
+    from proptimiser import propmodel
 
     for n_psi in (6, 12, 25):
         psi = jnp.linspace(0.0, 2 * jnp.pi, n_psi, endpoint=False)
@@ -556,12 +556,12 @@ def test_azimuth_mean_is_the_full_turn_rule():
         # harmonics below n_psi leave only the constant term (the old trapezoid rule gave (n_psi - 1) / n_psi of it)
         field = 2.0 + jnp.sin(psi + 0.3) + 0.5 * jnp.cos(2 * psi)
         assert np.isclose(float(propmodel.azimuth_mean(jnp.tile(field, 3), p)[0]), 2.0, rtol=0, atol=1e-14)
-        assert np.allclose(np.asarray(proptimiser._periodic_weights(psi)), 2 * np.pi / n_psi)
+        assert np.allclose(np.asarray(optimiser._periodic_weights(psi)), 2 * np.pi / n_psi)
 
 
 def test_momentum_thrust_and_torque_integrate_a_full_turn():
     # Uniform inflow in psi: the annulus integral is 2 pi times the local momentum flux, for any n_psi
-    import propmodel
+    from proptimiser import propmodel
 
     for n_psi in (12, 24):
         p = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6, n_psi=n_psi)).condition(0)
@@ -577,8 +577,8 @@ def test_zero_offsets_match_unswept_aero():
     # The swept section frame must reduce to the unswept aerodynamics at zero offsets. An unswept blade never takes
     # it, so it is forced on here. The literals are the unswept results recorded after the azimuth-quadrature fix.
     import dataclasses
-    import airflow
-    import propmodel
+    from proptimiser import airflow
+    from proptimiser import propmodel
 
     prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6))
     recorded = [(49.89642176871895, 4.566568796083332, 2685.142452096999),
@@ -602,7 +602,7 @@ def test_zero_offsets_match_unswept_aero():
 
 def test_blade_element_thrust_matches_momentum_thrust_without_loss_models():
     # The solve equates the two sides station by station, so their radial integrals agree for any n_psi
-    import propmodel
+    from proptimiser import propmodel
 
     for n_psi in (12, 24):
         p = Propeller.default(inputs=Inputs(coeff_method=0, n_r=6, n_psi=n_psi)).condition(1)

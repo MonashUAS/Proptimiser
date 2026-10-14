@@ -9,10 +9,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-import init  # noqa: F401  sets float64 before the arrays are built
-import propmodel
-from casadi_prop import PropellerModel
-from init import Inputs, Propeller
+from proptimiser import init  # noqa: F401  sets float64 before the arrays are built
+from proptimiser import propmodel
+from proptimiser.casadi_prop import PropellerModel
+from proptimiser.init import Inputs, Propeller
 
 THRUST_SCALE_N = 30.0
 

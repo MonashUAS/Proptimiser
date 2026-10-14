@@ -1,8 +1,8 @@
 '''
 Proptimiser graphical interface.
 
-    python app.py                   # start from the default propeller
-    python app.py currawong_v2      # open designs/currawong_v2.yaml and propellers/currawong_v2.state.json
+    proptimiser-gui                 # start from the default propeller
+    proptimiser-gui currawong_v2    # open designs/currawong_v2.yaml and propellers/currawong_v2.state.json
 
 '''
 
@@ -15,7 +15,7 @@ import sys
 os.environ.setdefault("QT_API", "pyside6")
 
 # Internal Imports: init applies the JAX configuration before anything else imports JAX
-import init
+from . import init
 
 import matplotlib
 matplotlib.use("QtAgg")
@@ -27,8 +27,8 @@ matplotlib.rcParams.update({
 
 from PySide6.QtWidgets import QApplication
 
-from gui.main_window import MainWindow
-from gui.session import Session
+from .gui.main_window import MainWindow
+from .gui.session import Session
 
 
 def main(argv):
@@ -53,5 +53,9 @@ def main(argv):
     return app.exec()
 
 
-if __name__ == "__main__":
+def run():
     sys.exit(main(sys.argv))
+
+
+if __name__ == "__main__":
+    run()

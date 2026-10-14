@@ -16,10 +16,10 @@ import equinox as eqx
 from abc import ABC, abstractmethod
 
 # Internal Imports
-import airflow
-import airfoil
-import geometry
-import propmodel
+from . import airflow
+from . import airfoil
+from . import geometry
+from . import propmodel
 
 _stop_event = threading.Event()
 _sigint_installed = False
@@ -922,7 +922,7 @@ def run_optimization(prop, update_queue=None, callback=None, stop_event=None):
 
 if __name__ == "__main__":
     ## Testing of optimiser functions
-    from init import Propeller
+    from .init import Propeller
 
     # generate basic propeller
     prop = Propeller.default()
