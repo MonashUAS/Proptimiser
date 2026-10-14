@@ -15,32 +15,35 @@ Shape rules that make the two namespaces agree:
 from types import SimpleNamespace
 
 import numpy as np
-import jax
-import jax.numpy as jnp
+
+from ._jax import HAS_JAX, jax, jnp, require_jax
 
 
-def _logaddexp(a, b):
-    """Stable log(exp(a) + exp(b)) of two arrays."""
-    m = jnp.maximum(a, b)
-    return m + jnp.log(jnp.exp(a - m) + jnp.exp(b - m))
+if HAS_JAX:
+    def _logaddexp(a, b):
+        """Stable log(exp(a) + exp(b)) of two arrays."""
+        m = jnp.maximum(a, b)
+        return m + jnp.log(jnp.exp(a - m) + jnp.exp(b - m))
 
 
-JAX_OPS = SimpleNamespace(
-    name="jax",
-    sin=jnp.sin, cos=jnp.cos, tan=jnp.tan, arctan2=jnp.arctan2, arccos=jnp.arccos,
-    sqrt=jnp.sqrt, exp=jnp.exp, log=jnp.log, tanh=jnp.tanh, abs=jnp.abs,
-    maximum=jnp.maximum, minimum=jnp.minimum, clip=jnp.clip, where=jnp.where,
-    sum=jnp.sum, mean=jnp.mean, matmul=jnp.matmul,
-    concatenate=jnp.concatenate, stack=jnp.stack, column_stack=jnp.column_stack,
-    ones_like=jnp.ones_like, zeros_like=jnp.zeros_like,
-    vstack_scalars=lambda items: jnp.stack(items)[:, None],   # list of scalars -> column (k, 1)
-    row=lambda matrix, i: matrix[i],                          # row i of a stack of fields
-    row_add=lambda x, row: x + row,                           # (p, n) + (n,): CasADi does not broadcast
-    const=lambda x: x,                                        # a constant array, in the namespace's array type
-    swish=jax.nn.swish,
-    log_sigmoid=jax.nn.log_sigmoid,
-    logaddexp=_logaddexp,
-)
+    JAX_OPS = SimpleNamespace(
+        name="jax",
+        sin=jnp.sin, cos=jnp.cos, tan=jnp.tan, arctan2=jnp.arctan2, arccos=jnp.arccos,
+        sqrt=jnp.sqrt, exp=jnp.exp, log=jnp.log, tanh=jnp.tanh, abs=jnp.abs,
+        maximum=jnp.maximum, minimum=jnp.minimum, clip=jnp.clip, where=jnp.where,
+        sum=jnp.sum, mean=jnp.mean, matmul=jnp.matmul,
+        concatenate=jnp.concatenate, stack=jnp.stack, column_stack=jnp.column_stack,
+        ones_like=jnp.ones_like, zeros_like=jnp.zeros_like,
+        vstack_scalars=lambda items: jnp.stack(items)[:, None],   # list of scalars -> column (k, 1)
+        row=lambda matrix, i: matrix[i],                          # row i of a stack of fields
+        row_add=lambda x, row: x + row,                           # (p, n) + (n,): CasADi does not broadcast
+        const=lambda x: x,                                        # a constant array, in the namespace's array type
+        swish=jax.nn.swish,
+        log_sigmoid=jax.nn.log_sigmoid,
+        logaddexp=_logaddexp,
+    )
+else:
+    JAX_OPS = None
 
 _CASADI_OPS = None
 
@@ -111,6 +114,7 @@ def ops(cfg):
     """The namespace for ModelConfig cfg (cfg.backend: "jax" or "casadi")."""
     global _CASADI_OPS
     if cfg.backend == "jax":
+        require_jax('the "jax" backend')
         return JAX_OPS
     if cfg.backend == "casadi":
         if _CASADI_OPS is None:

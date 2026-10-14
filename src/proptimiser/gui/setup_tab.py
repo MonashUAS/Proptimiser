@@ -50,8 +50,11 @@ INPUT_GROUPS = [
     ]),
     ("Motor", [
         Field("I_0", "No-load current [A]", "float"),
-        Field("R_m", "Winding resistance [ohm]", "float"),
+        Field("R_tot", "Motor, ESC and lead resistance [ohm]", "float"),
         Field("kV", "kV [RPM/V]", "float"),
+        Field("kappa", "ESC voltage factor", "float", tooltip="1 for a motor on a direct supply"),
+        Field("Q0", "No-load friction torque [Nm]", "float"),
+        Field("V_bus", "Bus voltage [V]", "float", tooltip="0 sets no limit on the ESC duty"),
     ]),
     ("Constraints", [
         Field("thrust_tol", "Thrust tolerance", "float", tooltip="Relative thrust error allowed about each target"),

@@ -1,10 +1,10 @@
-import jax
+from ._jax import jax, jnp, eqx, ARRAY_TYPES, HAS_JAX
 # Set jax debugging
-jax.config.update("jax_traceback_filtering", "off")
-jax.config.update("jax_check_tracer_leaks", "on")
-jax.config.update("jax_disable_jit", False)
-jax.config.update("jax_debug_nans", False)
-jax.config.update("jax_enable_x64", True)
+if HAS_JAX:
+    jax.config.update("jax_traceback_filtering", "off")
+    jax.config.update("jax_check_tracer_leaks", "on")
+    jax.config.update("jax_disable_jit", False)
+    jax.config.update("jax_debug_nans", False)
 
 import dataclasses
 import json
@@ -14,8 +14,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-import equinox as eqx
-import jax.numpy as jnp
 import numpy as np
 import yaml
 
@@ -23,7 +21,7 @@ import yaml
 from . import geometry
 
 from .paths import DESIGN_DIR, PROP_DIR      # hand design files <name>.yaml, solved state files <name>.state.json
-DESIGN_FORMAT = 1
+DESIGN_FORMAT = 2
 STATE_FORMAT = 1
 
 # Inputs fields holding one entry per flight condition
@@ -88,9 +86,12 @@ class Inputs:
     objective_weight: jnp.ndarray = dataclasses.field(default_factory=_array([0.9, 0.1]))
 
     # Motor Information
-    I_0: float = 2.0
-    R_m: float = 0.037
-    kV: float = 220.0
+    I_0: float = 2.0                # no-load current (A)
+    R_tot: float = 0.037            # motor, ESC and lead resistance (ohm)
+    kV: float = 220.0               # speed constant (rpm/V)
+    kappa: float = 1.0              # ESC voltage factor (nd): 1 for a motor on a direct supply
+    Q0: float = 0.0                 # friction torque at no load (Nm), on top of the no-load current I_0
+    V_bus: float = 0.0              # battery voltage (V): 0 sets no limit on the duty
     P_max: float = 3300.0
 
     # Cost Penalties
@@ -281,8 +282,11 @@ class ModelConfig:
     rot_corr_model: int
     high_induction_model: int
     I_0: float
-    R_m: float
+    R_tot: float
     kV: float
+    kappa: float
+    Q0: float
+    V_bus: float
     P_max: float
     w_thrust: float
     thrust_tol: float
@@ -290,7 +294,7 @@ class ModelConfig:
     w_confidence: float
     w_smooth: float
     min_confidence: float
-    backend: str = "jax"           # array namespace of the physics: "jax" or "casadi" (backend.py)
+    backend: str = "jax" if HAS_JAX else "casadi"           # array namespace of the physics: "jax" or "casadi" (backend.py)
 
     @classmethod
     def build(cls, inputs: Inputs, blade: BladeSpec) -> "ModelConfig":
@@ -588,7 +592,9 @@ class Propeller:
         for idx in range(self.inputs.n_cond):
             V_scale = get_velocity_scales(self._params(idx, jnp.zeros((3, n_r))))
             # Introduce zero for non-solved components to maintain shape (3, n_r)
-            seeds.append(jnp.zeros((3, n_r)).at[rows].set(jnp.broadcast_to(V_scale, (len(rows), n_r))))
+            seed_i = np.zeros((3, n_r))
+            seed_i[rows] = np.broadcast_to(np.asarray(V_scale), (len(rows), n_r))
+            seeds.append(jnp.asarray(seed_i))
         seed = jnp.stack(seeds)
         if V_i_0 is None:
             return seed
@@ -658,7 +664,7 @@ _INPUT_ANGLES = ("tilt",)
 
 DESIGN_HEADER = """\
 # Proptimiser design: {name}
-# Units: SI. Lengths m, speeds m/s, omega rad/s, thrust N, power W, I_0 A, R_m ohm, kV rpm/V,
+# Units: SI. Lengths m, speeds m/s, omega rad/s, thrust N, power W, I_0 A, R_tot ohm, kV rpm/V, kappa nd, Q0 Nm, V_bus V,
 # density kg/m^3, E, G and allowable stresses Pa. Angles in degrees: every key that ends in _deg.
 # Dimensionless (nd): weights, tolerances, ratios, CST weights, fill_factor.
 # Every key is required. An unknown key is an error. Write floats with a dot (1.0e-8, not 1e-8).
@@ -695,6 +701,21 @@ def design_yaml(inputs: Inputs, blade: BladeSpec, name: str = "") -> str:
     return DESIGN_HEADER.format(name=name) + body
 
 
+def _migrate_design_1(data: dict) -> dict:
+    '''
+    Format 1 to format 2: R_m (motor winding resistance) becomes R_tot, and the ESC factor kappa, the friction torque
+    Q0 and the bus voltage V_bus take the values that give the old motor model (1, 0 and 0).
+    '''
+    if not isinstance(data.get("inputs"), dict):
+        return data                   # the checks below name the fault
+    inputs = {}
+    for key, value in data["inputs"].items():
+        inputs["R_tot" if key == "R_m" else key] = value
+        if key == "kV":
+            inputs.update(kappa=1.0, Q0=0.0, V_bus=0.0)
+    return {**data, "format_version": DESIGN_FORMAT, "inputs": inputs}
+
+
 def design_from_dict(data: dict, source="design") -> tuple:
     '''
     (Inputs, BladeSpec) from the design YAML content. Rejects a missing key, an unknown key and a format_version
@@ -703,6 +724,8 @@ def design_from_dict(data: dict, source="design") -> tuple:
     if not isinstance(data, dict):
         raise ValueError(f"{source}: the design file must hold a mapping")
     _check_keys(data, ["format_version", "inputs", "blade"], source)
+    if data["format_version"] == 1:
+        data = _migrate_design_1(data)
     if data["format_version"] != DESIGN_FORMAT:
         raise ValueError(f"{source}: format_version {data['format_version']!r} is not supported "
                          f"(expected {DESIGN_FORMAT})")
@@ -782,7 +805,7 @@ def _to_json(value):
         return {k: _to_json(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_to_json(v) for v in value]
-    if isinstance(value, (jax.Array, np.ndarray)):
+    if isinstance(value, ARRAY_TYPES):
         return np.asarray(value).tolist()
     if isinstance(value, np.generic):
         return value.item()

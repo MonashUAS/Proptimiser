@@ -1,5 +1,5 @@
 # external imports
-import jax.numpy as jnp
+from ._jax import jnp
 
 # internal imports
 from . import geometry

@@ -7,8 +7,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
-import jax
-import jax.numpy as jnp
+from ._jax import jnp
 import aerosandbox as asb
 
 # CST vectors are stored as [lower weights x8, upper weights x8, LE weight, TE thickness]
@@ -147,7 +146,7 @@ def cst_at_stations(r, r_cst, cst):
 
     Returns shape (n_r, N_CST).
     """
-    return jax.vmap(jnp.interp, in_axes=(None, None, 1), out_axes=1)(r, r_cst, cst)
+    return jnp.stack([jnp.interp(r, r_cst, cst[:, k]) for k in range(cst.shape[1])], axis=1)
 
 ### Hub and Blend Zone Functions
 def stadium_coordinates(template_coords, thickness_ratio):

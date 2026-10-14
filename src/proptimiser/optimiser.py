@@ -65,7 +65,8 @@ def objectives(params):
 
     # calculate the motor power
     cfg = params.cfg
-    motor_power = propmodel.motorPower(torque, params.omega, I_0 = cfg.I_0, R_m = cfg.R_m, kV = cfg.kV)
+    motor_power = propmodel.motorPower(torque, params.omega, I_0=cfg.I_0, R_tot=cfg.R_tot, kV=cfg.kV,
+                                       kappa=cfg.kappa, Q0=cfg.Q0)
 
     # Return V_i_0 so we can catch it!
     return motor_power, thrust, V_i_0
@@ -77,7 +78,7 @@ def objectives(params):
 #   objective    J = sum_i w_i P_i / sum_i w_i P_ideal,i   motor power relative to the ideal (actuator disc) power of
 #                                                            the thrust targets; ~1/efficiency, proportional to energy
 #   constraints  g >= 0, each relative to its own limit:    thrust within +/- thrust_tol of the target, motor power
-#                                                            below P_max, section t/c above min_tc, load-weighted
+#                                                            below P_max, ESC duty below 1, section t/c above min_tc, load-weighted
 #                                                            NeuralFoil confidence above min_confidence (see
 #                                                            constraint_values)
 
@@ -85,6 +86,7 @@ class ConditionOutputs(NamedTuple):
     power: jnp.ndarray          # motor power (W)
     thrust: jnp.ndarray         # thrust (N)
     ideal_power: jnp.ndarray    # actuator disc power at the thrust target (W)
+    duty: jnp.ndarray           # ESC duty: motor terminal voltage over V_bus (nd), 0 when V_bus is 0
     log_load: jnp.ndarray       # per station: log of the section dynamic-pressure weight, sum over psi of V_R^2 dr dpsi
     log_load_confidence: jnp.ndarray  # per station: log of the same sum weighted by the NeuralFoil confidence
     V_i_0: jnp.ndarray          # solved induced velocity (warm start for the next evaluation)
@@ -111,7 +113,10 @@ def condition_outputs(params) -> ConditionOutputs:
     thrust = jnp.squeeze(propmodel.thrust(V_i, params))
     torque = jnp.squeeze(propmodel.torque(V_i, params))
     cfg = params.cfg
-    motor_power = propmodel.motorPower(torque, params.omega, I_0=cfg.I_0, R_m=cfg.R_m, kV=cfg.kV)
+    motor_power = propmodel.motorPower(torque, params.omega, I_0=cfg.I_0, R_tot=cfg.R_tot, kV=cfg.kV,
+                                       kappa=cfg.kappa, Q0=cfg.Q0)
+    duty = propmodel.motor_voltage(torque, params.omega, cfg.I_0, cfg.R_tot, cfg.kV, cfg.kappa, cfg.Q0) / jnp.where(
+        cfg.V_bus > 0, cfg.V_bus, jnp.inf)          # 0 when V_bus = 0: no limit
 
     if cfg.coeff_method == 3:
         _, _, _, log_confidence = airfoil.aero_coeffs(V_i, params, return_log_confidence=True)
@@ -126,7 +131,7 @@ def condition_outputs(params) -> ConditionOutputs:
     V_R = airflow.to_grid(V_R, params)
     log_load = (2 * jnp.log(jnp.maximum(V_R, 1e-6)) + jnp.log(_trapezoid_weights(params.r))[:, None]
                 + jnp.log(_periodic_weights(params.psi))[None, :])
-    return ConditionOutputs(motor_power, thrust, propmodel.actuator_disk_power(params.thrust_target, params),
+    return ConditionOutputs(motor_power, thrust, propmodel.actuator_disk_power(params.thrust_target, params), duty,
                             jax.nn.logsumexp(log_load, axis=1), jax.nn.logsumexp(log_load + log_confidence, axis=1),
                             V_i_0)
 
@@ -167,6 +172,8 @@ def constraint_values(outputs, params_struct, space):
     g = [cfg.thrust_tol - rel_thrust, cfg.thrust_tol + rel_thrust, 1.0 - outputs.power / cfg.P_max]
     if space.cst_active:
         g.append(geometry.max_thickness(params_struct.cst[0, 1:]) / space.min_tc - 1.0)
+    if space.duty_active:
+        g.append(1.0 - outputs.duty)
     if space.confidence_active:
         aero = np.array(space.aero_stations)
         g.append(jax.nn.logsumexp(outputs.log_load_confidence[:, aero], axis=1)
@@ -213,7 +220,7 @@ def penalty(g, params_struct, space):
     weighted by w_thrust, thickness by w_thickness, confidence by w_confidence.
     """
     cfg = params_struct.cfg
-    weights = {"thrust (upper)": cfg.w_thrust, "thrust (lower)": cfg.w_thrust, "motor power": cfg.w_thrust,
+    weights = {"thrust (upper)": cfg.w_thrust, "thrust (lower)": cfg.w_thrust, "motor power": cfg.w_thrust, "motor duty": cfg.w_thrust,
                "thickness": cfg.w_thickness, "confidence": cfg.w_confidence}
     total, start = 0.0, 0
     for name, size in space.constraint_groups(params_struct.omega.shape[0]):
@@ -273,6 +280,7 @@ class DesignSpace(eqx.Module):
     min_tc: float = eqx.field(static=True)
     aero_stations: tuple = eqx.field(static=True)       # radial stations in the aerodynamic zone (r >= r_aero)
     confidence_active: bool = eqx.field(static=True)    # NeuralFoil confidence constraint in use
+    duty_active: bool = eqx.field(static=True)          # ESC duty limit in use (Inputs.V_bus > 0)
 
     @classmethod
     def build(cls, prop):
@@ -327,6 +335,7 @@ class DesignSpace(eqx.Module):
             min_tc=blade.min_tc,
             aero_stations=tuple(int(i) for i in np.flatnonzero(r >= blade.R_aero)),
             confidence_active=inputs.coeff_method == 3 and inputs.min_confidence > 0,
+            duty_active=inputs.V_bus > 0,
         )
 
     def constraint_groups(self, n_cond):
@@ -336,6 +345,8 @@ class DesignSpace(eqx.Module):
         groups = [("thrust (upper)", n_cond), ("thrust (lower)", n_cond), ("motor power", n_cond)]
         if self.cst_active:
             groups.append(("thickness", len(self.seed["cst"])))
+        if self.duty_active:
+            groups.append(("motor duty", n_cond))
         if self.confidence_active:
             groups.append(("confidence", n_cond))
         return groups

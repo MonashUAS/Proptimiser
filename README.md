@@ -79,7 +79,7 @@ The YAML file has three keys: `format_version` (1), `inputs` and `blade`.
 `offset_r`, `offset_y` and `offset_z` give the sweep and rake of the pitch axis. `mat_*` and `fill_factor` give
 the blade material.
 
-The motor values (`I_0`, `R_m`, `kV`, `P_max`) and the off-axis inflow (`V_yz`) stay in the design YAML.
+The motor values (`I_0`, `R_tot`, `kV`, `kappa`, `Q0`, `V_bus`, `P_max`) and the off-axis inflow (`V_yz`) stay in the design YAML.
 The optimiser uses them for the motor power and the inflow. Contract A does not contain them.
 
 ### State JSON

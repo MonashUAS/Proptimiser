@@ -15,11 +15,10 @@ import dataclasses
 from typing import NamedTuple
 
 import casadi as cas
-import jax
-import jax.numpy as jnp
 import numpy as np
 
 from . import propmodel
+from ._jax import HAS_JAX, jnp, require_jax
 
 
 def casadi_params(params, **symbols):
@@ -28,8 +27,10 @@ def casadi_params(params, **symbols):
     Each keyword replaces a field with a CasADi symbol or a number, e.g. omega=opti.variable().
     """
     cfg = dataclasses.replace(params.cfg, backend="casadi")
-    constants = jax.tree_util.tree_map(np.asarray, dataclasses.replace(params, cfg=cfg))
-    return dataclasses.replace(constants, **symbols)
+    static = {"cfg", "airfoil_interp"}
+    constants = {f.name: np.asarray(getattr(params, f.name)) for f in dataclasses.fields(params)
+                 if f.name not in static}
+    return dataclasses.replace(params, **{**constants, **symbols, "cfg": cfg})
 
 
 class PropExpressions(NamedTuple):
@@ -64,6 +65,7 @@ class PropellerModel:
         self.n_aero = int(aero.sum())
         n_r = aero.size
         # E (n_aero, n_r) places the solved stations in the full station grid; the blend zone stays at lambda = 1
+        self._solver = None
         self._embed = np.eye(n_r)[aero]
         self._blend_seed = np.ones((self.n_solved, n_r)) * (~aero)
 
@@ -113,11 +115,53 @@ class PropellerModel:
         opti.subject_to(cas.vec(expr.residual) == 0)
         return PropOutputs(expr.thrust_N, expr.torque_Nm, expr.shaft_power_W, lam, flat)
 
+    def solve(self, omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3=None, mu_Pa_s=None, a_m_s=None,
+              tol=1e-10, max_iter=100):
+        """
+        The BEMT solution at a numeric flight state, by damped Newton iteration on the CasADi residuals (no JAX).
+        Returns (thrust_N, torque_Nm, lam) with lam of shape (k, n_aero), the values that start an Opti variable.
+        Raises RuntimeError when the iteration does not converge.
+        """
+        air = [self._base.rho if rho_kg_m3 is None else rho_kg_m3, self._base.mu if mu_Pa_s is None else mu_Pa_s,
+               self._base.a if a_m_s is None else a_m_s]
+        values = np.array([omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, *air], dtype=float)
+        if self._solver is None:
+            flat = cas.MX.sym("lam", self.n_solved * self.n_aero)
+            state = cas.MX.sym("state", 7)
+            expr = self.expressions(cas.reshape(flat, self.n_solved, self.n_aero), state[0], state[1], state[2],
+                                    state[3], state[4], state[5], state[6])
+            residual = cas.vec(expr.residual)
+            self._solver = (cas.Function("residual", [flat, state], [residual]),
+                            cas.Function("jacobian", [flat, state], [cas.jacobian(residual, flat)]),
+                            cas.Function("loads", [flat, state], [expr.thrust_N, expr.torque_Nm]))
+        residual, jacobian, loads = self._solver
+        norm = lambda x: float(np.max(np.abs(np.asarray(residual(x, values)))))
+        x, error = np.ones(self.n_solved * self.n_aero), None
+        error = norm(x)
+        for _ in range(max_iter):
+            if error < tol:
+                break
+            step = np.linalg.solve(np.asarray(jacobian(x, values)), -np.asarray(residual(x, values)).ravel())
+            alpha = 1.0
+            while alpha > 1e-4:
+                trial = x + alpha * step
+                trial_error = norm(trial)
+                if np.isfinite(trial_error) and trial_error < error:
+                    break
+                alpha *= 0.5
+            else:
+                raise RuntimeError(f"BEMT Newton iteration stalled at residual {error:.2e}")
+            x, error = trial, trial_error
+        if error >= tol:
+            raise RuntimeError(f"BEMT Newton iteration did not converge: residual {error:.2e}")
+        thrust, torque = loads(x, values)
+        return float(thrust), float(torque), x.reshape(self.n_solved, self.n_aero, order="F")
+
     def solve_jax(self, omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3=None, mu_Pa_s=None, a_m_s=None):
         """
-        The BEMT solution at a numeric flight state by the JAX solver (Newton with a bracketed fallback).
-        Returns (thrust_N, torque_Nm, lam) with lam of shape (k, n_aero), the values that start an Opti variable.
+        The same solution by the JAX solver (Newton with a bracketed fallback). Needs JAX. Used to check solve().
         """
+        require_jax("PropellerModel.solve_jax")
         fields = self._flight(omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3, mu_Pa_s, a_m_s)
         params = dataclasses.replace(self.params, **{k: jnp.asarray(v, dtype=float) for k, v in fields.items()})
         V_i, V_i_0 = propmodel.induced_velocity(params)
@@ -129,8 +173,8 @@ class PropellerModel:
     def warm_start(self, opti, outputs, omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3=None,
                    mu_Pa_s=None, a_m_s=None):
         """
-        Starts the inflow variables of outputs (from add_to) at the JAX solution for numeric guesses of the flight
+        Starts the inflow variables of outputs (from add_to) at the Newton solution for numeric guesses of the flight
         state. This keeps IPOPT on the attached-flow root of the BEMT, and saves iterations.
         """
-        *_, lam = self.solve_jax(omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3, mu_Pa_s, a_m_s)
+        *_, lam = self.solve(omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3, mu_Pa_s, a_m_s)
         opti.set_initial(outputs.variable, lam.reshape(-1, order="F"))

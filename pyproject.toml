@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "proptimiser"
 version = "0.1.0"
-description = "Propeller design tool: BEMT in JAX, optimiser, structural loads and Creo .ibl export."
+description = "Propeller design tool: BEMT (JAX and CasADi), optimiser, structural loads and Creo .ibl export."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Unlicense"
@@ -20,22 +20,26 @@ classifiers = [
 dependencies = [
     "numpy>=2.0",
     "scipy>=1.13",
-    "jax>=0.4.35",
-    "jaxopt>=0.8",
-    "optax>=0.2",
-    "equinox>=0.11",
-    "interpax>=0.3",
     "NeuralFoil>=0.3",
     "AeroSandbox>=4.2",
     "casadi>=3.6",
-    "matplotlib>=3.9",
     "PyYAML>=6.0",
     "h5py>=3.10",
 ]
 
 [project.optional-dependencies]
-gui = ["PySide6>=6.7", "pyvista>=0.44", "pyvistaqt>=0.11"]
-dev = ["pytest>=8"]
+# The CasADi path (casadi_prop.PropellerModel) needs none of these. The JAX solver, the optimiser, the structure
+# model, the plots and the table interpolators need the jax extra.
+jax = [
+    "jax>=0.4.35",
+    "jaxopt>=0.8",
+    "optax>=0.2",
+    "equinox>=0.11",
+    "interpax>=0.3",
+    "matplotlib>=3.9",
+]
+gui = ["proptimiser[jax]", "PySide6>=6.7", "pyvista>=0.44", "pyvistaqt>=0.11"]
+dev = ["proptimiser[jax]", "pytest>=8"]
 
 [project.scripts]
 proptimiser-export = "proptimiser.export_performance:main"

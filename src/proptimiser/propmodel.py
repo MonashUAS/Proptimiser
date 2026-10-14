@@ -3,12 +3,9 @@
 # External Libraries
 from typing import NamedTuple
 
-import jax
-import jax.numpy as jnp
-import equinox as eqx
 import numpy as np
 
-import matplotlib.pyplot as plt
+from ._jax import jax, jnp, eqx, jit
 
 # Internal Libraries
 from . import geometry
@@ -17,30 +14,42 @@ from .airfoil import aero_coeffs
 from .airflow import tip_root_loss_factors, inflow_model, equivelantActuatorDiskEfficiency, resultantVelocityComponents, high_induction_correction, station_to_points, to_grid, section_frame_of
 from .backend import JAX_OPS, ops
 
-jax.config.update("jax_enable_x64", True)
 
-def motorPower(torque: float, omega: float, I_0: float = 0.7, R_m: float = 0.120, kV: float = 150):
+def motorPower(torque: float, omega: float, I_0: float = 0.7, R_tot: float = 0.120, kV: float = 150,
+               kappa: float = 1.0, Q0: float = 0.0):
     """
-    Calcualtes Power Consumption required of the motor to drive the propeller
+    Electrical input power of the motor and ESC that drive the propeller. This is the Propalyser chain
+    (estimate/chain.py), a Drela first-order motor behind an ESC that works as a chopper:
+
+        I = I_0 + (torque + Q0) * Kv           Kv = kV * 2 pi / 60 (rad/s per volt)
+        V_term = omega / (kappa * Kv) + R_tot * I
+        P_in = V_term * I
+
+    P_in is the power at the ESC input when V_term is the equivalent bus voltage (the duty is V_term / V_bus).
+    With kappa = 1 and Q0 = 0 the result is the old first-order motor model.
 
     Inputs:
-        torque: torque of the motor (Nm)
+        torque: shaft torque of the propeller (Nm)
         omega: rotational rate of the motor (rad/s)
         I_0: zero load current (A)
-        R_m: Coil resistance (ohms)
+        R_tot: resistance of the motor, ESC and leads (ohms)
         kV: motor speed constant (RPM/volt)
+        kappa: ESC voltage factor (nd)
+        Q0: friction torque at no load (Nm)
     """
-    P_out = torque*omega
+    return motor_voltage(torque, omega, I_0, R_tot, kV, kappa, Q0) * motor_current(torque, I_0, kV, Q0)
 
-    K_t = 60 / (2*jnp.pi*kV) # Calculate the torque constant (Nm/A)
+def motor_current(torque, I_0, kV, Q0=0.0):
+    """
+    Motor current (A) for a shaft torque (Nm).
+    """
+    return I_0 + (torque + Q0) * kV * 2 * jnp.pi / 60
 
-    I = torque / K_t # calculate the current consumed by the motor
-
-    V = omega*60/(2*jnp.pi) / kV
-
-    P_in = P_out + R_m * (I+I_0)**2 + V*I_0
-
-    return P_in
+def motor_voltage(torque, omega, I_0, R_tot, kV, kappa=1.0, Q0=0.0):
+    """
+    Equivalent bus voltage (V) that the motor and ESC need: back EMF over kappa, plus the resistive drop.
+    """
+    return omega / (kappa * kV * 2 * jnp.pi / 60) + R_tot * motor_current(torque, I_0, kV, Q0)
 
 ## Azimuthal averaging
 
@@ -699,7 +708,7 @@ def radial_weights(params):
     zero = jnp.zeros(1)
     return (jnp.concatenate([zero, segment]) + jnp.concatenate([segment, zero])) / 2
 
-@jax.jit
+@jit
 def induced_velocity(params):
     '''
     Calculates the coupled 3D induced velocity field using BEMT.
@@ -840,6 +849,7 @@ def apc_model(filepath, plot=True):
             blit=False
         )
 
+        import matplotlib.pyplot as plt
         plt.show()
 
         fig = results.debug_diagnostics_plot(params, 0)

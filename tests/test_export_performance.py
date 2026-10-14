@@ -167,7 +167,7 @@ def test_contract_a_file_has_every_path_and_attribute(tmp_path, solved):
             if isinstance(obj, h5py.Dataset):
                 assert "units" in obj.attrs, name
             keys = [name.split("/")[-1], *obj.attrs]
-            assert not any(k in ("I_0", "R_m", "kV", "P_max", "V_yz") for k in keys), name
+            assert not any(k in ("I_0", "R_tot", "kappa", "Q0", "V_bus", "kV", "P_max", "V_yz") for k in keys), name
 
 
 def test_uncertainty_is_unavailable_with_a_basis(tmp_path, solved):

@@ -4,10 +4,21 @@ import re
 from functools import lru_cache
 import numpy as np
 
-import jax
-from jax import numpy as jnp
-import matplotlib.pyplot as plt
-import interpax
+from ._jax import jax, jnp, jit, HAS_JAX
+try:
+    import interpax                 # the table interpolators (coeff_method 1 and 2) need it, with JAX
+except ImportError:
+    interpax = None
+
+
+class _LazyPyplot:
+    """matplotlib.pyplot, imported at the first plot, so the CasADi path does not need matplotlib."""
+    def __getattr__(self, name):
+        import matplotlib.pyplot
+        return getattr(matplotlib.pyplot, name)
+
+
+plt = _LazyPyplot()
 from scipy.ndimage import gaussian_filter
 import neuralfoil as nf
 from pathlib import Path
@@ -270,7 +281,7 @@ class AlphaReInterpolator:
 
         self.re_grid_log = jnp.linspace(jnp.log10(re_array.min()), jnp.log10(re_array.max()), 15)
         log_re_array = jnp.log10(re_array)
-        interp_vmap = jax.vmap(jnp.interp, in_axes=(None, None, 1))
+        interp_vmap = lambda x, xp_, fp: jnp.stack([jnp.interp(x, xp_, fp[:, k]) for k in range(fp.shape[1])], axis=1)
 
         # Apply nan_to_num to guarantee safe behavior
         self.cl_grid = jnp.nan_to_num(interp_vmap(self.re_grid_log, log_re_array, cl_array))
@@ -537,7 +548,7 @@ def _with_confidence(coeffs, return_log_confidence):
 
 ### Data Loading/Grid Utilities
 
-@jax.jit
+@jit
 def jax_idw_3d_grid(scattered_points, scattered_values, grid_X, grid_Y, power=2.0, eps=1e-8):
     """
     Vectorized Inverse Distance Weighting (IDW) interpolation in pure JAX.

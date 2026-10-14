@@ -24,7 +24,7 @@ def _omega_for_thrust(model, V_x, V_yz, thrust_N, lo=100.0, hi=1500.0):
 
 def _motor_power_W(prop, torque_Nm, omega_rad_s):
     i = prop.inputs
-    return propmodel.motorPower(torque_Nm, omega_rad_s, I_0=i.I_0, R_m=i.R_m, kV=i.kV)
+    return propmodel.motorPower(torque_Nm, omega_rad_s, I_0=i.I_0, R_tot=i.R_tot, kV=i.kV, kappa=i.kappa, Q0=i.Q0)
 
 
 def test_quadcopter_hover():
