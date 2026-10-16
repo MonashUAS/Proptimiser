@@ -13,28 +13,31 @@ from proptimiser import fit_prop as fp
 TARGET = fp.Target(diameter_m=0.5, pitch_m=0.2, blades=2, r_hub_m=0.02)
 
 
-def test_read_chart_skips_comments(tmp_path):
-    path = tmp_path / "chart.csv"
-    path.write_text("# comment\n# more\nrpm,thrust_gf,input_power_W,motor_esc_efficiency\n"
-                    "1000,100,10,0.5\n2000,400,80,0.5\n", encoding="utf-8")
-    chart = fp.read_chart(path)
-    assert chart["rpm"].tolist() == [1000.0, 2000.0]
-    assert chart["thrust_gf"].tolist() == [100.0, 400.0]
+def test_read_maker_table_skips_comments(tmp_path):
+    path = tmp_path / "maker.csv"
+    path.write_text("# comment\n# more\nthrottle_pct,rpm,thrust_gf,output_W,torque_Nm\n"
+                    "30,1000,100,10,0.1\n40,2000,400,80,0.4\n", encoding="utf-8")
+    table = fp.read_maker_table(path)
+    assert table["rpm"].tolist() == [1000.0, 2000.0]
+    assert table["thrust_gf"].tolist() == [100.0, 400.0]
 
 
-def test_read_chart_refuses_a_missing_column(tmp_path):
-    path = tmp_path / "chart.csv"
+def test_read_maker_table_refuses_a_missing_column(tmp_path):
+    path = tmp_path / "maker.csv"
     path.write_text("rpm,thrust_gf\n1000,100\n", encoding="utf-8")
     with pytest.raises(ValueError, match="missing columns"):
-        fp.read_chart(path)
+        fp.read_maker_table(path)
 
 
-def test_chart_targets_units():
-    chart = dict(rpm=np.array([1000.0]), thrust_gf=np.array([1000.0]), input_power_W=np.array([100.0]),
-                 motor_esc_efficiency=np.array([0.8]))
-    rpm, thrust, shaft = fp.chart_targets(chart)
-    assert math.isclose(thrust[0], 9.80665)          # 1 kgf
-    assert math.isclose(shaft[0], 80.0)
+def test_chart_targets_units_and_shaft_power_check():
+    # 1 kgf of thrust. Torque 0.8 N m at 1000 rpm: omega = 104.72 rad/s, shaft power 83.78 W.
+    omega = 1000 * math.pi / 30
+    table = dict(rpm=np.array([1000.0]), thrust_gf=np.array([1000.0]), output_W=np.array([0.8 * omega]),
+                 torque_Nm=np.array([0.8]))
+    rpm, thrust, shaft = fp.chart_targets(table)
+    assert math.isclose(thrust[0], 9.80665)
+    assert math.isclose(shaft[0], 0.8 * omega)
+    assert np.allclose(fp.shaft_power_check(table), 0.0)
 
 
 def test_blade_family_pitch_and_chord():
@@ -68,7 +71,7 @@ def test_prior_residuals_are_zero_at_the_priors():
 
 def test_residuals_scale_with_the_reading_error():
     res = fp.residuals([105.0], [100.0], [100.0], [100.0], TARGET)
-    assert math.isclose(res[0], math.log(1.05) / 0.05)
+    assert math.isclose(res[0], math.log(1.05) / TARGET.sigma_thrust)
     assert math.isclose(res[1], 0.0)
 
 
@@ -76,12 +79,12 @@ def test_error_summary_and_gate():
     s = fp.error_summary([1.05, 0.95, 1.0], [1.0, 1.0, 1.0])
     assert math.isclose(s["rms"], math.sqrt(2 * 0.05**2 / 3))
     assert math.isclose(s["max_abs"], 0.05)
-    good = fp.error_summary([1.05, 0.95], [1.0, 1.0])
-    bad_max = fp.error_summary([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.15], [1.0] * 10)
-    bad_rms = fp.error_summary([1.1, 0.9], [1.0, 1.0])
+    good = fp.error_summary([1.04, 0.96], [1.0, 1.0])
+    bad_max = fp.error_summary([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.12], [1.0] * 10)
+    bad_rms = fp.error_summary([1.06, 0.94], [1.0, 1.0])
     assert fp.gate(good, good)
-    assert not fp.gate(good, bad_max)           # one point worse than 12 %
-    assert not fp.gate(bad_rms, good)           # RMS above 7 %
+    assert not fp.gate(good, bad_max)           # one point worse than 10 %
+    assert not fp.gate(bad_rms, good)           # RMS above 5 %
 
 
 def test_figure_of_merit_of_an_ideal_rotor_is_one():
@@ -98,7 +101,7 @@ def test_torque_over_thrust_diameter():
 
 
 def test_fluxer_design_files_load():
-    # The design YAML and the state JSON must load with every key present. No chart value is used.
+    # The design YAML and the state JSON must load with every key present. No maker value is used.
     from proptimiser import init
 
     prop = init.Propeller.load(fp.NAME)
@@ -138,3 +141,12 @@ def test_export_cli_passes_the_rpm_and_vx_lists(monkeypatch):
     seen.clear()
     ep.main(["x", "--author", "A"])
     assert seen["omega_list"] is None and seen["vx_list"] is None
+
+
+def test_table_at_thrust_and_reynolds():
+    table = dict(rpm=np.array([1000.0, 2000.0, 4000.0]), thrust_gf=np.array([100.0, 400.0, 1600.0]),
+                 output_W=np.array([10.0, 80.0, 640.0]), torque_Nm=np.array([0.1, 0.4, 1.6]))
+    # thrust ~ rpm^2 and power ~ rpm^3: at 2.0 times the thrust of 1000 rpm the speed is 1000 sqrt(2) rpm
+    p, rpm = fp.table_at_thrust(table, 2 * 100.0 * 1e-3 * fp.G0)
+    assert math.isclose(rpm, 1000 * math.sqrt(2), rel_tol=1e-6)
+    assert math.isclose(p, 10.0 * 2 ** 1.5, rel_tol=1e-6)

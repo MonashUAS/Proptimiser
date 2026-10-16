@@ -1,8 +1,8 @@
 # FITTED model of the MAD FLUXER PRO 22x6.6 MATT. It is not a measurement and not the maker geometry.
 # No blade geometry of this propeller is public. Chord and twist come from the 5-parameter family of
-# proptimiser.fit_prop (blade_family), fitted to designs/MAD_FLUXER_22x6_6_chart.csv with the BEMT.
-# Fitted parameters c75_over_R = 0.1028, dtheta_deg = 2.4824, a_inboard = 0.0004, b_tip = 0.3136, pitch_gradient = 0.0150.
-# The sections are Clark-Y, an assumption. The motor keys (I_0, R_tot, kappa, Q0, P_max) are class
+# proptimiser.fit_prop (blade_family), fitted to designs/MAD_FLUXER_22x6_6_maker.csv (maker bench table, shaft power) with the BEMT (Fit C).
+# Fitted parameters c75_over_R = 0.1163, dtheta_deg = 1.3210, a_inboard = 0.6974, b_tip = 0.0813, pitch_gradient = 0.0098.
+# The sections are clarky, an assumption. The motor keys (I_0, R_tot, kappa, Q0, P_max) are class
 # defaults and do not describe the MAD M6C10 IPE V3. The export does not use them. kV 150 is the maker value.
 # The design condition is the hover point: 3200 rpm, 22.4 N, V_x = 0.
 # Proptimiser design: MAD_FLUXER_22x6_6
@@ -55,8 +55,8 @@ blade:
   N: 2
   r_foils: [0.0, 0.025, 0.05, 0.15, 0.2794]
   airfoils: [clarky, clarky, clarky]
-  hub_chord: 0.04228627973704348
-  hub_twist_deg: 49.061073845780705
+  hub_chord: 0.008155280407871826
+  hub_twist_deg: 47.99747887167173
   hub_thickness_ratio: 0.1
   hub_cst: [-0.3172404036956897, -0.053942717406887386, 0.11792649197348969, -0.9344180731532927, 1.3653143580519196, -1.9396455321015964, 1.429862567623529, -1.6052649027831305, 0.3172404036956898, 0.05394271740689671, -0.11792649197350275, 0.934418073153309, -1.365314358051937, 1.9396455321016133, -1.4298625676235401, 1.6052649027831354, -8.247662385011394e-15, 0.022656937413475516]
   freeze: {}

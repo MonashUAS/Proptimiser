@@ -178,3 +178,57 @@ class PropellerModel:
         """
         *_, lam = self.solve(omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3, mu_Pa_s, a_m_s)
         opti.set_initial(outputs.variable, lam.reshape(-1, order="F"))
+
+
+## Static and axial-flow loads for one rotor (live call from a vehicle model)
+
+class RotorLoads(NamedTuple):
+    thrust_N: float
+    torque_Nm: float
+    shaft_power_W: float        # torque * omega
+    CT: float                   # T / (rho n^2 D^4), n in rev/s
+    CP: float                   # P / (rho n^3 D^5)
+    J: float                    # V_axial / (n D)
+
+
+_MODEL_CACHE = {}
+
+
+def coefficients(thrust_N, torque_Nm, rpm, v_axial_m_s, rho_kg_m3, diameter_m):
+    """RotorLoads from the thrust and torque of a rotor. rpm must be above zero."""
+    if rpm <= 0.0:
+        raise ValueError(f"rpm must be above zero, got {rpm}")
+    n = rpm / 60.0
+    omega = rpm * np.pi / 30.0
+    power = torque_Nm * omega
+    return RotorLoads(thrust_N, torque_Nm, power, thrust_N / (rho_kg_m3 * n**2 * diameter_m**4),
+                      power / (rho_kg_m3 * n**3 * diameter_m**5), v_axial_m_s / (n * diameter_m))
+
+
+def static_and_axial(state, rpm, v_axial, rho=1.225):
+    """
+    Thrust, torque, shaft power, CT and CP of one rotor at a given rpm and axial inflow speed. It uses the CasADi
+    path (damped Newton on the BEMT residuals, no JAX).
+
+    state    a Propeller (init.Propeller.load("MAD_FLUXER_22x6_6")), or a PropellerModel. The design YAML and the
+             state JSON of the propeller give the geometry. The model is built once for each Propeller and kept.
+    rpm      shaft speed (rev/min), above zero.
+    v_axial  axial inflow speed along the shaft (m/s). Zero is static.
+    rho      air density (kg/m^3). The viscosity and the speed of sound keep the sea-level values.
+
+    The model uses one azimuth point, which is exact in axial flow. Raises RuntimeError when the BEMT does not
+    converge. Returns RotorLoads (SI units).
+    """
+    if isinstance(state, PropellerModel):
+        model = state
+    else:
+        model = _MODEL_CACHE.get(id(state))
+        if model is None or model[0] is not state:
+            model = (state, PropellerModel.from_propeller(state, n_psi=1))
+            _MODEL_CACHE[id(state)] = model
+        model = model[1]
+    diameter = 2.0 * float(model.prop.blade.R_tip)
+    omega = rpm * np.pi / 30.0
+    scale = max(0.05 * rho * (rpm / 60.0) ** 2 * diameter**4, 0.1)      # only scales the unknowns
+    thrust, torque, _ = model.solve(omega, v_axial, 0.0, scale, rho_kg_m3=rho)
+    return coefficients(thrust, torque, rpm, v_axial, rho, diameter)

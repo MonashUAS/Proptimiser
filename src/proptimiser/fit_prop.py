@@ -1,11 +1,11 @@
 """
-Fit a propeller with no public geometry to a manufacturer thrust and power chart.
+Fit a propeller with no public geometry to a manufacturer bench table (thrust and shaft power against rpm).
 
 The result is a FITTED model, not a measured one. The blade is a chord and twist family with a few free
 parameters. The BEMT of Proptimiser gives thrust and shaft power. A least squares fit with priors on the
 shape parameters keeps the blade physical.
 
-The pure functions (read_chart, chart_targets, blade_family, residuals, error_summary, figure_of_merit) hold
+The pure functions (read_maker_table, chart_targets, blade_family, residuals, error_summary, figure_of_merit) hold
 no solver. fit_propeller and model_curve use the BEMT through export_performance.Case.
 
 Run from the repository root:
@@ -33,8 +33,8 @@ class Target:
     pitch_m: float
     blades: int
     r_hub_m: float
-    sigma_thrust: float = 0.05          # relative reading error of the thrust
-    sigma_power: float = 0.056          # 5 % on input power combined with 0.02 on a 0.83 efficiency
+    sigma_thrust: float = 0.03          # relative weight scale of the thrust. The maker values are "theoretical".
+    sigma_power: float = 0.03           # relative weight scale of the shaft power. This is a choice, not a measured error.
 
 
 # Priors of the shape parameters: (value, sigma). c75_over_R has no prior. Hobby props peak at 0.5R to 0.7R.
@@ -49,26 +49,30 @@ THETA_LOWER = (0.04, -4.0, 0.0, 0.0, -0.4)
 THETA_UPPER = (0.30, 4.0, 1.5, 1.5, 0.4)
 
 
-def read_chart(path):
+def read_maker_table(path):
     """
-    Read a chart CSV. A line that starts with # is a comment. The header is
-    rpm,thrust_gf,input_power_W,motor_esc_efficiency. Return a dict of 1-D float arrays.
+    Read the maker bench table CSV. A line that starts with # is a comment. The columns used are
+    rpm, thrust_gf, output_W (shaft power) and torque_Nm. Return a dict of 1-D float arrays.
     """
     with open(path, encoding="utf-8", newline="") as f:
         lines = [line for line in f if line.strip() and not line.lstrip().startswith("#")]
     rows = list(csv.DictReader(lines))
-    keys = ("rpm", "thrust_gf", "input_power_W", "motor_esc_efficiency")
+    keys = ("rpm", "thrust_gf", "output_W", "torque_Nm")
     missing = [k for k in keys if not rows or k not in rows[0]]
     if missing:
         raise ValueError(f"{path}: missing columns {missing}")
     return {k: np.array([float(r[k]) for r in rows]) for k in keys}
 
 
-def chart_targets(chart):
-    """Return (rpm, thrust in N, shaft power in W). Shaft power is the efficiency times the input power."""
-    thrust = chart["thrust_gf"] * 1e-3 * G0
-    shaft = chart["motor_esc_efficiency"] * chart["input_power_W"]
-    return chart["rpm"], thrust, shaft
+def chart_targets(table):
+    """Return (rpm, thrust in N, shaft power in W). The shaft power is the maker output power."""
+    return table["rpm"], table["thrust_gf"] * 1e-3 * G0, table["output_W"]
+
+
+def shaft_power_check(table):
+    """Relative difference of torque * omega from output_W, per row. The table must agree to a rounding error."""
+    omega = table["rpm"] * math.pi / 30.0
+    return table["torque_Nm"] * omega / table["output_W"] - 1.0
 
 
 def blade_family(theta, r, target):
@@ -139,8 +143,8 @@ def error_summary(model, chart):
     return dict(error=err, rms=float(np.sqrt(np.mean(err**2))), max_abs=float(np.max(np.abs(err))))
 
 
-def gate(thrust_summary, power_summary, rms_limit=0.07, max_limit=0.12):
-    """The validation gate: RMS at most 7 % and no point worse than 12 %, for thrust and for power."""
+def gate(thrust_summary, power_summary, rms_limit=0.05, max_limit=0.10):
+    """The validation gate: RMS at most 5 % and no point worse than 10 %, for thrust and for power."""
     ok = True
     for s in (thrust_summary, power_summary):
         ok = ok and s["rms"] <= rms_limit and s["max_abs"] <= max_limit
@@ -192,9 +196,8 @@ def model_curve(prop, rpm_list, vx=0.0, rho=RHO):
 def fit_propeller(target, chart, inputs, blade_kwargs, theta0=THETA_START, verbose=1):
     """
     Least squares fit of theta to the chart. Return (theta, Propeller, scipy result).
-    The residuals are the thrust log error against rpm and the log error of the power at equal thrust (the
-    figure of merit view), each over its reading error and doubled in the hover range 2800 to 3800 rpm,
-    plus the prior terms.
+    The residuals are the log error of the thrust against rpm and of the shaft power against rpm (Fit C), each
+    over its weight scale and doubled in the hover range 2800 to 3800 rpm, plus the prior terms.
     """
     from scipy.optimize import least_squares
 
@@ -207,7 +210,7 @@ def fit_propeller(target, chart, inputs, blade_kwargs, theta0=THETA_START, verbo
             return np.full(2 * len(rpm) + len(prior_residuals(theta)), 1e3)
         w = hover_weights(rpm)
         rt = np.log(thrust / thrust_chart) / target.sigma_thrust
-        rp = equal_thrust_residuals(thrust, power, thrust_chart, power_chart, target)
+        rp = np.log(power / power_chart) / target.sigma_power
         return np.concatenate([w * rt, w * rp, prior_residuals(theta)])
 
     result = least_squares(fun, np.asarray(theta0, dtype=float), bounds=(THETA_LOWER, THETA_UPPER),
@@ -218,21 +221,22 @@ def fit_propeller(target, chart, inputs, blade_kwargs, theta0=THETA_START, verbo
 
 ## The MAD FLUXER PRO 22x6.6 fit
 
-NAME = "MAD_FLUXER_22x6_6"
+NAME = "MAD_FLUXER_22x6_6"             # Fit C, the default. Fit B is MAD_FLUXER_22x6_6_fitB.
+GATE_RPM_MIN = 2490.0                  # the table row at 2492 rpm stands for the 2500 rpm limit
 FLUXER_TARGET = Target(diameter_m=22 * INCH, pitch_m=6.6 * INCH, blades=2, r_hub_m=0.025)
 HOVER_RPM = 3200.0
 FLUXER_NOTE = """\
 # FITTED model of the MAD FLUXER PRO 22x6.6 MATT. It is not a measurement and not the maker geometry.
 # No blade geometry of this propeller is public. Chord and twist come from the 5-parameter family of
-# proptimiser.fit_prop (blade_family), fitted to designs/MAD_FLUXER_22x6_6_chart.csv with the BEMT.
+# proptimiser.fit_prop (blade_family), fitted to designs/MAD_FLUXER_22x6_6_maker.csv (maker bench table, shaft power) with the BEMT (Fit C).
 # Fitted parameters {params}.
-# The sections are Clark-Y, an assumption. The motor keys (I_0, R_tot, kappa, Q0, P_max) are class
+# The sections are {airfoil}, an assumption. The motor keys (I_0, R_tot, kappa, Q0, P_max) are class
 # defaults and do not describe the MAD M6C10 IPE V3. The export does not use them. kV 150 is the maker value.
 # The design condition is the hover point: 3200 rpm, 22.4 N, V_x = 0.
 """
 
 
-def fluxer_setup():
+def fluxer_setup(airfoil="clarky"):
     """(Inputs, blade keyword dict) of the FLUXER design. Settings follow the Currawong V1 design."""
     from . import init
 
@@ -242,7 +246,7 @@ def fluxer_setup():
         omega=[HOVER_RPM * math.pi / 30.0], tilt=[0.0], solve_omega=[False], solve_tilt=[False],
         objective_weight=[1.0], kV=150.0, V_bus=0.0, inflow_model=1, coeff_method=3, tip_loss_model=1,
         root_loss_model=1, rot_corr_model=1, V_i_0_max_iter=50)
-    blade = dict(N=2, r_foils=(0.0, FLUXER_TARGET.r_hub_m, 0.05, 0.15, R), airfoils=("clarky",) * 3)
+    blade = dict(N=2, r_foils=(0.0, FLUXER_TARGET.r_hub_m, 0.05, 0.15, R), airfoils=(airfoil,) * 3)
     return inputs, blade
 
 
@@ -257,73 +261,118 @@ def apc_static_reference(dat_path, rpm):
     return float(ct), float(cp), float(ct**1.5 / (cp * math.sqrt(math.pi / 2)))
 
 
-def report(prop, chart, dat_path, rho=RHO):
-    """Print the validation table, FoM, Q/(T D) and the J trend. Return (thrust summary, power summary, gate)."""
+HOVER_THRUST_N = 22.4       # thrust of one rotor in hover
+
+
+def table_at_thrust(table, thrust_n):
+    """Maker shaft power (W) and rpm at the thrust thrust_n (N): log-log interpolation on the maker table."""
+    rpm, thrust, power = chart_targets(table)
+    return (float(power_at_thrust(thrust, power, [thrust_n])[0]),
+            float(np.exp(np.interp(np.log(thrust_n), np.log(thrust), np.log(rpm)))))
+
+
+def evaluate(prop, table, rho=RHO, hover_thrust_n=HOVER_THRUST_N):
+    """
+    Compare the model with the maker table. Return a dict with the per-row arrays and the summaries.
+    The gate rows are the rows at or above GATE_RPM_MIN. The hover view compares the shaft power at the thrust
+    hover_thrust_n (log-log interpolation on the model curve and on the table).
+    """
+    D = FLUXER_TARGET.diameter_m
+    rpm, thrust_t, power_t = chart_targets(table)
+    thrust, power, ok = model_curve(prop, rpm)
+    p_eq = power_at_thrust(thrust, power, thrust_t)
+    g = rpm >= GATE_RPM_MIN
+    out = dict(rpm=rpm, thrust_table=thrust_t, thrust_model=thrust, power_table=power_t, power_model=power,
+               power_at_table_thrust=p_eq, converged=ok, gate_rows=g,
+               fom_table=figure_of_merit(thrust_t, power_t, D, rho), fom_model=figure_of_merit(thrust, power, D, rho))
+    out["thrust"] = error_summary(thrust[g], thrust_t[g])
+    out["power"] = error_summary(power[g], power_t[g])
+    out["equal_thrust"] = error_summary(p_eq[g], power_t[g])
+    out["fom_diff"] = error_summary(out["fom_model"][g], out["fom_table"][g])
+    p_hover_table, rpm_hover = table_at_thrust(table, hover_thrust_n)
+    p_hover_model = float(power_at_thrust(thrust, power, [hover_thrust_n])[0])
+    out["hover"] = dict(thrust_n=hover_thrust_n, rpm_table=rpm_hover, power_table=p_hover_table,
+                        power_model=p_hover_model, error=p_hover_model / p_hover_table - 1.0,
+                        fom_table=float(figure_of_merit(hover_thrust_n, p_hover_table, D, rho)),
+                        fom_model=float(figure_of_merit(hover_thrust_n, p_hover_model, D, rho)))
+    out["gate"] = bool(gate(out["thrust"], out["power"]) and abs(out["hover"]["error"]) <= 0.07)
+    return out
+
+
+def reynolds_at(prop, rpm, x=0.75, rho=RHO, mu=1.798e-5):
+    """Chord Reynolds number and section Mach number of the model at x = r / R, static, at the given rpm."""
+    r = np.asarray(prop.r)
+    R = float(prop.blade.R_tip)
+    c = float(np.interp(x * R, r, np.asarray(prop.c)))
+    speed = rpm * math.pi / 30.0 * x * R
+    return rho * speed * c / mu, speed / 343.0
+
+
+def print_evaluation(ev):
+    """Print the tables of evaluate()."""
+    print("rpm   thrust_tab_N thrust_mod_N  err%   power_tab_W power_mod_W  err%   P_at_Ttab_W  err%   FoM_tab FoM_mod")
+    for i, r in enumerate(ev["rpm"]):
+        mark = " " if ev["gate_rows"][i] else "*"
+        print(f"{r:5.0f}{mark}{ev['thrust_table'][i]:10.2f} {ev['thrust_model'][i]:11.2f} "
+              f"{100 * (ev['thrust_model'][i] / ev['thrust_table'][i] - 1):+6.1f} {ev['power_table'][i]:11.1f} "
+              f"{ev['power_model'][i]:11.1f} {100 * (ev['power_model'][i] / ev['power_table'][i] - 1):+6.1f} "
+              f"{ev['power_at_table_thrust'][i]:11.1f} {100 * (ev['power_at_table_thrust'][i] / ev['power_table'][i] - 1):+6.1f} "
+              f"{ev['fom_table'][i]:8.3f} {ev['fom_model'][i]:7.3f}")
+    print("(* = outside the gate range)")
+    for key, label in (("thrust", "thrust vs rpm"), ("power", "power vs rpm"),
+                       ("equal_thrust", "power at equal thrust"), ("fom_diff", "FoM")):
+        print(f"{label:24s} RMS {100 * ev[key]['rms']:5.1f} %  max {100 * ev[key]['max_abs']:5.1f} %")
+    h = ev["hover"]
+    print(f"hover {h['thrust_n']} N: table {h['power_table']:.1f} W at {h['rpm_table']:.0f} rpm, model {h['power_model']:.1f} W, "
+          f"error {100 * h['error']:+.1f} %; FoM table {h['fom_table']:.3f}, model {h['fom_model']:.3f}")
+    print(f"gate (5 % RMS, 10 % max on thrust and power vs rpm, 7 % power at hover thrust): {'PASS' if ev['gate'] else 'FAIL'}")
+
+
+def report(prop, table, dat_path, rho=RHO):
+    """Print the validation tables, Q/(T D) and the J trend. Return the evaluate() dict."""
     from . import export_performance as ep
 
     D = FLUXER_TARGET.diameter_m
-    rpm, thrust_chart, power_chart = chart_targets(chart)
-    thrust, power, ok = model_curve(prop, rpm)
-    st, sp = error_summary(thrust, thrust_chart), error_summary(power, power_chart)
-    print("rpm   thrust_chart_N  thrust_model_N  err%    power_chart_W  power_model_W  err%   converged")
-    for i, r in enumerate(rpm):
-        print(f"{r:5.0f} {thrust_chart[i]:13.2f} {thrust[i]:15.2f} {100 * st['error'][i]:+7.1f} {power_chart[i]:14.1f} "
-              f"{power[i]:14.1f} {100 * sp['error'][i]:+6.1f}   {bool(ok[i])}")
-    pe = power_at_thrust(thrust, power, thrust_chart)
-    se = error_summary(pe, power_chart)
-    print("equal-thrust view: power of the model at the chart thrust")
-    print("rpm    thrust_N  power_chart_W  power_model_at_T_W  err%")
-    for i, r in enumerate(rpm):
-        print(f"{r:5.0f} {thrust_chart[i]:9.2f} {power_chart[i]:14.1f} {pe[i]:19.1f} {100 * se['error'][i]:+7.1f}")
-    print(f"equal-thrust power RMS {100 * se['rms']:.1f} % max {100 * se['max_abs']:.1f} %")
-    print(f"thrust RMS {100 * st['rms']:.1f} % max {100 * st['max_abs']:.1f} %   "
-          f"power RMS {100 * sp['rms']:.1f} % max {100 * sp['max_abs']:.1f} %   gate {'PASS' if gate(st, sp) else 'FAIL'}")
-
-    print("\nStatic figure of merit and Q/(T D)")
-    hover_rpm = [HOVER_RPM, float(rpm[-1])]
-    th2, pw2, _ = model_curve(prop, hover_rpm)
-    for k, r in enumerate(hover_rpm):
-        om = r * math.pi / 30.0
+    ev = evaluate(prop, table, rho)
+    print_evaluation(ev)
+    print("\nQ/(T D) and the Reynolds number at 0.75 R")
+    for r in (HOVER_RPM, float(ev["rpm"][-1])):
+        th, pw, _ = model_curve(prop, [r])
         ct, cp, fom_apc = apc_static_reference(dat_path, r)
-        qtd_apc = cp / (2 * math.pi) / ct          # Q/(T D) = CQ / CT with CQ = CP / 2 pi
-        print(f"rpm {r:6.0f}: model T {th2[k]:6.2f} N P {pw2[k]:6.1f} W FoM {figure_of_merit(th2[k], pw2[k], D, rho):.3f} "
-              f"Q/(TD) {torque_over_thrust_diameter(th2[k], pw2[k], om, D):.4f} | APC 22x8 CT {ct:.4f} CP {cp:.4f} "
-              f"FoM {fom_apc:.3f} Q/(TD) {qtd_apc:.4f}")
-    k = len(rpm) - 1
-    print(f"chart at {rpm[k]:.0f} rpm: FoM {figure_of_merit(thrust_chart[k], power_chart[k], D, rho):.3f}; "
-          f"at {rpm[3]:.0f} rpm: FoM {figure_of_merit(thrust_chart[3], power_chart[3], D, rho):.3f}")
-
+        re75, mach = reynolds_at(prop, r)
+        print(f"rpm {r:6.0f}: model T {th[0]:6.2f} N P {pw[0]:6.1f} W FoM {figure_of_merit(th[0], pw[0], D, rho):.3f} "
+              f"Q/(TD) {torque_over_thrust_diameter(th[0], pw[0], r * math.pi / 30.0, D):.4f} Re75 {re75:,.0f} M75 {mach:.2f} "
+              f"| APC 22x8 FoM {fom_apc:.3f} Q/(TD) {cp / (2 * math.pi) / ct:.4f}")
     print("\nCT and CP trend with J")
     case = ep.Case(prop)
     js = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
-    for r in (HOVER_RPM, float(rpm[-1])):
+    for r in (HOVER_RPM, float(ev["rpm"][-1])):
         n = r / 60.0
         rows = ep.performance_table(case, [r * math.pi / 30.0], [j * n * D for j in js], rho)
         print(f"rpm {r:.0f}: " + "  ".join(f"J {row['J']:.2f} CT {row['CT']:.4f} CP {row['CP']:.4f}" for row in rows))
-    apc = ep.read_apc_table(dat_path)[5000]
-    print("APC 22x8 at 5000 rpm: " + "  ".join(
-        f"J {j:.2f} CT {np.interp(j, apc[:, 0], apc[:, 1]):.4f} CP {np.interp(j, apc[:, 0], apc[:, 2]):.4f}" for j in js))
-    return st, sp, gate(st, sp)
+    return ev
 
 
 def main(argv=None):
     import argparse
     from . import init
 
-    parser = argparse.ArgumentParser(description="Fit the MAD FLUXER PRO 22x6.6 to the maker chart.")
-    parser.add_argument("--chart", default="designs/MAD_FLUXER_22x6_6_chart.csv")
+    parser = argparse.ArgumentParser(description="Fit the MAD FLUXER PRO 22x6.6 to the maker bench table (Fit C).")
+    parser.add_argument("--table", default="designs/MAD_FLUXER_22x6_6_maker.csv")
     parser.add_argument("--apc-dat", default="apc_prop_data/performance_data/PER3_22x8.dat")
+    parser.add_argument("--airfoil", default="clarky", help="airfoil folder name in src/proptimiser/airfoils")
+    parser.add_argument("--name", default=NAME, help="name of the saved design (with --save)")
     parser.add_argument("--save", action="store_true", help="write designs/ and propellers/ files (replaces them)")
     parser.add_argument("--no-fit", action="store_true", help="skip the fit: use the start values")
     args = parser.parse_args(argv)
 
-    chart = read_chart(args.chart)
-    inputs, blade = fluxer_setup()
+    table = read_maker_table(args.table)
+    inputs, blade = fluxer_setup(args.airfoil)
     if args.no_fit:
         theta = np.array(THETA_START)
         prop = build_propeller(theta, FLUXER_TARGET, inputs, blade)
     else:
-        theta, prop, result = fit_propeller(FLUXER_TARGET, chart, inputs, blade, verbose=0)
+        theta, prop, result = fit_propeller(FLUXER_TARGET, table, inputs, blade, verbose=0)
         print(f"fit cost {result.cost:.3f} after {result.nfev} model runs")
     params = ", ".join(f"{k} = {v:.4f}" for k, v in zip(PARAM_NAMES, theta))
     print("parameters:", params)
@@ -331,11 +380,11 @@ def main(argv=None):
     print("r_m      ", np.round(r[::3], 4))
     print("chord_m  ", np.round(np.asarray(prop.c)[::3], 4))
     print("twist_deg", np.round(np.degrees(np.asarray(prop.beta))[::3], 2))
-    report(prop, chart, args.apc_dat)
+    report(prop, table, args.apc_dat)
     if args.save:
-        design_path = prop.save(NAME, overwrite=True)
+        design_path = prop.save(args.name, overwrite=True)
         text = design_path.read_text(encoding="utf-8")
-        design_path.write_text(FLUXER_NOTE.format(params=params) + text, encoding="utf-8", newline="\n")
+        design_path.write_text(FLUXER_NOTE.format(params=params, airfoil=args.airfoil) + text, encoding="utf-8", newline="\n")
         print("wrote", design_path)
 
 

@@ -8,6 +8,7 @@ import casadi as cas
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from proptimiser import init  # noqa: F401  sets float64 before the arrays are built
 from proptimiser import propmodel
@@ -84,3 +85,35 @@ def test_implicit_derivatives_match_jax():
     expected = np.asarray(jax.jacfwd(loads_jax)(jnp.asarray(theta0)))
 
     np.testing.assert_allclose(got, expected, rtol=1e-5)
+
+
+def test_coefficients_from_hand_numbers():
+    from proptimiser.casadi_prop import coefficients
+
+    # 3000 rpm: n = 50 rev/s, omega = 100 pi rad/s. D = 0.5 m, rho = 1.2.
+    out = coefficients(thrust_N=10.0, torque_Nm=0.4, rpm=3000.0, v_axial_m_s=12.5, rho_kg_m3=1.2, diameter_m=0.5)
+    assert np.isclose(out.shaft_power_W, 0.4 * 100 * np.pi)
+    assert np.isclose(out.CT, 10.0 / (1.2 * 50**2 * 0.5**4))
+    assert np.isclose(out.CP, 0.4 * 100 * np.pi / (1.2 * 50**3 * 0.5**5))
+    assert np.isclose(out.J, 0.5)
+    with pytest.raises(ValueError):
+        coefficients(1.0, 1.0, 0.0, 0.0, 1.2, 0.5)
+
+
+def test_static_and_axial_matches_the_jax_solver_and_scales_with_density():
+    from proptimiser.casadi_prop import static_and_axial
+
+    prop = _prop(n_psi=12)
+    rpm, v_x = 5600.0, 18.0
+    out = static_and_axial(prop, rpm, v_x, 1.225)
+    T_jax, Q_jax, _ = PropellerModel.from_propeller(prop).solve_jax(rpm * np.pi / 30, v_x, 0.0, THRUST_SCALE_N)
+    assert np.isclose(out.thrust_N, T_jax, rtol=1e-6) and np.isclose(out.torque_Nm, Q_jax, rtol=1e-6)
+    D = 2 * float(prop.blade.R_tip)
+    assert np.isclose(out.J, v_x / (rpm / 60 * D))
+    assert np.isclose(out.CT, out.thrust_N / (1.225 * (rpm / 60) ** 2 * D**4))
+    # a second call reuses the model; a lower density gives a lower thrust
+    thin = static_and_axial(prop, rpm, v_x, 1.0)
+    assert 0.0 < thin.thrust_N < out.thrust_N
+    # static point
+    static = static_and_axial(prop, rpm, 0.0)
+    assert static.J == 0.0 and static.thrust_N > out.thrust_N
