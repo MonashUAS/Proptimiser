@@ -1,0 +1,77 @@
+# This is the first fit (equal weight on thrust and power against rpm). It passes the rpm gate but has thrust 6 % low. See docs/fluxer_22x6_6.md.
+# FITTED model of the MAD FLUXER PRO 22x6.6 MATT. It is not a measurement and not the maker geometry.
+# No blade geometry of this propeller is public. Chord and twist come from the 5-parameter family of
+# proptimiser.fit_prop (blade_family), fitted to designs/MAD_FLUXER_22x6_6_chart.csv with the BEMT.
+# Fitted parameters c75_over_R = 0.1004, dtheta_deg = 2.0041, a_inboard = 0.1270, b_tip = 0.3384, pitch_gradient = 0.0071.
+# The sections are Clark-Y, an assumption. The motor keys (I_0, R_tot, kappa, Q0, P_max) are class
+# defaults and do not describe the MAD M6C10 IPE V3. The export does not use them. kV 150 is the maker value.
+# The design condition is the hover point: 3200 rpm, 22.4 N, V_x = 0.
+# Proptimiser design: MAD_FLUXER_22x6_6
+# Units: SI. Lengths m, speeds m/s, omega rad/s, thrust N, power W, I_0 A, R_tot ohm, kV rpm/V, kappa nd, Q0 Nm, V_bus V,
+# density kg/m^3, E, G and allowable stresses Pa. Angles in degrees: every key that ends in _deg.
+# Dimensionless (nd): weights, tolerances, ratios, CST weights, fill_factor.
+# Every key is required. An unknown key is an error. Write floats with a dot (1.0e-8, not 1e-8).
+format_version: 2
+inputs:
+  opt_solver: L-BFGS-B
+  opt_max_iter: 2000
+  opt_tol: 1.0e-06
+  opt_verbose: 1
+  opt_print_every: 5
+  V_i_0_max_iter: 50
+  V_i_0_eps: 1.0e-08
+  V_i_0_verbose: 0
+  bemt_type: [true, true, false]
+  n_r: 25
+  n_psi: 12
+  jax_tracing: false
+  thrust_target: [22.4]
+  V_x: [0.0]
+  V_yz: [0.0]
+  omega: [335.1032163829113]
+  tilt_deg: [0.0]
+  solve_omega: [false]
+  solve_tilt: [false]
+  objective_weight: [1.0]
+  I_0: 2.0
+  R_tot: 0.037
+  kV: 150.0
+  kappa: 1.0
+  Q0: 0.0
+  V_bus: 0.0
+  P_max: 3300.0
+  w_thrust: 10000.0
+  thrust_tol: 0.01
+  w_thickness: 10.0
+  w_confidence: 1.0
+  w_smooth: 0.01
+  min_confidence: 0.9
+  inflow_model: 1
+  coeff_method: 3
+  tip_loss_model: 1
+  root_loss_model: 1
+  rot_corr_model: 1
+  high_induction_model: 0
+blade:
+  N: 2
+  r_foils: [0.0, 0.025, 0.05, 0.15, 0.2794]
+  airfoils: [clarky, clarky, clarky]
+  hub_chord: 0.032536626829992
+  hub_twist_deg: 48.733085693477555
+  hub_thickness_ratio: 0.1
+  hub_cst: [-0.3172404036956897, -0.053942717406887386, 0.11792649197348969, -0.9344180731532927, 1.3653143580519196, -1.9396455321015964, 1.429862567623529, -1.6052649027831305, 0.3172404036956898, 0.05394271740689671, -0.11792649197350275, 0.934418073153309, -1.365314358051937, 1.9396455321016133, -1.4298625676235401, 1.6052649027831354, -8.247662385011394e-15, 0.022656937413475516]
+  freeze: {}
+  optimise_cst: true
+  c_bounds: [0.001, 0.2]
+  beta_bounds_deg: [0.0, 50.0]
+  cst_bound: 0.25
+  min_tc: 0.06
+  offset_r: []
+  offset_y: []
+  offset_z: []
+  mat_density: 1700.0
+  mat_E: 19700000000.0
+  mat_G: 7300000000.0
+  mat_sigma_allow: 60000000.0
+  mat_tau_allow: 0.0
+  fill_factor: 1.0

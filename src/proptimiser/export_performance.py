@@ -422,6 +422,8 @@ def main(argv=None):
     parser.add_argument("--prop-id", help="prop_id in the file (default: the design name)")
     parser.add_argument("--out", help="output .h5 file (default: exports/<prop_id>.h5)")
     parser.add_argument("--rho", type=float, default=RHO, help="air density in kg/m3")
+    parser.add_argument("--rpm-list", help="rotor speeds in rpm, comma separated (default: 300 to 750 rad/s and the design speed)")
+    parser.add_argument("--vx-list", help="axial speeds in m/s, comma separated (default: the smallest converging speed, then 2 to 30 in steps of 2)")
     parser.add_argument("--apc", help="APC geometry file (.PE0): compare with --compare-apc, write no file")
     parser.add_argument("--compare-apc", help="APC performance file (PER3 .dat)")
     parser.add_argument("--n-r", type=int, help="radial stations of the APC propeller (default: apc_model)")
@@ -435,7 +437,9 @@ def main(argv=None):
     if not args.design:
         parser.error("give a design name")
     try:
-        path = export(args.design, args.author, args.out, args.prop_id, args.rho)
+        omegas = None if not args.rpm_list else [float(v) * math.pi / 30.0 for v in args.rpm_list.split(",")]
+        vxs = None if not args.vx_list else [float(v) for v in args.vx_list.split(",")]
+        path = export(args.design, args.author, args.out, args.prop_id, args.rho, omega_list=omegas, vx_list=vxs)
     except RuntimeError as e:
         parser.exit(2, f"export refused: {e}\n")
     print(f"Wrote {path}")

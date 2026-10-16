@@ -1,0 +1,16 @@
+# Manufacturer chart for the MAD FLUXER PRO 22x6.6 MATT on the MAD M6C10 IPE V3 KV150 motor.
+# Source: the MAD chart, 12S, 25 C, sea level. Read off the chart by hand and copied here from Propalyser.
+# Reading error: +/-5 % on thrust_gf and input_power_W, +/-0.02 on motor_esc_efficiency.
+# Shaft power = motor_esc_efficiency * input_power_W.
+# Units: rpm, thrust in gram-force (1 gf = 9.80665e-3 N), power in W, efficiency nd.
+# This file is a fit target and a validation input. It is not a measurement made in this repository.
+rpm,thrust_gf,input_power_W,motor_esc_efficiency
+1950,800,40,0.83
+2400,1250,80,0.83
+2850,1780,130,0.83
+3300,2380,200,0.83
+3750,3050,290,0.83
+4200,3950,400,0.83
+4650,4900,560,0.83
+5100,5900,730,0.83
+5550,6900,960,0.84
