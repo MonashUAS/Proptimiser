@@ -81,22 +81,23 @@ class PropellerModel:
         return cls(prop)
 
     @staticmethod
-    def _flight(omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3, mu_Pa_s, a_m_s):
+    def _flight(omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3, mu_Pa_s, a_m_s, scale=1.0):
         """The Params fields of a flight state. Air properties left as None keep the sea-level defaults."""
-        fields = dict(omega=omega_rad_s, V_x=V_x_m_s, V_yz=V_yz_m_s, thrust_target=thrust_scale_N)
+        fields = dict(omega=omega_rad_s, V_x=V_x_m_s, V_yz=V_yz_m_s, thrust_target=thrust_scale_N, scale=scale)
         air = dict(rho=rho_kg_m3, mu=mu_Pa_s, a=a_m_s)
         return {**fields, **{name: value for name, value in air.items() if value is not None}}
 
     def expressions(self, lam, omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3=None, mu_Pa_s=None,
-                    a_m_s=None) -> PropExpressions:
+                    a_m_s=None, scale=1.0) -> PropExpressions:
         """
         Residuals and loads for the inflow ratios lam (k, n_aero) and one flight state. The flight state values are
         numbers or CasADi expressions. thrust_scale_N only scales the unknowns and the residuals (it is not a
         constraint): use the thrust you expect. rho, mu and a default to sea-level air (1.225 kg/m^3, 1.798e-5 Pa s,
-        343 m/s).
+        343 m/s). scale multiplies every length of the blade (radius, chord, station spacing) with the shape kept:
+        the radius is scale * R_tip of the propeller. It is a number or a CasADi expression (an Opti variable).
         """
         params = dataclasses.replace(self._base, **self._flight(omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N,
-                                                                rho_kg_m3, mu_Pa_s, a_m_s))
+                                                                rho_kg_m3, mu_Pa_s, a_m_s, scale))
         lam_full = cas.mtimes(lam, self._embed) + self._blend_seed
         V_i = propmodel.inflow_from_lambda(lam_full, params)
         residual = cas.mtimes(propmodel.bemt_residuals(lam_full, params), self._embed.T)
@@ -104,19 +105,20 @@ class PropellerModel:
         return PropExpressions(residual, propmodel.thrust(V_i, params), torque, torque * omega_rad_s)
 
     def add_to(self, opti, omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3=None, mu_Pa_s=None,
-               a_m_s=None) -> PropOutputs:
+               a_m_s=None, scale=1.0) -> PropOutputs:
         """
         Adds the propeller to opti at one flight state: the inflow ratios as variables and the BEMT residuals as
         equality constraints. Call it once for each rotor and flight state. Returns the loads as expressions.
+        scale is the geometric scale of the blade (see expressions): an Opti variable makes the radius a design variable.
         """
         flat = opti.variable(init_guess=np.ones(self.n_solved * self.n_aero))
         lam = cas.reshape(flat, self.n_solved, self.n_aero)
-        expr = self.expressions(lam, omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3, mu_Pa_s, a_m_s)
+        expr = self.expressions(lam, omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3, mu_Pa_s, a_m_s, scale)
         opti.subject_to(cas.vec(expr.residual) == 0)
         return PropOutputs(expr.thrust_N, expr.torque_Nm, expr.shaft_power_W, lam, flat)
 
     def solve(self, omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3=None, mu_Pa_s=None, a_m_s=None,
-              tol=1e-10, max_iter=100):
+              tol=1e-10, max_iter=100, scale=1.0):
         """
         The BEMT solution at a numeric flight state, by damped Newton iteration on the CasADi residuals (no JAX).
         Returns (thrust_N, torque_Nm, lam) with lam of shape (k, n_aero), the values that start an Opti variable.
@@ -124,12 +126,12 @@ class PropellerModel:
         """
         air = [self._base.rho if rho_kg_m3 is None else rho_kg_m3, self._base.mu if mu_Pa_s is None else mu_Pa_s,
                self._base.a if a_m_s is None else a_m_s]
-        values = np.array([omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, *air], dtype=float)
+        values = np.array([omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, *air, scale], dtype=float)
         if self._solver is None:
             flat = cas.MX.sym("lam", self.n_solved * self.n_aero)
-            state = cas.MX.sym("state", 7)
+            state = cas.MX.sym("state", 8)
             expr = self.expressions(cas.reshape(flat, self.n_solved, self.n_aero), state[0], state[1], state[2],
-                                    state[3], state[4], state[5], state[6])
+                                    state[3], state[4], state[5], state[6], state[7])
             residual = cas.vec(expr.residual)
             self._solver = (cas.Function("residual", [flat, state], [residual]),
                             cas.Function("jacobian", [flat, state], [cas.jacobian(residual, flat)]),
@@ -157,12 +159,13 @@ class PropellerModel:
         thrust, torque = loads(x, values)
         return float(thrust), float(torque), x.reshape(self.n_solved, self.n_aero, order="F")
 
-    def solve_jax(self, omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3=None, mu_Pa_s=None, a_m_s=None):
+    def solve_jax(self, omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3=None, mu_Pa_s=None, a_m_s=None,
+                  scale=1.0):
         """
         The same solution by the JAX solver (Newton with a bracketed fallback). Needs JAX. Used to check solve().
         """
         require_jax("PropellerModel.solve_jax")
-        fields = self._flight(omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3, mu_Pa_s, a_m_s)
+        fields = self._flight(omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3, mu_Pa_s, a_m_s, scale)
         params = dataclasses.replace(self.params, **{k: jnp.asarray(v, dtype=float) for k, v in fields.items()})
         V_i, V_i_0 = propmodel.induced_velocity(params)
         lam = V_i_0[self.cfg.solve_rows] / propmodel.get_velocity_scales(params)
@@ -171,12 +174,12 @@ class PropellerModel:
                 np.asarray(lam)[:, aero])
 
     def warm_start(self, opti, outputs, omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3=None,
-                   mu_Pa_s=None, a_m_s=None):
+                   mu_Pa_s=None, a_m_s=None, scale=1.0):
         """
         Starts the inflow variables of outputs (from add_to) at the Newton solution for numeric guesses of the flight
         state. This keeps IPOPT on the attached-flow root of the BEMT, and saves iterations.
         """
-        *_, lam = self.solve(omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3, mu_Pa_s, a_m_s)
+        *_, lam = self.solve(omega_rad_s, V_x_m_s, V_yz_m_s, thrust_scale_N, rho_kg_m3, mu_Pa_s, a_m_s, scale=scale)
         opti.set_initial(outputs.variable, lam.reshape(-1, order="F"))
 
 
@@ -205,7 +208,7 @@ def coefficients(thrust_N, torque_Nm, rpm, v_axial_m_s, rho_kg_m3, diameter_m):
                       power / (rho_kg_m3 * n**3 * diameter_m**5), v_axial_m_s / (n * diameter_m))
 
 
-def static_and_axial(state, rpm, v_axial, rho=1.225):
+def static_and_axial(state, rpm, v_axial, rho=1.225, scale=1.0):
     """
     Thrust, torque, shaft power, CT and CP of one rotor at a given rpm and axial inflow speed. It uses the CasADi
     path (damped Newton on the BEMT residuals, no JAX).
@@ -215,6 +218,7 @@ def static_and_axial(state, rpm, v_axial, rho=1.225):
     rpm      shaft speed (rev/min), above zero.
     v_axial  axial inflow speed along the shaft (m/s). Zero is static.
     rho      air density (kg/m^3). The viscosity and the speed of sound keep the sea-level values.
+    scale    geometric scale of the blade (number): the diameter is 2 * scale * R_tip.
 
     The model uses one azimuth point, which is exact in axial flow. Raises RuntimeError when the BEMT does not
     converge. Returns RotorLoads (SI units).
@@ -227,8 +231,8 @@ def static_and_axial(state, rpm, v_axial, rho=1.225):
             model = (state, PropellerModel.from_propeller(state, n_psi=1))
             _MODEL_CACHE[id(state)] = model
         model = model[1]
-    diameter = 2.0 * float(model.prop.blade.R_tip)
+    diameter = 2.0 * scale * float(model.prop.blade.R_tip)
     omega = rpm * np.pi / 30.0
-    scale = max(0.05 * rho * (rpm / 60.0) ** 2 * diameter**4, 0.1)      # only scales the unknowns
-    thrust, torque, _ = model.solve(omega, v_axial, 0.0, scale, rho_kg_m3=rho)
+    thrust_scale = max(0.05 * rho * (rpm / 60.0) ** 2 * diameter**4, 0.1)      # only scales the unknowns
+    thrust, torque, _ = model.solve(omega, v_axial, 0.0, thrust_scale, rho_kg_m3=rho, scale=scale)
     return coefficients(thrust, torque, rpm, v_axial, rho, diameter)

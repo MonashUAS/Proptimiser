@@ -708,7 +708,7 @@ def aero_coeffs(V_i, params, return_log_confidence=False):
     V_R, phi = resultantVelocityComponents(V_i, params)
     AoA_eff = pt(params.beta) - phi
 
-    Re = calc_reynolds(params.rho, xp.maximum(V_R, 1e-6), pt(params.c), params.mu)
+    Re = calc_reynolds(params.rho, xp.maximum(V_R, 1e-6), params.scale * pt(params.c), params.mu)
     Mach = V_R / params.a
 
     # Section shape and thickness at each radial station, then at each point

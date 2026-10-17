@@ -26,7 +26,7 @@ def equivelantActuatorDiskEfficiency(T, params):
     avoiding division by zero at V_x = 0.
     '''
     xp = ops(params.cfg)
-    R = params.cfg.R_tip
+    R = params.scale * params.cfg.R_tip
     A_disk = jnp.pi * (R**2)
 
     # Ideal hover induced velocity: v_0 = sqrt(T / (2 * rho * A))
@@ -126,7 +126,7 @@ def resultantVelocityComponents(V_i, params, plotting=False):
     # Swirl V_i_t > 0 turns with the blade (the momentum torque 2 rho r^2 V_i_t V' is then positive), so it reduces
     # the tangential velocity the blade sees: W_t = omega r (1 - a') for a propeller. With + V_i_t a drag-free blade
     # would absorb less shaft power than the axial momentum flux it produces, which breaks energy conservation.
-    V_norml_net = omega * r_pt + V_yz_perp - V_i_t
+    V_norml_net = omega * (params.scale * r_pt) + V_yz_perp - V_i_t
 
     if params.cfg.swept:
         V_axial_net, V_norml_net = swept_section_velocity(V_axial_net, V_norml_net, V_yz * xp.cos(psi_pt), params)
@@ -291,7 +291,7 @@ def buhl_high_induction(dT_classical, V_ia, F, params):
 
     # Buhl empirical heavily-loaded modification
     a_c = 0.4
-    dT_buhl = 2 * rho * r_pt * (V_ref**2) * F * (a_c**2 + (4.0 - 2.0 * a_c) * a)
+    dT_buhl = 2 * rho * (params.scale * r_pt) * (V_ref**2) * F * (a_c**2 + (4.0 - 2.0 * a_c) * a)
 
     # Element-wise conditional blending
     return xp.where(a <= a_c, dT_classical, dT_buhl)

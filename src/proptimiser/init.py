@@ -374,6 +374,7 @@ class Params(eqx.Module):
     rho: float = 1.225          # air density (kgm^{-3})
     mu: float = 1.798e-5        # air viscosity (kgm^-1s^-1)
     a: float = 343.0            # speed of sound (m/s)
+    scale: float = 1.0          # geometric scale of the blade: every length (r, dr, c, R_tip) times scale. A CasADi symbol in a sizing problem
 
 
 class Propeller:

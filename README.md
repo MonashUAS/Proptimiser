@@ -269,11 +269,31 @@ sol = opti.solve()
 - `warm_start` runs the JAX solver at a numeric flight state and starts the variables there.
   The solve from the default start takes 4 IPOPT iterations in the tests. The warm start takes 0.
 
+### Scale a propeller in a CasADi problem
+
+Pass `scale` to `add_to`, `expressions`, `solve`, `warm_start` and `static_and_axial` to change the size of the blade.
+`scale` multiplies every length of the blade: radius, chord, station spacing and the blade section offsets. The twist,
+the sections and the pitch ratio stay the same. The radius is `scale * R_tip` of the `Propeller`.
+
+```python
+model = PropellerModel.from_propeller(Propeller.load("MAD_FLUXER_22x6_6"), n_psi=1)
+opti = asb.Opti()
+s = opti.variable(init_guess=1.0, lower_bound=0.6, upper_bound=1.6)         # radius / 0.2794 m
+rotor = model.add_to(opti, omega_rad_s=omega, V_x_m_s=0.0, V_yz_m_s=0.0, thrust_scale_N=22.0, scale=s)
+```
+
+- `scale` is a number or an Opti expression. The default is 1. With a number, the loads equal the loads of a
+  `Propeller` built at the scaled size (`tests/test_casadi_scale.py` checks this to 1e-8).
+- The Reynolds number, the tip speed and the Mach number change with the radius, so the model is not a similarity law.
+  A scale far from 1 (below 0.6 or above 1.6) leaves the range where the fitted blade is valid. Check the result.
+- The tip loss, the Pitt-Peters skew and the Du-Selig correction depend on r/R only. They do not change with `scale`.
+- `warm_start` takes `scale` as a number.
+
 Limits:
 
 - The CasADi backend runs the parametric and NeuralFoil section models (`coeff_method` 0 and 3).
   The table models (1 and 2) run on JAX only.
-- Chord, twist and sections are constants. The CasADi problem cannot size the blade.
+- Chord, twist and sections are constants. The CasADi problem can scale the blade (see below) but cannot change its shape.
 - The model gives thrust, torque and power. It does not give the in-plane hub force or the side force.
 - The airfoil model is NeuralFoil, trained for Reynolds numbers of about 1e4 to 1e7.
   Check the confidence output (`airfoil.aero_coeffs(..., return_log_confidence=True)`) on JAX for a new design.

@@ -95,7 +95,7 @@ def _force_components(V_i: jnp.ndarray, params: Params) -> BladeForces:
 
     frame = section_frame_of(params)
     pt = lambda x: station_to_points(x, params)
-    c_pt = pt(params.c)
+    c_pt = params.scale * pt(params.c)
     q_c = 0.5 * params.rho * c_pt * V_R ** 2 * pt(frame.arc)
     cos_phi, sin_phi = xp.cos(phi), xp.sin(phi)
 
@@ -182,7 +182,7 @@ def dT_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
         C_L, C_D, _ = aero_coeffs(V_i, params)
 
         # Blade Element Theory instantaneous thrust element
-        dT_blade_instantaneous = 0.5 * rho * station_to_points(params.c, params) * (V_R**2) * (C_L * xp.cos(phi) - C_D * xp.sin(phi))
+        dT_blade_instantaneous = 0.5 * rho * (params.scale * station_to_points(params.c, params)) * (V_R**2) * (C_L * xp.cos(phi) - C_D * xp.sin(phi))
 
     # Average thrust in each annulus over one rotation, summed over the N blades
     dT_blade_ave = N * azimuth_mean(dT_blade_instantaneous, params)
@@ -215,7 +215,7 @@ def dH_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
     side; it is applied to the momentum thrust and torque in thrust() and torque().
     """
     xp = ops(params.cfg)
-    N, c = params.N, params.c # geometric values
+    N, c = params.N, params.scale * params.c # geometric values
     rho = params.rho # air density
 
     if params.cfg.swept:
@@ -260,7 +260,7 @@ def dQ_blade(V_i: jnp.ndarray, params: Params, debug: bool = False):
 
     Uses formulation from (M. Nahon et al., 2015) equation 12
     """
-    r = params.r
+    r = params.scale * params.r
 
     # Calculate the hub force elements dH
     dH_blade_ave = dH_blade(V_i, params, debug)
@@ -320,7 +320,7 @@ def dT_momentum(V_i: jnp.ndarray, params: Params, debug: bool = False, apply_tip
 
     # Compute baseline classical momentum element locally
     V_prime = xp.sqrt((V_x + V_ia) ** 2 + V_yz ** 2)
-    dT_element_classical = 2 * rho * r_pt * V_ia * V_prime * F
+    dT_element_classical = 2 * rho * (params.scale * r_pt) * V_ia * V_prime * F
 
     # Route through the configured model for conditional modifications
     dT_element_corrected = high_induction_correction(dT_element_classical, V_ia, F, params)
@@ -379,7 +379,7 @@ def dQ_momentum(V_i, params, debug=False, apply_tip_loss=True):
     V_prime = xp.sqrt((V_x + V_ia) ** 2 + V_yz ** 2)
 
     # dQ element per radian (omitting dr to match dT_momentum format)
-    dQ_element_classical = 2 * rho * (r_pt ** 2) * V_it * V_prime * F
+    dQ_element_classical = 2 * rho * ((params.scale * r_pt) ** 2) * V_it * V_prime * F
 
     # Integrate over one full turn of psi to get the torque per annulus
     dQ_momentum_ave = 2 * jnp.pi * azimuth_mean(dQ_element_classical, params)
@@ -441,7 +441,7 @@ def bemt_residuals(lambda_i_0_guess, params):
     V_i = inflow_from_lambda(lambda_i_0_guess, params)
 
     # Axial Residual (Scale by Thrust Target); Tangential Residual (Scale by Approximate Ideal Torque, to make O(1))
-    Q_ref = params.thrust_target * params.cfg.R_tip
+    Q_ref = params.thrust_target * params.scale * params.cfg.R_tip
     rows = []
     for i in solve_idx:
         if i == 0:
@@ -460,7 +460,7 @@ def get_velocity_scales(params):
     Returns: V_scale -> shape (k, 1) for the k solved components, for broadcasting against (k, n_r) arrays.
     """
     xp = ops(params.cfg)
-    R_tip = params.cfg.R_tip
+    R_tip = params.scale * params.cfg.R_tip
     A_disk = jnp.pi * (R_tip ** 2)
 
     # Axial Scale: Mean Momentum Inflow
@@ -759,7 +759,7 @@ def torque(V_i, params, debug=False):
 
     # Use trapezoidal integration over the aerodynamic zone to compute the total torque
     xp = ops(params.cfg)
-    Q = xp.sum(dQ_blade_ave * xp.const(radial_weights(params)))
+    Q = params.scale * xp.sum(dQ_blade_ave * xp.const(radial_weights(params)))
 
     return Q
 
@@ -771,7 +771,7 @@ def thrust(V_i, params):
 
     # Numerically Compute Double Integral (over the aerodynamic zone) to Solve for Thrust
     xp = ops(params.cfg)
-    T = xp.sum(dT * xp.const(radial_weights(params)))
+    T = params.scale * xp.sum(dT * xp.const(radial_weights(params)))
 
     return T
 
@@ -799,7 +799,7 @@ def actuator_disk_power(T, params):
     T is from momentum theory, 
     '''
     rho = params.rho
-    R   = params.cfg.R_tip
+    R   = params.scale * params.cfg.R_tip
     V_x = params.V_x # freestream velocity
 
     A = jnp.pi*R**2 # disc area
