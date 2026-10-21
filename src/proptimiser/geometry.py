@@ -329,71 +329,64 @@ def generate_blade_coordinates(r, r_foils, cst_weights, hub_thickness_ratio=0.1,
             
     return blade_coords
 
-def offset_airfoil_profile(foil_x, foil_y, chord, skin_thickness):
-    """
-    Offsets a normalized 2D airfoil inward by a physical skin thickness.
-    Prevents trailing edge self-intersection by clipping crossed lines.
-    Assumes foil coordinates are ordered: TE_upper -> LE -> TE_lower.
-    """
-    import numpy as np
+CORE_TOLERANCE = 0.01       # a core thinner than this fraction of the skin thickness counts as no core. The discrete
+                            # normals put micrometre noise on a section exactly two skins thick (the stadium hub)
 
-    # 1. Normalize the physical offset to the local chord
-    # Ensure chord is a scalar value (extract from array if necessary)
-    chord_val = chord[0] if isinstance(chord, np.ndarray) else chord
-    offset_mag = skin_thickness / chord_val
-    
-    # 2. Calculate gradients to find normals
-    dx = np.gradient(foil_x)
-    dy = np.gradient(foil_y)
-    length = np.hypot(dx, dy)
-    
-    # Avoid division by zero at sharp edges
-    length[length == 0] = 1e-8
-    
-    # Calculate inward-pointing normals based on the loop direction
-    nx = -dy / length
-    ny = dx / length
-    
-    # 3. Apply the inward offset
-    off_x = foil_x - offset_mag * nx
-    off_y = foil_y - offset_mag * ny
-    
-    # 4. Filter self-intersections (The "Swallowtail" clip)
-    le_idx = np.argmin(off_x)
-    
-    # Split into upper and lower surfaces
-    upper_x, upper_y = off_x[:le_idx+1], off_y[:le_idx+1]
-    lower_x, lower_y = off_x[le_idx:], off_y[le_idx:]
-    
-    # Reverse upper surface so X is strictly increasing (LE -> TE) for interpolation
-    rev_upper_x = upper_x[::-1]
-    rev_upper_y = upper_y[::-1]
-    
-    try:
-        # Interpolate lower surface Y values onto the upper surface X coordinates
-        lower_y_interp = np.interp(rev_upper_x, lower_x, lower_y)
-        
-        # Valid points are where the offset upper surface remains above the lower surface
-        valid_idx = rev_upper_y > lower_y_interp
-        
-        # Revert the valid upper points back to TE -> LE order
-        clean_upper_x = rev_upper_x[valid_idx][::-1]
-        clean_upper_y = rev_upper_y[valid_idx][::-1]
-        
-        # Truncate the lower surface at the new blunt trailing edge
-        max_x = np.max(clean_upper_x)
-        clean_lower_x = lower_x[lower_x <= max_x]
-        clean_lower_y = lower_y[lower_x <= max_x]
-        
-        # Reconstruct the continuous loop
-        clean_core_x = np.concatenate([clean_upper_x, clean_lower_x])
-        clean_core_y = np.concatenate([clean_upper_y, clean_lower_y])
-        
-    except Exception as e:
-        print(f"Warning: Intersection clipping failed, using raw offset. {e}")
-        clean_core_x, clean_core_y = off_x, off_y
+def offset_airfoil_profile(foil_x, foil_y, skin_thickness, n_points_per_side=100):
+    """
+    Offsets one section inward by the skin thickness (m) and returns the core loop (core_x, core_y).
+    The section is in the chord frame, in metres, before the twist rotation: x runs from the leading edge to the
+    trailing edge, and the points go TE_upper -> LE -> TE_lower.
 
-    return clean_core_x, clean_core_y
+    The offset surfaces cross near the edges. The core keeps the contiguous chordwise run where the upper surface
+    stays above the lower surface, so the trailing edge becomes blunt. Each side is resampled onto n_points_per_side
+    cosine-spaced x values, so every core section has the same point count. The loop is closed (the first point is
+    repeated at the end).
+
+    Returns None when the section is thinner than two skin thicknesses, with the CORE_TOLERANCE margin (no core at
+    this station).
+    """
+    foil_x, foil_y = np.asarray(foil_x, dtype=float), np.asarray(foil_y, dtype=float)
+
+    # Unit normals on the left of the direction of travel. They point inward on a counter-clockwise loop.
+    dx, dy = np.gradient(foil_x), np.gradient(foil_y)
+    length = np.maximum(np.hypot(dx, dy), 1e-12)
+    nx, ny = -dy / length, dx / length
+    area = 0.5 * np.sum(foil_x * np.roll(foil_y, -1) - np.roll(foil_x, -1) * foil_y)
+    inward = 1.0 if area > 0 else -1.0
+    off_x = foil_x + inward * skin_thickness * nx
+    off_y = foil_y + inward * skin_thickness * ny
+
+    # Split at the leading edge of the original section. Sort each side by x, because the offset can fold near the edges.
+    le = int(np.argmin(foil_x))
+    upper = np.argsort(off_x[:le + 1])
+    lower = np.argsort(off_x[le:])
+    upper_x, upper_y = off_x[:le + 1][upper], off_y[:le + 1][upper]
+    lower_x, lower_y = off_x[le:][lower], off_y[le:][lower]
+
+    # Core thickness on a fine chordwise grid, then the contiguous run of positive thickness around the thickest point
+    x = np.linspace(max(upper_x[0], lower_x[0]), min(upper_x[-1], lower_x[-1]), 4 * n_points_per_side)
+    if x.size == 0 or x[-1] <= x[0]:
+        return None
+    thickness = np.interp(x, upper_x, upper_y) - np.interp(x, lower_x, lower_y)
+    k = int(np.argmax(thickness))
+    if thickness[k] <= CORE_TOLERANCE * skin_thickness:
+        return None
+    start, end = k, k
+    while start > 0 and thickness[start - 1] > 0.0:
+        start -= 1
+    while end < x.size - 1 and thickness[end + 1] > 0.0:
+        end += 1
+    if end == start:
+        return None
+
+    # Resample both sides between the core leading edge and the core trailing edge
+    xs = x[start] + (x[end] - x[start]) * np.asarray(cosine_spacing(n_points_per_side))
+    ys_upper = np.interp(xs, upper_x, upper_y)
+    ys_lower = np.interp(xs, lower_x, lower_y)
+    core_x = np.concatenate([xs[::-1], xs[1:], xs[-1:]])
+    core_y = np.concatenate([ys_upper[::-1], ys_lower[1:], ys_upper[-1:]])
+    return core_x, core_y
 
 AERO_PITCH_AXIS = 0.25      # pitch axis of the aerodynamic zone (x/c): the quarter-chord line
 
@@ -569,6 +562,11 @@ def export_to_creo_ibl(r, c, beta, blade_coords, exportname,
     Generates a Creo .ibl file with support for a dynamic pitch_axis array.
     Forces coordinate loops to close at the trailing edge for solid CAD imports.
     offsets (n_r, 4), from station_offsets, place every section's pitch-axis point on the swept axis.
+
+    skin_thickness > 0 (m) writes the core insert: every section offset inward by the skin thickness
+    (offset_airfoil_profile). A station thinner than two skin thicknesses has no core, so the insert keeps only the
+    contiguous stations with a core. A ValueError tells when no station has a core, or when the core stations are
+    not one contiguous run.
     Writes <out_dir>/<exportname>.ibl and returns its path.
     """
     import numpy as np
@@ -581,44 +579,64 @@ def export_to_creo_ibl(r, c, beta, blade_coords, exportname,
     if np.isscalar(pitch_axis):
         pitch_axis = np.full(n_r, pitch_axis)
 
+    # Section loops (x, z) in metres, relative to the pitch-axis point, one for each kept station
+    sections = {}
+    for i in range(n_r):
+        pa = pitch_axis[i]
+        if skin_thickness > 0.0:
+            # Offset in the chord frame (scaled, not yet twisted), then twist about the pitch axis
+            core = offset_airfoil_profile(blade_coords[i, :, 0] * c[i], blade_coords[i, :, 1] * c[i],
+                                          skin_thickness, n_points_per_side=(n_foil + 1) // 2)
+            if core is None:
+                continue
+            foil = asb.Airfoil(coordinates=np.column_stack(core))
+            base_coords = foil.rotate(angle=-beta[i], x_center=pa * c[i], y_center=0.0).coordinates
+        else:
+            foil = asb.Airfoil(coordinates=blade_coords[i])
+            foil = foil.rotate(angle=-beta[i], x_center=pa, y_center=0.0)
+            foil = foil.scale(c[i], c[i])
+            base_coords = foil.coordinates
+
+        core_x, core_y = base_coords[:, 0], base_coords[:, 1]
+        if not (np.isclose(core_x[0], core_x[-1]) and np.isclose(core_y[0], core_y[-1])):
+            core_x = np.append(core_x, core_x[0])
+            core_y = np.append(core_y, core_y[0])
+        sections[i] = (core_x - pa * c[i], core_y)
+
+    kept = sorted(sections)
+    if skin_thickness > 0.0:
+        if not kept:
+            thickest = max(range(n_r), key=lambda i: c[i] * np.ptp(blade_coords[i, :, 1]))
+            raise ValueError(f"No station has a core with a {skin_thickness * 1000:.2f} mm skin. The thickest section is "
+                             f"at r = {r[thickest] * 1000:.1f} mm, about {c[thickest] * np.ptp(blade_coords[thickest, :, 1]) * 1000:.2f} mm thick")
+        gaps = [i for i in range(kept[0], kept[-1] + 1) if i not in sections]
+        if gaps:
+            raise ValueError(f"The core is not continuous with a {skin_thickness * 1000:.2f} mm skin: no core at "
+                             + ", ".join(f"r = {r[i] * 1000:.1f} mm" for i in gaps))
+        print(f"Core Insert: r = {r[kept[0]] * 1000:.1f} to {r[kept[-1]] * 1000:.1f} mm "
+              f"(stations {kept[0] + 1} to {kept[-1] + 1} of {n_r})")
+
     path = Path(out_dir) / f"{exportname}.ibl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         # Note: 'Open' here refers to the loft trajectory (spanwise), not the cross-sections
-        f.write("Open\nArclength\n") 
-        
-        for i, r_i in enumerate(r):
-            pa = pitch_axis[i]
-            f.write(f"Begin section ! Station {i+1}: r = {r_i:.4f} m\n")
+        f.write("Open\nArclength\n")
+
+        for i in kept:
+            core_x, core_y = sections[i]
+            f.write(f"Begin section ! Station {i+1}: r = {r[i]:.4f} m\n")
             f.write("Begin curve\n")
-            
-            foil = asb.Airfoil(coordinates=blade_coords[i])
-            
-            foil = foil.rotate(angle=-beta[i], x_center=pa, y_center=0.0)
-            foil = foil.scale(c[i], c[i])
-            
-            base_coords = foil.coordinates
-            
-            if skin_thickness > 0.0:
-                core_x, core_y = offset_airfoil_profile(base_coords[:, 0], base_coords[:, 1], 
-                                                        c[i], skin_thickness)
-            else:
-                core_x, core_y = base_coords[:, 0], base_coords[:, 1]
-            
-            if not (np.isclose(core_x[0], core_x[-1]) and np.isclose(core_y[0], core_y[-1])):
-                core_x = np.append(core_x, core_x[0])
-                core_y = np.append(core_y, core_y[0])
-                
+
             for j in range(len(core_x)):
                 # Apply the dynamic pitch axis translation, then the sweep and rake of the pitch-axis point
-                pt_x = (core_x[j] - (pa * c[i]) + x0[i]) * scale
+                pt_x = (core_x[j] + x0[i]) * scale
                 pt_y = y0[i] * scale
                 pt_z = (core_y[j] + z0[i]) * scale
-                
+
                 f.write(f"{j+1}  {pt_x:.6f}  {pt_y:.6f}  {pt_z:.6f}\n")
-                
+
     part_type = "Core Insert" if skin_thickness > 0 else "Aerodynamic Skin"
-    print(f"Successfully generated Creo geometry: {exportname}.ibl ({n_r} sections) - {part_type}")
+    print(f"Successfully generated Creo geometry: {exportname}.ibl ({len(kept)} sections) - {part_type}")
     return path
 
 def export_parting_surface_ibl(r, c, beta, blade_coords, r_foils, exportname, 
