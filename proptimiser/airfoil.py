@@ -26,7 +26,7 @@ from pathlib import Path
 from .airflow import resultantVelocityComponents, calc_reynolds, station_to_points
 from .backend import JAX_OPS, ops
 from .geometry import N_CST, max_thickness
-from .paths import AIRFOIL_DIR
+from .init import AIRFOIL_DIR
 
 from aerosandbox.geometry.airfoil.airfoil_families import (
     get_kulfan_parameters,

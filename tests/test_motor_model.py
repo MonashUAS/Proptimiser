@@ -32,9 +32,7 @@ def test_duty_is_terminal_voltage_over_bus_voltage():
     assert v / V_BUS < 1.0
 
 
-def test_design_format_1_migrates():
+def test_design_format_1_is_refused():
     data = {"format_version": 1, "inputs": {"I_0": 2.0, "R_m": 0.037, "kV": 220.0, "P_max": 1.0}, "blade": {}}
-    out = init._migrate_design_1(data)
-    assert out["format_version"] == init.DESIGN_FORMAT
-    assert list(out["inputs"]) == ["I_0", "R_tot", "kV", "kappa", "Q0", "V_bus", "P_max"]
-    assert out["inputs"]["R_tot"] == 0.037 and out["inputs"]["kappa"] == 1.0 and out["inputs"]["V_bus"] == 0.0
+    with pytest.raises(ValueError, match="format_version 1 is not supported"):
+        init.design_from_dict(data)

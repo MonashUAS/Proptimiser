@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
 
 [project]
 name = "proptimiser"
@@ -40,18 +40,22 @@ jax = [
 ]
 gui = ["proptimiser[jax]", "PySide6>=6.7", "pyvista>=0.44", "pyvistaqt>=0.11"]
 dev = ["proptimiser[jax]", "pytest>=8"]
+# The STEP solid of the outer mould line (geometry.export_propeller_step): OpenCascade for Python.
+cad = ["cadquery-ocp==8.0.1.1.0"]
 
 [project.scripts]
 proptimiser-export = "proptimiser.export_performance:main"
+proptimiser-cad = "proptimiser.cad_export:main"
 
 [project.gui-scripts]
 proptimiser-gui = "proptimiser.app:run"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+# The wheel holds the proptimiser package only, with its airfoil data.
+[tool.hatch.build.targets.wheel]
+packages = ["proptimiser"]
 
-[tool.setuptools.package-data]
-proptimiser = ["airfoils/**/*"]
+[tool.hatch.build.targets.sdist]
+include = ["proptimiser", "tests", "README.md", "LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

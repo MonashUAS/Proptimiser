@@ -5,26 +5,27 @@ The result is a FITTED model, not a measured one. The blade is a chord and twist
 parameters. The BEMT of Proptimiser gives thrust and shaft power. A least squares fit with priors on the
 shape parameters keeps the blade physical.
 
-The pure functions (read_maker_table, chart_targets, blade_family, residuals, error_summary, figure_of_merit) hold
-no solver. fit_propeller and model_curve use the BEMT through export_performance.Case.
+Two families: POWER (blade_family, a power law chord and a helix twist) and the shape family of a shape CSV
+(shape_family: a reference chord and twist, for example a measured blade, with a chord scale and two twist parameters).
+
+The pure functions (read_maker_table, chart_targets, blade_family, read_shape, residuals, error_summary,
+figure_of_merit) hold no solver. fit_propeller and model_curve use the BEMT through export_performance.Case.
 
 Run from the repository root:
     .venv/Scripts/python -m proptimiser.fit_prop
+    .venv/Scripts/python -m proptimiser.fit_prop --shape data/shapes/jung2021_tmotor.csv --name MAD_FLUXER_22x6_6_jung --save
 """
 import csv
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
 G0 = 9.80665                # N per kgf
 INCH = 0.0254               # m per inch
 RHO = 1.225                 # air density (kg/m3), sea level, same as the exporter
-
-# Names of the free parameters, in the order of the vector theta
-PARAM_NAMES = ("c75_over_R", "dtheta_deg", "a_inboard", "b_tip", "pitch_gradient")
-
 
 @dataclass(frozen=True)
 class Target:
@@ -37,16 +38,20 @@ class Target:
     sigma_power: float = 0.03           # relative weight scale of the shaft power. This is a choice, not a measured error.
 
 
-# Priors of the shape parameters: (value, sigma). c75_over_R has no prior. Hobby props peak at 0.5R to 0.7R.
-PRIORS = {
-    "dtheta_deg": (0.0, 2.0),           # the quoted pitch holds at 0.75R within 2 deg
-    "a_inboard": (0.4, 0.3),
-    "b_tip": (0.35, 0.2),
-    "pitch_gradient": (0.0, 0.1),       # a constant geometric pitch
-}
-THETA_START = (0.13, 0.0, 0.4, 0.35, 0.0)
-THETA_LOWER = (0.04, -4.0, 0.0, 0.0, -0.4)
-THETA_UPPER = (0.30, 4.0, 1.5, 1.5, 0.4)
+@dataclass(frozen=True)
+class Family:
+    """
+    A blade family: the shape function and its free parameters. shape(theta, r, target) gives chord (m) and
+    twist beta (rad) at the radii r (m). priors maps a parameter name to (value, sigma). A name with no prior is free.
+    """
+    name: str
+    params: tuple
+    start: tuple
+    lower: tuple
+    upper: tuple
+    x_scale: tuple
+    priors: dict
+    shape: Callable
 
 
 def read_maker_table(path):
@@ -94,12 +99,95 @@ def blade_family(theta, r, target):
     return chord, beta
 
 
-def prior_residuals(theta):
+# The power family. Priors: (value, sigma). c75_over_R has no prior. Hobby props peak at 0.5R to 0.7R.
+POWER = Family(
+    name="power",
+    params=("c75_over_R", "dtheta_deg", "a_inboard", "b_tip", "pitch_gradient"),
+    start=(0.13, 0.0, 0.4, 0.35, 0.0),
+    lower=(0.04, -4.0, 0.0, 0.0, -0.4),
+    upper=(0.30, 4.0, 1.5, 1.5, 0.4),
+    x_scale=(0.05, 1.0, 0.3, 0.3, 0.1),
+    priors={
+        "dtheta_deg": (0.0, 2.0),           # the quoted pitch holds at 0.75R within 2 deg
+        "a_inboard": (0.4, 0.3),
+        "b_tip": (0.35, 0.2),
+        "pitch_gradient": (0.0, 0.1),       # a constant geometric pitch
+    },
+    shape=blade_family,
+)
+
+
+def read_shape(path):
+    """
+    Read a blade shape CSV with the columns blade, r_over_R, c_over_R, beta_rad. A line that starts with # is a comment.
+    With more than one blade, return the mean of the blades on their common r/R range: each blade is interpolated to the
+    stations of the first blade in that range, and the range ends are added. Return (r_over_R, c_over_R, beta_rad).
+    """
+    with open(path, encoding="utf-8", newline="") as f:
+        lines = [line for line in f if line.strip() and not line.lstrip().startswith("#")]
+    rows = list(csv.DictReader(lines))
+    keys = ("blade", "r_over_R", "c_over_R", "beta_rad")
+    missing = [k for k in keys if not rows or k not in rows[0]]
+    if missing:
+        raise ValueError(f"{path}: missing columns {missing}")
+    blades = {}
+    for r in rows:
+        blades.setdefault(r["blade"], []).append([float(r[k]) for k in keys[1:]])
+    curves = [np.array(sorted(v)).T for v in blades.values()]
+    lo, hi = max(c[0][0] for c in curves), min(c[0][-1] for c in curves)
+    if lo >= hi:
+        raise ValueError(f"{path}: the blades have no common r/R range")
+    x0 = curves[0][0]
+    x = np.unique(np.concatenate([[lo], x0[(x0 > lo) & (x0 < hi)], [hi]]))
+    c = np.mean([np.interp(x, cv[0], cv[1]) for cv in curves], axis=0)
+    b = np.mean([np.interp(x, cv[0], cv[2]) for cv in curves], axis=0)
+    return x, c, b
+
+
+def _hold_and_extend(x, xp, fp):
+    """np.interp, but linear on the last segment outboard of xp[-1]. Inboard of xp[0] the first value holds."""
+    out = np.interp(x, xp, fp)
+    slope = (fp[-1] - fp[-2]) / (xp[-1] - xp[-2])
+    return np.where(x > xp[-1], fp[-1] + slope * (x - xp[-1]), out)
+
+
+def shape_family(path):
+    """
+    The shape family of a shape CSV (read_shape). With x = r / R and the reference curves c_ref, beta_ref:
+    chord:  c(x) = k_chord c_ref(x) R
+    twist:  beta(x) = beta_ref(0.75) + k_twist (beta_ref(x) - beta_ref(0.75)) + dtheta
+    Inboard of the first station, chord and twist hold the first value (the root carries little load). Outboard of the
+    last station, they follow the last segment to the tip. theta = (1, 0, 1) gives the shape as given.
+    """
+    xr, cr, br = read_shape(path)
+    b75 = float(np.interp(0.75, xr, br))
+
+    def shape(theta, r, target):
+        k_chord, dtheta_deg, k_twist = (float(v) for v in theta)
+        R = 0.5 * target.diameter_m
+        x = np.asarray(r, dtype=float) / R
+        chord = k_chord * _hold_and_extend(x, xr, cr) * R
+        beta = b75 + k_twist * (_hold_and_extend(x, xr, br) - b75) + math.radians(dtheta_deg)
+        return chord, beta
+
+    return Family(
+        name=f"shape {Path(path).name}",
+        params=("k_chord", "dtheta_deg", "k_twist"),
+        start=(0.85, 0.0, 1.0),
+        lower=(0.3, -6.0, 0.5),
+        upper=(2.0, 6.0, 1.5),
+        x_scale=(0.1, 1.0, 0.1),
+        priors={"dtheta_deg": (0.0, 2.0), "k_twist": (1.0, 0.2)},
+        shape=shape,
+    )
+
+
+def prior_residuals(theta, family):
     """Normalised distance of the shape parameters from their priors."""
     out = []
-    for name, value in zip(PARAM_NAMES, theta):
-        if name in PRIORS:
-            mean, sigma = PRIORS[name]
+    for name, value in zip(family.params, theta):
+        if name in family.priors:
+            mean, sigma = family.priors[name]
             out.append((float(value) - mean) / sigma)
     return np.array(out)
 
@@ -164,14 +252,14 @@ def torque_over_thrust_diameter(thrust, power, omega, diameter):
 
 ## BEMT access
 
-def build_propeller(theta, target, inputs, blade_kwargs):
-    """A Propeller with the chord and twist of blade_family(theta)."""
+def build_propeller(theta, target, inputs, blade_kwargs, family):
+    """A Propeller with the chord and twist of family.shape(theta)."""
     from . import init
 
     blade = init.BladeSpec(**blade_kwargs)
     r, _ = init.geometry.radial_stops(blade.R_tip, blade.R_hub, inputs.n_r)
-    chord, beta = blade_family(theta, np.asarray(r), target)
-    r_hub_chord, r_hub_beta = blade_family(theta, np.array([blade.R_hub]), target)
+    chord, beta = family.shape(theta, np.asarray(r), target)
+    r_hub_chord, r_hub_beta = family.shape(theta, np.array([blade.R_hub]), target)
     blade = init.dataclasses.replace(blade, hub_chord=float(r_hub_chord[0]),
                                      hub_twist_deg=float(np.degrees(r_hub_beta[0])))
     return init.Propeller(inputs, blade, c=chord, beta=beta,
@@ -193,9 +281,9 @@ def model_curve(prop, rpm_list, vx=0.0, rho=RHO):
     return np.array(thrust), np.array(power), np.array(ok)
 
 
-def fit_propeller(target, chart, inputs, blade_kwargs, theta0=THETA_START, verbose=1):
+def fit_propeller(target, chart, inputs, blade_kwargs, family, theta0=None, verbose=1):
     """
-    Least squares fit of theta to the chart. Return (theta, Propeller, scipy result).
+    Least squares fit of theta of the family to the chart. Return (theta, Propeller, scipy result). theta0 None: family.start.
     The residuals are the log error of the thrust against rpm and of the shaft power against rpm (Fit C), each
     over its weight scale and doubled in the hover range 2800 to 3800 rpm, plus the prior terms.
     """
@@ -204,19 +292,20 @@ def fit_propeller(target, chart, inputs, blade_kwargs, theta0=THETA_START, verbo
     rpm, thrust_chart, power_chart = chart_targets(chart)
 
     def fun(theta):
-        prop = build_propeller(theta, target, inputs, blade_kwargs)
+        prop = build_propeller(theta, target, inputs, blade_kwargs, family)
         thrust, power, ok = model_curve(prop, rpm)
         if not ok.all() or np.any(thrust <= 0) or np.any(power <= 0):
-            return np.full(2 * len(rpm) + len(prior_residuals(theta)), 1e3)
+            return np.full(2 * len(rpm) + len(prior_residuals(theta, family)), 1e3)
         w = hover_weights(rpm)
         rt = np.log(thrust / thrust_chart) / target.sigma_thrust
         rp = np.log(power / power_chart) / target.sigma_power
-        return np.concatenate([w * rt, w * rp, prior_residuals(theta)])
+        return np.concatenate([w * rt, w * rp, prior_residuals(theta, family)])
 
-    result = least_squares(fun, np.asarray(theta0, dtype=float), bounds=(THETA_LOWER, THETA_UPPER),
-                           diff_step=1e-3, x_scale=(0.05, 1.0, 0.3, 0.3, 0.1), verbose=2 if verbose else 0)
+    theta0 = family.start if theta0 is None else theta0
+    result = least_squares(fun, np.asarray(theta0, dtype=float), bounds=(family.lower, family.upper),
+                           diff_step=1e-3, x_scale=family.x_scale, verbose=2 if verbose else 0)
     theta = result.x
-    return theta, build_propeller(theta, target, inputs, blade_kwargs), result
+    return theta, build_propeller(theta, target, inputs, blade_kwargs, family), result
 
 
 ## The MAD FLUXER PRO 22x6.6 fit
@@ -234,6 +323,26 @@ FLUXER_NOTE = """\
 # defaults and do not describe the MAD M6C10 IPE V3. The export does not use them. kV 150 is the maker value.
 # The design condition is the hover point: 3200 rpm, 22.4 N, V_x = 0.
 """
+SHAPE_NOTE = """\
+# FITTED model of the MAD FLUXER PRO 22x6.6 MATT. It is not a measurement and not the maker geometry.
+# No blade geometry of this propeller is public. Chord and twist follow the reference shape {shape}
+# (proptimiser.fit_prop shape_family: chord scale k_chord, twist scale k_twist about 0.75R, twist offset dtheta_deg),
+# fitted to designs/MAD_FLUXER_22x6_6_maker.csv (maker bench table, shaft power) with the BEMT (Fit C).
+# Shape source: {source}
+# Fitted parameters {params}.
+# The sections are {airfoil}, an assumption. The motor keys (I_0, R_tot, kappa, Q0, P_max) are class
+# defaults and do not describe the MAD M6C10 IPE V3. The export does not use them. kV 150 is the maker value.
+# The design condition is the hover point: 3200 rpm, 22.4 N, V_x = 0.
+"""
+
+
+def shape_source(path):
+    """The first comment line of a shape CSV, without the #: the source of the shape."""
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.lstrip().startswith("#"):
+                return line.lstrip()[1:].strip()
+    return "not given"
 
 
 def fluxer_setup(airfoil="clarky"):
@@ -360,21 +469,24 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Fit the MAD FLUXER PRO 22x6.6 to the maker bench table (Fit C).")
     parser.add_argument("--table", default="designs/MAD_FLUXER_22x6_6_maker.csv")
     parser.add_argument("--apc-dat", default="apc_prop_data/performance_data/PER3_22x8.dat")
-    parser.add_argument("--airfoil", default="clarky", help="airfoil folder name in src/proptimiser/airfoils")
+    parser.add_argument("--airfoil", default="clarky", help="airfoil folder name in proptimiser/airfoils")
     parser.add_argument("--name", default=NAME, help="name of the saved design (with --save)")
     parser.add_argument("--save", action="store_true", help="write designs/ and propellers/ files (replaces them)")
-    parser.add_argument("--no-fit", action="store_true", help="skip the fit: use the start values")
+    parser.add_argument("--no-fit", action="store_true",
+                        help="skip the fit: use the start values (with --shape: the shape as given, theta = 1, 0, 1)")
+    parser.add_argument("--shape", default=None, help="shape CSV (blade, r_over_R, c_over_R, beta_rad): use the shape family")
     args = parser.parse_args(argv)
 
     table = read_maker_table(args.table)
     inputs, blade = fluxer_setup(args.airfoil)
+    family = shape_family(args.shape) if args.shape else POWER
     if args.no_fit:
-        theta = np.array(THETA_START)
-        prop = build_propeller(theta, FLUXER_TARGET, inputs, blade)
+        theta = np.array((1.0, 0.0, 1.0) if args.shape else family.start)
+        prop = build_propeller(theta, FLUXER_TARGET, inputs, blade, family)
     else:
-        theta, prop, result = fit_propeller(FLUXER_TARGET, table, inputs, blade, verbose=0)
+        theta, prop, result = fit_propeller(FLUXER_TARGET, table, inputs, blade, family, verbose=0)
         print(f"fit cost {result.cost:.3f} after {result.nfev} model runs")
-    params = ", ".join(f"{k} = {v:.4f}" for k, v in zip(PARAM_NAMES, theta))
+    params = ", ".join(f"{k} = {v:.4f}" for k, v in zip(family.params, theta))
     print("parameters:", params)
     r = np.asarray(prop.r)
     print("r_m      ", np.round(r[::3], 4))
@@ -384,7 +496,12 @@ def main(argv=None):
     if args.save:
         design_path = prop.save(args.name, overwrite=True)
         text = design_path.read_text(encoding="utf-8")
-        design_path.write_text(FLUXER_NOTE.format(params=params, airfoil=args.airfoil) + text, encoding="utf-8", newline="\n")
+        if args.shape:
+            note = SHAPE_NOTE.format(shape=Path(args.shape).as_posix(), source=shape_source(args.shape), params=params,
+                                     airfoil=args.airfoil)
+        else:
+            note = FLUXER_NOTE.format(params=params, airfoil=args.airfoil)
+        design_path.write_text(note + text, encoding="utf-8", newline="\n")
         print("wrote", design_path)
 
 

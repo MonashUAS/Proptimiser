@@ -1,9 +1,9 @@
 # Proptimiser design: Currawong_V1
-# Units: SI. Lengths m, speeds m/s, omega rad/s, thrust N, power W, I_0 A, R_m ohm, kV rpm/V,
+# Units: SI. Lengths m, speeds m/s, omega rad/s, thrust N, power W, I_0 A, R_tot ohm, kappa nd, Q0 Nm, V_bus V, kV rpm/V,
 # density kg/m^3, E, G and allowable stresses Pa. Angles in degrees: every key that ends in _deg.
 # Dimensionless (nd): weights, tolerances, ratios, CST weights, fill_factor.
 # Every key is required. An unknown key is an error. Write floats with a dot (1.0e-8, not 1e-8).
-format_version: 1
+format_version: 2
 inputs:
   opt_solver: L-BFGS-B
   opt_max_iter: 2000
@@ -26,8 +26,11 @@ inputs:
   solve_tilt: [false, false]
   objective_weight: [0.9, 0.1]
   I_0: 2.0
-  R_m: 0.037
+  R_tot: 0.037
   kV: 220
+  kappa: 1.0
+  Q0: 0.0
+  V_bus: 0.0
   P_max: 3300
   w_thrust: 10000.0
   thrust_tol: 0.01
@@ -35,10 +38,12 @@ inputs:
   w_confidence: 1.0
   w_smooth: 0.01
   min_confidence: 0.9
+  min_safety_factor: 0.0
   inflow_model: 0
   coeff_method: 3
   tip_loss_model: 0
   root_loss_model: 0
+  loss_in_solve: 0
   rot_corr_model: 0
   high_induction_model: 0
 blade:
@@ -64,3 +69,9 @@ blade:
   mat_sigma_allow: 60000000.0
   mat_tau_allow: 0.0
   fill_factor: 1.0
+  skin_thickness_m: 0.0
+  skin_density_kg_m3: 1700.0
+  skin_E_Pa: 19700000000.0
+  skin_G_Pa: 7300000000.0
+  skin_sigma_allow_Pa: 60000000.0
+  skin_tau_allow_Pa: 0.0

@@ -36,7 +36,7 @@ import equinox as eqx
 from . import airflow
 from . import init
 from . import propmodel
-from .paths import HOME
+from .init import HOME
 
 SCHEMA = "prop-performance"
 SCHEMA_VERSION = 1

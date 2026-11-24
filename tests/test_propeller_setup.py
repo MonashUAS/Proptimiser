@@ -481,6 +481,36 @@ def test_confidence_constraint_is_load_weighted_and_keeps_its_gradient():
     assert np.isfinite(d_log) and abs(d_log) > 1.0 and abs(d_conf) < 1e-6
 
 
+def test_stress_constraint_matches_the_structural_safety_factor():
+    from proptimiser import propmodel, structure
+
+    # One value per aerodynamic station (no tip) and condition: 1 - min_safety_factor / safety_factor
+    prop = Propeller.default(inputs=Inputs(coeff_method=0, n_r=8, min_safety_factor=1.5))
+    space = optimiser.DesignSpace.build(prop)
+    ps = prop.batched()
+    g = np.asarray(optimiser.constraint_values(optimiser.evaluate_all_conditions(ps), ps, space))
+    start = 0
+    for name, size in space.constraint_groups(prop.inputs.n_cond):
+        if name == "stress":
+            break
+        start += size
+    assert size == prop.inputs.n_cond * len(space.stress_stations)
+    p = prop.condition(0)
+    V_i, V_i_0 = propmodel.induced_velocity(p)
+    p = eqx.tree_at(lambda q: q.V_i_0, p, V_i_0)
+    sf = np.asarray(structure.stress_fields(structure.structural_loads(p, prop.material()), prop.material()).safety_factor)
+    expected = 1.0 - 1.5 / sf[:, :-1].min(axis=0)[np.array(space.stress_stations)]
+    assert np.allclose(g[start:start + len(space.stress_stations)], expected, rtol=1e-8, atol=1e-10)
+
+    # The gradient goes through the air loads and the section properties
+    jac = jax.jacrev(lambda v: optimiser.problem_values(v, ps, space)[1])(space.to_unit(prop))
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree_util.tree_leaves(jac))
+
+    # Zero disables it
+    off = optimiser.DesignSpace.build(Propeller.default(inputs=Inputs(coeff_method=0, n_r=8)))
+    assert "stress" not in dict(off.constraint_groups(1))
+
+
 def test_prandtl_loss_follows_the_closed_form_and_vanishes_at_the_ends():
     from proptimiser import airflow
 

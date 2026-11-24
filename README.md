@@ -33,6 +33,24 @@ The extra `gui` adds PySide6 and pyvista for the graphical interface. The extra 
 Leave out the extras for the library only.
 `requirements.txt` holds the exact versions of the tested environment.
 
+## Repository layout
+
+| Folder | Content |
+|---|---|
+| `proptimiser/` | The package: BEMT, optimiser, structure, geometry and exports. The wheel holds only this folder. |
+| `tests/` | The tests of the package. |
+| `designs/`, `propellers/`, `exports/` | Design YAML files, solved states and exports. |
+| `docs/` | The contract A layout and design notes. |
+
+Proptimiser is a sizing tool. It holds no Creo, CFD or MCP function. Its CAD outputs are the files for Creo:
+
+| Output | Command | Files |
+|---|---|---|
+| Mould skin, core insert, parting surface | GUI Design tab, Export to Creo | `.ibl` curve files |
+| Blade solid and face table | GUI (Blade solid box), or `proptimiser-cad <design>` | `<design>_blade.step`, `<design>_blade_faces.json` |
+
+The STEP export needs the `cad` extra (`pip install -e .[cad]`).
+
 ## Use as a library
 
 ```python
@@ -100,7 +118,7 @@ The state file has `format_version` 1, a `units` map and one key for each array:
 ### Load and save in Python
 
 ```python
-from init import Propeller
+from proptimiser.init import Propeller
 
 prop = Propeller.load("currawong_v2")       # designs/currawong_v2.yaml and propellers/currawong_v2.state.json
 prop.save("currawong_v3")                   # writes both files, refuses to replace a file without overwrite=True
@@ -147,6 +165,7 @@ The optimiser sees only dimensionless values:
 | Thrust | `abs(T_i / T_i* - 1) <= thrust_tol` | Each condition stays in its thrust band. |
 | Motor power | `P_i <= P_max` | The motor limit. |
 | Thickness | `t/c >= min_tc` | At each optimised CST section. |
+| Stress | safety factor `>= min_safety_factor` | At each aerodynamic station and condition, from `structure.stress_fields` (skin and core). The hub and blend zone are not in it. `0` disables it. |
 | Confidence | NeuralFoil confidence `>= min_confidence` | Load-weighted mean over the aerodynamic zone. `0` disables it. |
 
 - `SLSQP` (default) applies the constraints exactly. Phase 1 restores feasibility when the seed violates a constraint.
@@ -156,6 +175,27 @@ The optimiser sees only dimensionless values:
 
 The BEMT solves the induced velocity with damped Newton on each annulus, to `V_i_0_eps`. `jax.lax.custom_root`
 gives exact gradients. A bracketed fallback solves an annulus where Newton stops at a minimum that is not a root.
+
+### Prandtl factors
+
+`tip_loss_model` and `root_loss_model` select the factors. `0` removes a factor. `root_loss_model: 0` gives the tip
+factor only. `loss_in_solve` selects where the factors apply:
+
+| `loss_in_solve` | BEMT residuals | Thrust and torque |
+|---|---|---|
+| `0` (default, and each saved design) | No factor | The momentum loads times the factor |
+| `1` | The factor on the momentum side | The momentum loads times the factor. They equal the blade loads at the root. |
+
+`loss_in_solve: 1` raises thrust and torque. A saved design is then off its thrust target, so optimise the design
+again before you use the result. The JAX and CasADi backends both accept the key.
+
+`propmodel.loads_with_loss_in_solve(prop.condition(i))` gives the thrust and the torque with the factors in the solve
+from a solved state. It does not change the design.
+
+The optimiser cost is the reason for the default. The solve time changes little (median over 5 designs, warm start,
+one thread: +13 % with both factors, +7 % with the tip factor only). The optimiser needs more iterations on the
+larger designs (median wall time to convergence on `currawong_v2`, 4 seeds, against `loss_in_solve: 0`: +22 % with
+both factors, +13 % with the tip factor only).
 
 `opt_verbose` (0, 1, 2) and `V_i_0_verbose` (0, 1, 2) set the output of the optimiser and of the BEMT solve.
 
@@ -200,26 +240,41 @@ into `exports/`:
 The exporters cut each section at constant radius. A swept section is longer by `1 / cos L`, where `L` is the
 angle between the span and the radial line.
 
+The trailing edge gap is at least 0.1 mm (`geometry.TE_MIN_THICKNESS_M`) at each station outboard of the hub. The
+value comes from the manufacturing tolerance. It applies to the CAD files, so also to the mould and the CFD model.
+The BEMT and structural models keep the design CST. Export the `.ibl` files again after a change to this value.
+
 ## Structural loads
 
 `structure.py` calculates the loads along the blade and at the hub for the solved flight conditions. It uses the
 stored induced velocity and solves nothing. All functions are safe for `jit`, `vmap` and `grad`.
 
 ```python
-import results
+from proptimiser import results
 
 prop, params_list, rows = results.evaluate_conditions(prop)                # solves the induced velocity
 data = results.structural_data(params_list[0], prop.material())
 print(results.structural_summary(data, 0))
 ```
 
+Mass properties of a blade or a propeller. Hub hardware is optional, and you give it explicitly:
+
+```python
+from proptimiser import structure
+
+blade = prop.blade_mass_properties()                                       # structure.MassProps: mass, cg, inertia, inertia_cg
+rotor = prop.mass_properties(hardware=structure.hub_hardware(0.004, radius=0.015, height=0.012))
+rotor.inertia[2, 2]                                                        # spin inertia about the rotation axis (kg m^2)
+```
+
 | Part | Method | Result |
 |---|---|---|
-| Section | Strip integrals of the CST outline | Area, centroid, second moments, torsion constant |
+| Section | Strip integrals of the CST outline and of its inward offset, weighted by region | Area, centroid, second moments and torsion constant of the outline, mass-weighted and stiffness-weighted sums |
+| Mass | Gauss rule along the radius, from `r_foils[0]` to the tip, of the rigid slices | Mass, centre of gravity and inertia tensor of one blade and of the `N`-blade propeller |
 | Inertia | Each blade slice is a rigid body that follows the hub and the pitch change | Centrifugal, Euler, Coriolis and gyroscopic loads, centrifugal twisting moment |
 | Statics | Force summation from the tip to the root with 3D position vectors | Axial force, shear, moments and torque at each station and azimuth |
 | Hub | Sum of the root loads of the `N` blades by Fourier series over the azimuth | Hub forces, moments and their `N`/rev amplitudes |
-| Stress | Axial and bending stress at the outline points, torsion and shear, von Mises | Safety factor against `mat_sigma_allow` and `mat_tau_allow` |
+| Stress | Axial and bending strain on the transformed section, times the `E` of each region, torsion and shear, von Mises | Stress in the skin and in the core, safety factor against the allowables of each region |
 
 Frames and signs:
 
@@ -228,12 +283,38 @@ Frames and signs:
 - Positive twist `beta` lifts the leading edge toward `+e_z`.
 - `offset_y` is positive toward the direction of rotation (APC `SWEEP`). `offset_z` is positive toward the thrust
   side (APC `RAKE`).
+- `MassProps` uses the blade frame of the first blade at azimuth 0. `I_ij = int (|p|^2 delta_ij - p_i p_j) dm`, so a
+  product of inertia has a minus sign. The spin inertia is `inertia[2, 2]`. The centrifugal twisting moment about `e_r`
+  is `omega^2 inertia[1, 2]` for steady rotation.
+
+Material regions (`structure.Layup`, every key is required in a design file):
+
+| Keys | Region |
+|---|---|
+| `mat_*`, `fill_factor` | The core. `fill_factor` is the share of the core area that is material |
+| `skin_thickness_m`, `skin_density_kg_m3`, `skin_E_Pa`, `skin_G_Pa`, `skin_sigma_allow_Pa`, `skin_tau_allow_Pa` | The skin: one homogenised region, not a ply table |
+
+- With `skin_thickness_m` 0, the core is the whole outline and the section is one isotropic material. The skin keys then
+  have no effect.
+- The skin thickness is measured normal to the outline. The core ends where the two offset lines cross, so the section
+  is solid skin at a thin trailing edge or tip.
+- The inertial loads and the mass properties use the mass-weighted section. The bending uses the stiffness-weighted
+  section, and the moments act about its centroid. The stress of a region is its `E` times the strain.
 
 Limits:
 
 - The blade is rigid. There is no elastic deflection, no fatigue model and no flutter model.
-- The shear centre is the centroid. The model has no laminate: use `fill_factor` for an equivalent solid.
+- The shear centre is the centroid. The torsional stiffness comes from Saint-Venant's approximation of the outline and
+  of the core, 8 % above the Bredt value for a thin skin on the test section.
+- A laminate has no von Mises stress. The skin stress is that of a homogenised region. Set the skin allowables to
+  effective values for this rule, and check the plies separately.
+- The skin thickness is constant along the span. A local root reinforcement is not in the model.
 - The material allowables are placeholders. Set them from the real material.
+- The mass model follows the design CST and the stations. It leaves out the CAD trailing edge rule (P1), and a design
+  state whose blend-zone chord is not the hub planform keeps its state chord. `docs/fluxer_22x6_6.md` gives the size of
+  these differences for the Rosella blade.
+- The structural loads start at `r_hub`. The mass properties also hold the hub zone inboard of it, and the wedge factor
+  of a bent pitch axis. A swept blade thus has a small difference between the two: 1 % of the mass on `APC_20x10E`.
 - `tilt` does not change the aerodynamics, so it does not change the loads.
 
 ## Use a propeller in a CasADi problem
@@ -243,8 +324,8 @@ Use it to size a quadcopter, a quadplane or a fixed-wing UAV with a real BEMT pr
 
 ```python
 import aerosandbox as asb
-from casadi_prop import PropellerModel
-from init import Propeller
+from proptimiser.casadi_prop import PropellerModel
+from proptimiser.init import Propeller
 
 model = PropellerModel.from_propeller(Propeller.load("currawong_v2_solved"), n_psi=1)   # axial flight
 

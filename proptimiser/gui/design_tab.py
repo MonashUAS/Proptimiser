@@ -17,7 +17,7 @@ from PySide6.QtCore import Qt
 from .. import geometry
 from .. import results
 from .. import structure
-from ..init import DESIGN_DIR
+from ..init import DESIGN_DIR, EXPORT_DIR
 from .setup_tab import MODEL_CHOICES
 from .widgets import FloatEdit, LivePlotCanvas, MplCanvas, make_table, fill_table, fit_table_height
 from .workers import Task
@@ -296,7 +296,7 @@ class DesignTab(QWidget):
         self.refresh_3d_button.clicked.connect(self.update_3d)
 
         self.export_name = QLineEdit()
-        self.export_dir = QLineEdit(str(geometry.EXPORT_DIR))
+        self.export_dir = QLineEdit(str(EXPORT_DIR))
         browse = QPushButton("Browse...")
         browse.clicked.connect(self._browse_export_dir)
         dir_row = QHBoxLayout()
@@ -308,13 +308,15 @@ class DesignTab(QWidget):
         self.export_parting = QCheckBox("Parting surface")
         for box in (self.export_mold, self.export_insert, self.export_parting):
             box.setChecked(True)
+        # The blade solid for the Creo CFD template: <prefix>_blade.step and <prefix>_blade_faces.json (needs the cad extra)
+        self.export_step = QCheckBox("Blade solid (STEP) and face table")
         self.laminate = FloatEdit(1.5)
         self.n_camber = QSpinBox()
         self.n_camber.setRange(10, 1000)
         self.n_camber.setValue(100)
         self.x_margin = FloatEdit(5.0)
         self.y_margin = FloatEdit(5.0)
-        self.export_button = QPushButton("Export to Creo (.ibl)")
+        self.export_button = QPushButton("Export to Creo")
         self.export_button.clicked.connect(self.export_creo)
 
         form = QFormLayout()
@@ -328,6 +330,7 @@ class DesignTab(QWidget):
         form.addRow("Camber points", self.n_camber)
         form.addRow("Chordwise margin [mm]", self.x_margin)
         form.addRow("Spanwise margin [mm]", self.y_margin)
+        form.addRow(self.export_step)
         form.addRow(self.export_button)
         panel = QGroupBox("Creo export")
         panel.setLayout(form)
@@ -527,7 +530,7 @@ class DesignTab(QWidget):
     def export_structure(self):
         if self.evaluation is None:
             return
-        default = geometry.EXPORT_DIR / f"{self.session.name}_C{self.condition.currentIndex()}_structure.csv"
+        default = EXPORT_DIR / f"{self.session.name}_C{self.condition.currentIndex()}_structure.csv"
         path, _ = QFileDialog.getSaveFileName(self, "Export structural loads", str(default), "CSV (*.csv)")
         if not path:
             return
@@ -549,7 +552,7 @@ class DesignTab(QWidget):
     def export_sections(self):
         if self.evaluation is None:
             return
-        default = geometry.EXPORT_DIR / f"{self.session.name}_C{self.condition.currentIndex()}_sections.csv"
+        default = EXPORT_DIR / f"{self.session.name}_C{self.condition.currentIndex()}_sections.csv"
         path, _ = QFileDialog.getSaveFileName(self, "Export sectional data", str(default), "CSV (*.csv)")
         if not path:
             return
@@ -652,12 +655,19 @@ class DesignTab(QWidget):
 
     def export_creo(self):
         prefix = self.export_name.text().strip() or self.session.name
-        out_dir = Path(self.export_dir.text().strip() or geometry.EXPORT_DIR)
+        out_dir = Path(self.export_dir.text().strip() or EXPORT_DIR)
         targets = [(kind, f"{prefix}_{suffix}") for kind, suffix, box in (
             ("mold", "mold", self.export_mold), ("insert", "insert", self.export_insert),
             ("parting", "parting_surf", self.export_parting)) if box.isChecked()]
-        if not targets:
+        step = self.export_step.isChecked()
+        if not targets and not step:
             return
+        if step:
+            try:
+                import OCP  # noqa: F401  the STEP writer needs OpenCascade (the cad extra)
+            except ImportError:
+                QMessageBox.warning(self, "Export", "The STEP export needs the cad extra: pip install -e .[cad]")
+                return
         try:
             laminate = self.laminate.value() / 1000.0
             x_margin, y_margin = self.x_margin.value(), self.y_margin.value()
@@ -665,7 +675,13 @@ class DesignTab(QWidget):
             QMessageBox.warning(self, "Export", str(e))
             return
 
-        existing = [out_dir / f"{name}.ibl" for _, name in targets if (out_dir / f"{name}.ibl").exists()]
+        # The mould skin is three files, one for each zone (geometry.export_standard_ibl)
+        files = [f"{name}_{zone}" for kind, name in targets if kind == "mold" for zone, _ in geometry.STANDARD_SECTIONS]
+        files += [name for kind, name in targets if kind != "mold"]
+        paths = [out_dir / f"{name}.ibl" for name in files]
+        if step:
+            paths += [out_dir / f"{prefix}_blade.step", out_dir / f"{prefix}_blade_faces.json"]
+        existing = [p for p in paths if p.exists()]
         if existing and QMessageBox.question(
             self, "Overwrite files?", "Replace\n" + "\n".join(p.name for p in existing) + f"\nin {out_dir}?"
         ) != QMessageBox.Yes:
@@ -681,7 +697,9 @@ class DesignTab(QWidget):
             r, c, beta, pitch_axis, coords, offsets = cached if cached is not None else geometry.blade_export_geometry(prop)
             written = []
             for kind, name in targets:
-                if kind == "parting":
+                if kind == "mold":
+                    written.extend(geometry.export_standard_ibl(prop, name, out_dir=out_dir)[0])
+                elif kind == "parting":
                     written.append(geometry.export_parting_surface_ibl(
                         r, c, beta, coords, np.array(prop.blade.r_foils), name, pitch_axis=pitch_axis,
                         x_margin=x_margin, y_margin=y_margin, n_camber_points=n_camber, out_dir=out_dir,
@@ -690,6 +708,10 @@ class DesignTab(QWidget):
                     written.append(geometry.export_to_creo_ibl(
                         r, c, beta, coords, name, pitch_axis=pitch_axis,
                         skin_thickness=laminate if kind == "insert" else 0.0, out_dir=out_dir, offsets=offsets))
+            if step:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                solid = geometry.export_propeller_step(prop, out_dir, prefix, rotor=False)
+                written += [solid["blade"], solid["faces"]]
             return written
 
         task = Task(work, self)

@@ -510,14 +510,18 @@ def _structural_fields(params, mat, kin):
     result = structure.structural_loads(params, mat, kin)
     stress = structure.stress_fields(result, mat)
     props, loads, hub = result.props, result.resultants, result.hub
+    blade, rotor = structure.blade_mass_properties(params, mat), structure.propeller_mass_properties(params, mat)
     return dict(
         r=params.r, psi=params.psi, c=params.c, beta_deg=jnp.degrees(params.beta), aero=propmodel.aero_zone(params),
-        mass_per_length=mat.density * mat.fill * props.area * result.axes.arc,
+        mass_per_length=props.mass.total * result.axes.arc,
         area=props.area, I_xx=props.I_xx, I_zz=props.I_zz, I_xz=props.I_xz, J=props.J, t_max=props.t_max,
         x_c=props.x_c, z_c=props.z_c,
         N=loads.N, V_x=loads.V_x, V_z=loads.V_z, M_x=loads.M_x, M_z=loads.M_z, T=loads.T,
         T_aero=result.T_aero, T_inertial=result.T_inertial,
         sigma_max=stress.sigma_max, tau=stress.tau, sigma_vm=stress.sigma_vm, safety_factor=stress.safety_factor,
+        core_sigma_max=stress.core_sigma_max, core_sigma_vm=stress.core_sigma_vm,
+        blade_mass=blade.mass, blade_cg=blade.cg, blade_inertia_cg=blade.inertia_cg,
+        propeller_mass=rotor.mass, propeller_inertia=rotor.inertia,
         atm=result.pitch_torque_aero, ctm=result.pitch_torque_inertial, hold=result.pitch_torque_hold,
         hub_force=hub.force, hub_moment=hub.moment,
         hub_force_amplitude=hub.force_amplitude, hub_moment_amplitude=hub.moment_amplitude,
@@ -527,15 +531,17 @@ def _structural_fields(params, mat, kin):
 def structural_data(params, mat, kin=None) -> dict:
     '''
     Loads along the blade and at the hub of one solved flight condition (numpy), from structure.structural_loads and
-    structure.stress_fields. params is a Params whose V_i_0 is solved (evaluate_conditions), mat a structure.Material
+    structure.stress_fields. params is a Params whose V_i_0 is solved (evaluate_conditions), mat a structure.Layup
     (Propeller.material()) and kin an optional structure.Kinematics.
 
     The dict holds, per station (n_r,): r, c, beta_deg, aero (aerodynamic zone mask), the section properties (area,
     I_xx, I_zz, I_xz, J, t_max, x_c, z_c) and mass_per_length; per azimuth and station (n_psi, n_r), SI units: the
     internal loads N, V_x, V_z, M_x, M_z, T, and T_aero and T_inertial (the parts of T), the stresses sigma_max, tau,
     sigma_vm and safety_factor; per azimuth (n_psi,): the root pitch torques atm, ctm and hold; and the hub loads
-    hub_force, hub_moment (n_psi, 3) with their harmonics hub_force_amplitude and hub_moment_amplitude, with a
-    'summary' dict of the figures structural_summary reports. Blade loads are those of one blade at root azimuth psi.
+    hub_force, hub_moment (n_psi, 3) with their harmonics hub_force_amplitude and hub_moment_amplitude; the mass
+    properties blade_mass, blade_cg, blade_inertia_cg, propeller_mass and propeller_inertia (structure.MassProps, without
+    hub hardware), with a 'summary' dict of the figures structural_summary reports. Blade loads are those of one blade
+    at root azimuth psi.
     '''
     fields = {k: np.asarray(v) for k, v in _structural_fields(_without_logs(params), mat, kin).items()}
     psi = fields["psi"]
@@ -555,7 +561,10 @@ def structural_data(params, mat, kin=None) -> dict:
         atm_peak=peak(fields["atm"]), ctm_peak=peak(fields["ctm"]), hold_peak=peak(fields["hold"]),
         safety_factor_min=float(sf[psi_i, r_i]), safety_factor_r=float(fields["r"][r_i]),
         safety_factor_psi=float(np.degrees(psi[psi_i])), sigma_vm_max=float(fields["sigma_vm"].max()),
-        sigma_allow=float(mat.sigma_allow), tau_allow=float(mat.tau_allow),
+        sigma_allow=float(mat.outer.sigma_allow), tau_allow=float(mat.outer.tau_allow),
+        skin_thickness=float(mat.skin_thickness), core_sigma_vm_max=float(fields["core_sigma_vm"].max()),
+        blade_mass=float(fields["blade_mass"]), blade_cg_r=float(fields["blade_cg"][0]),
+        propeller_mass=float(fields["propeller_mass"]), propeller_I_spin=float(fields["propeller_inertia"][2, 2]),
         hub_thrust=float(hub_force[:, 2].mean()), hub_torque=float(-hub_moment[:, 2].mean()),
         hub_side_force=float(np.max(np.hypot(hub_force[:, 0], hub_force[:, 1]))),
         hub_moment_xy=float(np.max(np.hypot(hub_moment[:, 0], hub_moment[:, 1]))),
@@ -566,12 +575,15 @@ def structural_data(params, mat, kin=None) -> dict:
 def structural_summary(data, cond_idx=None) -> str:
     '''
     Plain-text report of structural_data: the blade-root loads, the pitch-change torques of a constant-speed unit, the
-    weakest section and the hub loads. Blade-root values are the largest over the azimuth, in N, N m and MPa.
+    weakest section, the hub loads and the mass properties. Blade-root values are the largest over the azimuth, in N, N m
+    and MPa.
     '''
     s = data["summary"]
     title = "Structural loads" + ("" if cond_idx is None else f", flight condition {cond_idx}")
     return "\n".join([
-        f"{title} ({s['n_blades']} blades, rigid blade, isotropic section)",
+        f"{title} ({s['n_blades']} blades, rigid blade, "
+        + (f"{1000 * s['skin_thickness']:.2f} mm skin over a core, largest core von Mises {s['core_sigma_vm_max'] / 1e6:.1f} MPa)"
+           if s["skin_thickness"] > 0.0 else "one material section)"),
         f"  Blade root (r = {1000 * s['r_root']:.1f} mm): retention force {s['root_N']:.1f} N | shear x/z {s['root_V_x']:.1f} / {s['root_V_z']:.1f} N | "
         f"flap moment {s['root_M_x']:.3f} N m | edge moment {s['root_M_z']:.3f} N m | torque {s['root_T']:.3f} N m",
         f"  Pitch-change torque (about the blade axis): aerodynamic {s['atm_mean']:+.3f} N m | centrifugal {s['ctm_mean']:+.3f} N m | "
@@ -580,6 +592,8 @@ def structural_summary(data, cond_idx=None) -> str:
         f"azimuth {s['safety_factor_psi']:.0f} deg (von Mises {s['sigma_vm_max'] / 1e6:.1f} MPa, allowable {s['sigma_allow'] / 1e6:.1f} MPa)",
         f"  Hub: thrust {s['hub_thrust']:.2f} N | shaft torque {s['hub_torque']:.3f} N m | peak side force {s['hub_side_force']:.2f} N | "
         f"peak moment about x/y {s['hub_moment_xy']:.3f} N m | thrust at {s['n_blades']}/rev {s['hub_thrust_amplitude']:.3f} N",
+        f"  Mass: blade {1000 * s['blade_mass']:.1f} g with its CG at r = {1000 * s['blade_cg_r']:.1f} mm | propeller {1000 * s['propeller_mass']:.1f} g | "
+        f"propeller spin inertia {s['propeller_I_spin']:.3e} kg m^2 (no hub hardware)",
     ])
 
 def structural_peak(values, psi_index=None):

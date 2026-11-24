@@ -20,7 +20,18 @@ import yaml
 # Internal Imports
 from . import geometry
 
-from .paths import DESIGN_DIR, PROP_DIR      # hand design files <name>.yaml, solved state files <name>.state.json
+# Folders used by Proptimiser.
+# AIRFOIL_DIR holds the airfoil data. It is part of the installed package.
+# HOME holds the user files: designs, solved states and exports. It is the folder in the environment variable
+# PROPTIMISER_HOME. When the variable is not set, HOME is the current working directory.
+AIRFOIL_DIR = Path(__file__).resolve().parent / "airfoils"
+
+HOME = Path(os.environ.get("PROPTIMISER_HOME") or Path.cwd()).resolve()
+DESIGN_DIR = HOME / "designs"           # hand design files: <name>.yaml
+PROP_DIR = HOME / "propellers"          # solved state files: <name>.state.json
+EXPORT_DIR = HOME / "exports"           # generated .ibl, .csv and .h5 files
+APC_DIR = HOME / "apc_prop_data"        # APC data. It is not part of the package.
+
 DESIGN_FORMAT = 2
 STATE_FORMAT = 1
 
@@ -102,12 +113,14 @@ class Inputs:
     w_confidence: float = 1.0       # weight of the NeuralFoil low-confidence penalty
     w_smooth: float = 1e-2          # weight of the chord smoothness penalty (all solvers; 0 disables)
     min_confidence: float = 0.9     # lowest load-weighted NeuralFoil confidence over the aerodynamic zone (0 disables)
+    min_safety_factor: float = 0.0  # lowest structural safety factor at each station and condition (nd, 0 disables)
 
     # Aerodynamic Models Selection
     inflow_model: int = 0   #0: Simple 1: Pitt-Peters
     coeff_method: int = 3 # 0: Parametric, 1: 2D Interp, 2: 3D Interp, 3: NeuralFoil
     tip_loss_model: int = 0 # 0: No Loss 1: Prandtl
     root_loss_model: int = 0 # 0: No Loss 1: Prandtl
+    loss_in_solve: int = 0 # 0: the Prandtl factors apply after the solve, 1: in the momentum side of the BEMT residuals
     rot_corr_model: int = 0 # 3D inflow correction model
     high_induction_model: int = 0 # (0: Classical Momentum, 1: Buhl Correction) NOT USEFUL FOR REGULAR FLIGHT
 
@@ -117,6 +130,8 @@ class Inputs:
         self.bemt_type = tuple(bool(b) for b in self.bemt_type)
         if len(self.bemt_type) != 3 or not any(self.bemt_type):
             raise ValueError(f"bemt_type must select at least one of (V_ia, V_it, V_ir), got {self.bemt_type}")
+        if self.loss_in_solve not in (0, 1):
+            raise ValueError(f"loss_in_solve must be 0 or 1, got {self.loss_in_solve}")
 
         for name in CONDITION_FIELDS:
             dtype = bool if name.startswith("solve_") else float
@@ -172,13 +187,20 @@ class BladeSpec:
     offset_y: tuple = ()                    # tangential offset (m): + toward the rotation direction (APC SWEEP), so a backswept tip is negative
     offset_z: tuple = ()                    # axial offset (m): + toward the thrust direction (APC RAKE)
 
-    # Structure: one isotropic material over the CST section outline (defaults follow the APC propeller files)
+    # Structure: a skin over a core inside the CST section outline (structure.Layup). The mat_* keys are the core. With
+    # skin_thickness_m = 0 the core is the whole outline: one isotropic material (defaults follow the APC propeller files)
     mat_density: float = 1700.0             # kg/m^3 (specific gravity 1.7)
     mat_E: float = 19.7e9                   # Young's modulus (Pa)
     mat_G: float = 7.3e9                    # shear modulus (Pa)
     mat_sigma_allow: float = 60e6           # allowable normal stress (Pa), a placeholder: set it from the material
     mat_tau_allow: float = 0.0              # allowable shear stress (Pa); 0 means mat_sigma_allow / sqrt(3)
-    fill_factor: float = 1.0                # share of the outline area that is material: 1 solid, < 1 homogenised infill
+    fill_factor: float = 1.0                # share of the core area that is material: 1 solid, < 1 homogenised infill
+    skin_thickness_m: float = 0.0           # cured skin thickness normal to the outline (m). 0 means no skin
+    skin_density_kg_m3: float = 1700.0      # homogenised laminate density
+    skin_E_Pa: float = 19.7e9               # effective spanwise Young's modulus of the laminate
+    skin_G_Pa: float = 7.3e9                # effective shear modulus of the laminate
+    skin_sigma_allow_Pa: float = 60e6       # allowable normal stress of the laminate, a placeholder: set it from the laminate
+    skin_tau_allow_Pa: float = 0.0          # allowable shear stress; 0 means skin_sigma_allow_Pa / sqrt(3)
 
     def __post_init__(self):
         self.N = int(self.N)
@@ -230,6 +252,10 @@ class BladeSpec:
             raise ValueError("Material density, E, G and sigma_allow must be positive, and tau_allow cannot be negative")
         if not 0.0 < self.fill_factor <= 1.0:
             raise ValueError(f"fill_factor must be in (0, 1], got {self.fill_factor}")
+        if min(self.skin_density_kg_m3, self.skin_E_Pa, self.skin_G_Pa, self.skin_sigma_allow_Pa) <= 0 or self.skin_tau_allow_Pa < 0:
+            raise ValueError("Skin density, E, G and sigma_allow must be positive, and tau_allow cannot be negative")
+        if self.skin_thickness_m < 0:
+            raise ValueError(f"skin_thickness_m cannot be negative, got {self.skin_thickness_m}")
 
     @property
     def swept(self) -> bool:
@@ -267,6 +293,7 @@ class ModelConfig:
     Hashable model settings read by the physics. Built from Inputs + BladeSpec and carried
     on Params as a static field, so jit specialises on it.
     '''
+    R_start: float                  # inboard end of the hub zone (r_foils[0]): only the mass properties use it
     R_hub: float
     R_aero: float                   # inboard edge of the aerodynamic zone: the blend zone inboard of it carries no force
     R_tip: float
@@ -279,6 +306,7 @@ class ModelConfig:
     coeff_method: int
     tip_loss_model: int
     root_loss_model: int
+    loss_in_solve: int
     rot_corr_model: int
     high_induction_model: int
     I_0: float
@@ -294,12 +322,14 @@ class ModelConfig:
     w_confidence: float
     w_smooth: float
     min_confidence: float
+    min_safety_factor: float
     backend: str = "jax" if HAS_JAX else "casadi"           # array namespace of the physics: "jax" or "casadi" (backend.py)
 
     @classmethod
     def build(cls, inputs: Inputs, blade: BladeSpec) -> "ModelConfig":
-        copied = [f.name for f in dataclasses.fields(cls) if f.name not in ("R_hub", "R_aero", "R_tip", "solve_idx", "swept", "backend")]
+        copied = [f.name for f in dataclasses.fields(cls) if f.name not in ("R_start", "R_hub", "R_aero", "R_tip", "solve_idx", "swept", "backend")]
         return cls(
+            R_start=blade.r_foils[0],
             R_hub=blade.R_hub,
             R_aero=blade.R_aero,
             R_tip=blade.R_tip,
@@ -531,12 +561,29 @@ class Propeller:
 
     def material(self):
         '''
-        The blade material as structure.Material, for the structural loads (kept out of Params and ModelConfig, so a
-        change of material never recompiles the BEMT).
+        The section regions as structure.Layup, for the structural loads and the mass properties (kept out of Params
+        and ModelConfig, so a change of material never recompiles the BEMT).
         '''
-        from .structure import Material      # Internal Import: structure imports this module
+        from .structure import Layup         # Internal Import: structure imports this module
 
-        return Material.from_blade(self.blade)
+        return Layup.from_blade(self.blade)
+
+    def blade_mass_properties(self):
+        '''
+        Mass, centre of gravity and inertia tensor of one blade (structure.MassProps), SI units.
+        '''
+        from . import structure              # Internal Import: structure imports this module
+
+        return structure.blade_mass_properties(self.condition(0), self.material())
+
+    def mass_properties(self, hardware=None):
+        '''
+        Mass, centre of gravity and inertia tensor of the propeller (structure.MassProps), SI units. hardware is an
+        optional structure.MassProps of the hub or hardware mass (structure.hub_hardware).
+        '''
+        from . import structure              # Internal Import: structure imports this module
+
+        return structure.propeller_mass_properties(self.condition(0), self.material(), hardware)
 
     ## Solver Setup
     def condition(self, idx: int = 0) -> Params:
@@ -666,7 +713,8 @@ _INPUT_ANGLES = ("tilt",)
 DESIGN_HEADER = """\
 # Proptimiser design: {name}
 # Units: SI. Lengths m, speeds m/s, omega rad/s, thrust N, power W, I_0 A, R_tot ohm, kV rpm/V, kappa nd, Q0 Nm, V_bus V,
-# density kg/m^3, E, G and allowable stresses Pa. Angles in degrees: every key that ends in _deg.
+# density kg/m^3, E, G and allowable stresses Pa. Angles in degrees: every key that ends in _deg. The skin_* keys
+# carry their unit in the name. The mat_* keys and fill_factor are the core region (the whole outline when skin_thickness_m is 0).
 # Dimensionless (nd): weights, tolerances, ratios, CST weights, fill_factor.
 # Every key is required. An unknown key is an error. Write floats with a dot (1.0e-8, not 1e-8).
 """
@@ -702,21 +750,6 @@ def design_yaml(inputs: Inputs, blade: BladeSpec, name: str = "") -> str:
     return DESIGN_HEADER.format(name=name) + body
 
 
-def _migrate_design_1(data: dict) -> dict:
-    '''
-    Format 1 to format 2: R_m (motor winding resistance) becomes R_tot, and the ESC factor kappa, the friction torque
-    Q0 and the bus voltage V_bus take the values that give the old motor model (1, 0 and 0).
-    '''
-    if not isinstance(data.get("inputs"), dict):
-        return data                   # the checks below name the fault
-    inputs = {}
-    for key, value in data["inputs"].items():
-        inputs["R_tot" if key == "R_m" else key] = value
-        if key == "kV":
-            inputs.update(kappa=1.0, Q0=0.0, V_bus=0.0)
-    return {**data, "format_version": DESIGN_FORMAT, "inputs": inputs}
-
-
 def design_from_dict(data: dict, source="design") -> tuple:
     '''
     (Inputs, BladeSpec) from the design YAML content. Rejects a missing key, an unknown key and a format_version
@@ -725,8 +758,6 @@ def design_from_dict(data: dict, source="design") -> tuple:
     if not isinstance(data, dict):
         raise ValueError(f"{source}: the design file must hold a mapping")
     _check_keys(data, ["format_version", "inputs", "blade"], source)
-    if data["format_version"] == 1:
-        data = _migrate_design_1(data)
     if data["format_version"] != DESIGN_FORMAT:
         raise ValueError(f"{source}: format_version {data['format_version']!r} is not supported "
                          f"(expected {DESIGN_FORMAT})")

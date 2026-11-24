@@ -1,0 +1,78 @@
+# Proptimiser design: currawong_v4
+# Units: SI. Lengths m, speeds m/s, omega rad/s, thrust N, power W, I_0 A, R_tot ohm, kV rpm/V, kappa nd, Q0 Nm, V_bus V,
+# density kg/m^3, E, G and allowable stresses Pa. Angles in degrees: every key that ends in _deg. The skin_* keys
+# carry their unit in the name. The mat_* keys and fill_factor are the core region (the whole outline when skin_thickness_m is 0).
+# Dimensionless (nd): weights, tolerances, ratios, CST weights, fill_factor.
+# Every key is required. An unknown key is an error. Write floats with a dot (1.0e-8, not 1e-8).
+format_version: 2
+inputs:
+  opt_solver: SLSQP
+  opt_max_iter: 2000
+  opt_tol: 1.0e-08
+  opt_verbose: 1
+  opt_print_every: 50
+  V_i_0_max_iter: 200
+  V_i_0_eps: 1.0e-08
+  V_i_0_verbose: 0
+  bemt_type: [true, true, false]
+  n_r: 50
+  n_psi: 16
+  jax_tracing: false
+  thrust_target: [12.39, 60.0]
+  V_x: [17.5, 0.8]
+  V_yz: [3.0, 3.0]
+  omega: [588.0, 650.0]
+  tilt_deg: [0.0, 0.0]
+  solve_omega: [true, true]
+  solve_tilt: [false, false]
+  objective_weight: [0.9, 0.1]
+  I_0: 2.0
+  R_tot: 0.037
+  kV: 220.0
+  kappa: 1.0
+  Q0: 0.0
+  V_bus: 42.0
+  P_max: 3300.0
+  w_thrust: 10000.0
+  thrust_tol: 0.01
+  w_thickness: 10.0
+  w_confidence: 1.0
+  w_smooth: 0.01
+  min_confidence: 0.9
+  min_safety_factor: 0.0
+  inflow_model: 1
+  coeff_method: 3
+  tip_loss_model: 1
+  root_loss_model: 1
+  loss_in_solve: 0
+  rot_corr_model: 1
+  high_induction_model: 0
+blade:
+  N: 2
+  r_foils: [0.0, 0.025, 0.05, 0.15, 0.285]
+  airfoils: [arad10, arad10, arad10]
+  hub_chord: 0.03
+  hub_twist_deg: 0.0
+  hub_thickness_ratio: 0.1
+  hub_cst: [-0.3172404036956897, -0.053942717406887386, 0.11792649197348969, -0.9344180731532927, 1.3653143580519196, -1.9396455321015964, 1.429862567623529, -1.6052649027831305, 0.3172404036956898, 0.05394271740689671, -0.11792649197350275, 0.934418073153309, -1.365314358051937, 1.9396455321016133, -1.4298625676235401, 1.6052649027831354, -8.247662385011394e-15, 0.022656937413475516]
+  freeze: {}
+  optimise_cst: true
+  c_bounds: [0.001, 0.2]
+  beta_bounds_deg: [0.0, 50.0]
+  cst_bound: 0.25
+  min_tc: 0.06
+  offset_r: []
+  offset_y: []
+  offset_z: []
+  mat_density: 1700.0
+  mat_E: 19700000000.0
+  mat_G: 7300000000.0
+  mat_sigma_allow: 60000000.0
+  mat_tau_allow: 0.0
+  fill_factor: 1.0
+  skin_thickness_m: 0.0
+  skin_density_kg_m3: 1700.0
+  skin_E_Pa: 19700000000.0
+  skin_G_Pa: 7300000000.0
+  skin_sigma_allow_Pa: 60000000.0
+  skin_tau_allow_Pa: 0.0

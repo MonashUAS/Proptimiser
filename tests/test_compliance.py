@@ -15,8 +15,11 @@ THIS_FILE = Path(__file__).resolve()
 
 
 def _tracked(*patterns):
-    out = subprocess.run(["git", "ls-files", *patterns], cwd=ROOT, capture_output=True, text=True, check=True)
-    return [ROOT / p for p in out.stdout.splitlines() if (ROOT / p).resolve() != THIS_FILE]
+    """The files that git tracks or will track (not ignored), as they are in the working tree. A deleted file holds no text."""
+    command = ["git", "ls-files", "--cached", "--others", "--exclude-standard", *patterns]
+    out = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=True)
+    paths = {ROOT / p for p in out.stdout.splitlines()}
+    return sorted(p for p in paths if p.is_file() and p.resolve() != THIS_FILE)
 
 
 def _python_files():
@@ -51,16 +54,18 @@ def test_no_legacy_loader_remains():
         assert ".eqx" not in text, f"{path.name} mentions .eqx files"
         assert not re.search(r"format_version\W{1,6}2\b|\(2, *FORMAT_VERSION\)", text), \
             f"{path.name} handles format_version 2"
-        assert not re.search(r"legacy_eqx|_LEGACY_|_RESET_FROM_V2|loadprop|_OldCase", text), \
+        assert not re.search(r"legacy_eqx|_LEGACY_|_RESET_FROM_V2|loadprop|_OldCase|_migrate_", text), \
             f"{path.name} holds a legacy loader name"
 
 
-def test_saved_files_use_format_version_1():
+def test_saved_files_use_the_current_format_version():
     import json
     import yaml
+    from proptimiser import init
 
+    # A design file uses DESIGN_FORMAT. A state file uses format_version 1 (rule 5)
     for path in _tracked("designs/*.yaml"):
-        assert yaml.safe_load(path.read_text(encoding="utf-8"))["format_version"] == 1, path.name
+        assert yaml.safe_load(path.read_text(encoding="utf-8"))["format_version"] == init.DESIGN_FORMAT, path.name
     for path in _tracked("propellers/*"):
         assert path.name.endswith(".state.json"), f"{path.name} is not a state file"
         assert json.loads(path.read_text(encoding="utf-8"))["format_version"] == 1, path.name
@@ -70,6 +75,6 @@ def test_exporter_writes_schema_version_1_only():
     from proptimiser import export_performance as ep
 
     assert ep.SCHEMA == "prop-performance" and ep.SCHEMA_VERSION == 1
-    source = (ROOT / "src" / "proptimiser" / "export_performance.py").read_text(encoding="utf-8")
+    source = (ROOT / "proptimiser" / "export_performance.py").read_text(encoding="utf-8")
     assert len(re.findall(r'attrs\["schema_version"\]', source)) == 1
     assert "schema_version = 2" not in source and "SCHEMA_VERSION = 2" not in source

@@ -14,8 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 # Internal Imports
-from ..init import DESIGN_DIR, Propeller
-from ..paths import APC_DIR as APC_DATA_DIR
+from ..init import APC_DIR as APC_DATA_DIR, DESIGN_DIR, Propeller
 from .design_tab import DesignTab
 from .optimise_tab import OptimiseTab
 from .setup_tab import SetupTab

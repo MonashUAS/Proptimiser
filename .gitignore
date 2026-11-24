@@ -222,3 +222,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Measured data with no stated terms of use
+/data/measured/
+
+
+# Local files, LLM's and documentation (will integrate better later)
+README.md
+docs/
+data/
+Proptimiser Paper.md

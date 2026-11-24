@@ -21,6 +21,7 @@ MODEL_CHOICES = dict(
     coeff_method=("Parametric", "2D interpolation", "3D interpolation", "NeuralFoil"),
     tip_loss_model=("None", "Prandtl"),
     root_loss_model=("None", "Prandtl"),
+    loss_in_solve=("After the solve", "In the solve"),
     rot_corr_model=("None", "Du-Selig"),
     high_induction_model=("Classical momentum", "Buhl"),
 )
@@ -45,6 +46,8 @@ INPUT_GROUPS = [
         Field("coeff_method", "Airfoil coefficients", "choice", choices=MODEL_CHOICES["coeff_method"]),
         Field("tip_loss_model", "Tip loss", "choice", choices=MODEL_CHOICES["tip_loss_model"]),
         Field("root_loss_model", "Root loss", "choice", choices=MODEL_CHOICES["root_loss_model"]),
+        Field("loss_in_solve", "Prandtl factors apply", "choice", choices=MODEL_CHOICES["loss_in_solve"],
+              tooltip="After the solve: the BEMT residuals have no factor. In the solve: the momentum side has the factor"),
         Field("rot_corr_model", "Rotational correction", "choice", choices=MODEL_CHOICES["rot_corr_model"]),
         Field("high_induction_model", "High induction", "choice", choices=MODEL_CHOICES["high_induction_model"]),
     ]),
@@ -59,6 +62,8 @@ INPUT_GROUPS = [
     ("Constraints", [
         Field("thrust_tol", "Thrust tolerance", "float", tooltip="Relative thrust error allowed about each target"),
         Field("P_max", "Max motor power [W]", "float"),
+        Field("min_safety_factor", "Min safety factor", "float",
+              tooltip="Lowest structural safety factor at each station and condition (0 disables)"),
         Field("min_confidence", "Min NeuralFoil confidence", "float",
               tooltip="Lowest NeuralFoil confidence, averaged over the aerodynamic zone with each element weighted by "
                       "its force scale V_R^2 dr (0 disables)"),
@@ -110,13 +115,20 @@ BLADE_GROUPS = [
                       "One value per control radius, or empty for none"),
     ]),
     ("Structure", [
-        Field("mat_density", "Density [kg/m^3]", "float"),
-        Field("mat_E", "Young's modulus E [Pa]", "float"),
-        Field("mat_G", "Shear modulus G [Pa]", "float"),
-        Field("mat_sigma_allow", "Allowable normal stress [Pa]", "float"),
-        Field("mat_tau_allow", "Allowable shear stress [Pa]", "float", tooltip="0: allowable normal stress / sqrt(3)"),
-        Field("fill_factor", "Fill factor", "float",
-              tooltip="Share of the section outline that is material: 1 is solid, below 1 is a homogenised infill"),
+        Field("mat_density", "Core density [kg/m^3]", "float", tooltip="The whole section when the skin thickness is 0"),
+        Field("mat_E", "Core Young's modulus E [Pa]", "float"),
+        Field("mat_G", "Core shear modulus G [Pa]", "float"),
+        Field("mat_sigma_allow", "Core allowable normal stress [Pa]", "float"),
+        Field("mat_tau_allow", "Core allowable shear stress [Pa]", "float", tooltip="0: allowable normal stress / sqrt(3)"),
+        Field("fill_factor", "Core fill factor", "float",
+              tooltip="Share of the core area that is material: 1 is solid, below 1 is a homogenised infill"),
+        Field("skin_thickness_m", "Skin thickness [m]", "float",
+              tooltip="Cured skin thickness normal to the outline. 0: no skin, the core is one solid material"),
+        Field("skin_density_kg_m3", "Skin density [kg/m^3]", "float"),
+        Field("skin_E_Pa", "Skin effective E [Pa]", "float", tooltip="Homogenised spanwise modulus of the laminate"),
+        Field("skin_G_Pa", "Skin effective G [Pa]", "float", tooltip="Homogenised shear modulus of the laminate"),
+        Field("skin_sigma_allow_Pa", "Skin allowable normal stress [Pa]", "float"),
+        Field("skin_tau_allow_Pa", "Skin allowable shear stress [Pa]", "float", tooltip="0: allowable normal stress / sqrt(3)"),
     ]),
 ]
 

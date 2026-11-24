@@ -1,6 +1,7 @@
 ## Define All Physical Properties for Given Propeller Geometry
 
 # External Libraries
+import dataclasses
 from typing import NamedTuple
 
 import numpy as np
@@ -316,7 +317,7 @@ def dT_momentum(V_i: jnp.ndarray, params: Params, debug: bool = False, apply_tip
         F = tip_loss * root_loss
         F = xp.clip(F, 0.05, 1.0)
     else:
-        F = xp.ones_like(V_ia)   # smooth, well-scaled system for the solve
+        F = xp.ones_like(V_ia)   # no factor in the solve (Inputs.loss_in_solve = 0)
 
     # Compute baseline classical momentum element locally
     V_prime = xp.sqrt((V_x + V_ia) ** 2 + V_yz ** 2)
@@ -372,7 +373,7 @@ def dQ_momentum(V_i, params, debug=False, apply_tip_loss=True):
         F = tip_loss * root_loss
         F = xp.clip(F, 0.05, 1.0)
     else:
-        F = xp.ones_like(V_ia)   # smooth, well-scaled system for the solve
+        F = xp.ones_like(V_ia)   # no factor in the solve (Inputs.loss_in_solve = 0)
 
     # Compute baseline classical momentum element locally
     # Uses V_prime to account for skewed wake mass flux (Nahon 2015)
@@ -400,7 +401,8 @@ def thrust_residual(V_i, params):
     Returns array of shape (n_r,)
     """
     dT_BEMT_avg = dT_blade(V_i, params, debug=False)
-    dT_MMNT_avg = dT_momentum(V_i, params, debug=False, apply_tip_loss=False)   # smooth for the solve
+    # Inputs.loss_in_solve selects where the Prandtl factors apply: 0 after the solve, 1 in the momentum side of the solve
+    dT_MMNT_avg = dT_momentum(V_i, params, debug=False, apply_tip_loss=params.cfg.loss_in_solve == 1)
     return dT_BEMT_avg - dT_MMNT_avg
 
 def torque_residual(V_i, params):
@@ -409,7 +411,7 @@ def torque_residual(V_i, params):
     Returns array of shape (n_r,)
     """
     dQ_BEMT_avg = dQ_blade(V_i, params, debug=False)
-    dQ_MMNT_avg = dQ_momentum(V_i, params, debug=False, apply_tip_loss=False)
+    dQ_MMNT_avg = dQ_momentum(V_i, params, debug=False, apply_tip_loss=params.cfg.loss_in_solve == 1)
     return dQ_BEMT_avg - dQ_MMNT_avg
 
 def inflow_from_lambda(lambda_i_0_guess, params):
@@ -755,7 +757,7 @@ def torque(V_i, params, debug=False):
     """
     
     # Get the average torque per rotation in each annulus using the dQ_blade function
-    dQ_blade_ave = dQ_momentum(V_i, params, debug, apply_tip_loss=True)   # accurate, applied post-solve
+    dQ_blade_ave = dQ_momentum(V_i, params, debug, apply_tip_loss=True)   # the loads always carry the factor
 
     # Use trapezoidal integration over the aerodynamic zone to compute the total torque
     xp = ops(params.cfg)
@@ -767,13 +769,37 @@ def thrust(V_i, params):
     '''
     Calculate total thrust from solved induced velocity
     '''
-    dT = dT_momentum(V_i, params, apply_tip_loss=True)   # accurate, applied post-solve
+    dT = dT_momentum(V_i, params, apply_tip_loss=True)   # the loads always carry the factor
 
     # Numerically Compute Double Integral (over the aerodynamic zone) to Solve for Thrust
     xp = ops(params.cfg)
     T = params.scale * xp.sum(dT * xp.const(radial_weights(params)))
 
     return T
+
+class SolvedLoads(NamedTuple):
+    """
+    Loads of one BEMT solve, with the unit in each name (nd: dimensionless).
+    """
+    thrust_N: jnp.ndarray
+    torque_Nm: jnp.ndarray
+    residual_nd: jnp.ndarray        # largest scaled BEMT residual over the aerodynamic zone
+    V_i_0_m_s: jnp.ndarray          # solved induced velocity (3, n_r)
+
+@jit
+def _solved_loads(params) -> SolvedLoads:
+    V_i, V_i_0 = induced_velocity(params)
+    lam = V_i_0[params.cfg.solve_rows] / get_velocity_scales(params)
+    residual = jnp.max(jnp.where(aero_zone(params), jnp.abs(bemt_residuals(lam, params)), 0.0))
+    return SolvedLoads(jnp.squeeze(thrust(V_i, params)), jnp.squeeze(torque(V_i, params)), residual, V_i_0)
+
+def loads_with_loss_in_solve(params) -> SolvedLoads:
+    """
+    Post-processing: the loads of a solved state with the Prandtl factors in the BEMT solve, for any value of
+    Inputs.loss_in_solve in the design. params.V_i_0 is the start of the solve. The design and params do not change.
+    The factors follow tip_loss_model and root_loss_model. JAX only, for one flight condition (Propeller.condition).
+    """
+    return _solved_loads(dataclasses.replace(params, cfg=dataclasses.replace(params.cfg, loss_in_solve=1)))
 
 def mechanicalPower(V_i, params):
     '''

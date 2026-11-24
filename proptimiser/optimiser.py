@@ -20,6 +20,7 @@ from . import airflow
 from . import airfoil
 from . import geometry
 from . import propmodel
+from . import structure
 
 _stop_event = threading.Event()
 _sigint_installed = False
@@ -78,7 +79,8 @@ def objectives(params):
 #   objective    J = sum_i w_i P_i / sum_i w_i P_ideal,i   motor power relative to the ideal (actuator disc) power of
 #                                                            the thrust targets; ~1/efficiency, proportional to energy
 #   constraints  g >= 0, each relative to its own limit:    thrust within +/- thrust_tol of the target, motor power
-#                                                            below P_max, ESC duty below 1, section t/c above min_tc, load-weighted
+#                                                            below P_max, ESC duty below 1, section t/c above min_tc, structural
+#                                                            safety factor above min_safety_factor, load-weighted
 #                                                            NeuralFoil confidence above min_confidence (see
 #                                                            constraint_values)
 
@@ -90,6 +92,7 @@ class ConditionOutputs(NamedTuple):
     log_load: jnp.ndarray       # per station: log of the section dynamic-pressure weight, sum over psi of V_R^2 dr dpsi
     log_load_confidence: jnp.ndarray  # per station: log of the same sum weighted by the NeuralFoil confidence
     V_i_0: jnp.ndarray          # solved induced velocity (warm start for the next evaluation)
+    V_i: jnp.ndarray            # induced velocity field of the solve, with its gradient (for the structural loads)
 
 def _trapezoid_weights(x):
     """
@@ -133,7 +136,7 @@ def condition_outputs(params) -> ConditionOutputs:
                 + jnp.log(_periodic_weights(params.psi))[None, :])
     return ConditionOutputs(motor_power, thrust, propmodel.actuator_disk_power(params.thrust_target, params), duty,
                             jax.nn.logsumexp(log_load, axis=1), jax.nn.logsumexp(log_load + log_confidence, axis=1),
-                            V_i_0)
+                            V_i_0, V_i)
 
 @jax.jit
 def evaluate_all_conditions(params_struct) -> ConditionOutputs:
@@ -151,6 +154,15 @@ def energy_ratio(outputs, params_struct):
     w = params_struct.objective_weight
     return jnp.sum(w * outputs.power) / jnp.sum(w * outputs.ideal_power)
 
+def stress_utilisation(params, V_i, layup):
+    """
+    Stress over the allowable stress of ONE flight condition, per station (n_r - 1,): the largest value over the
+    azimuth of 1 / safety_factor (structure.stress_fields). V_i is the induced velocity of the solve, so the gradient
+    includes the change of the air loads. The tip station has no load and is not in the result.
+    """
+    result = structure.structural_loads(params, layup, V_i=V_i)
+    return jnp.max(1.0 / structure.stress_fields(result, layup).safety_factor[:, :-1], axis=0)
+
 def constraint_values(outputs, params_struct, space):
     """
     Inequality constraints g >= 0, each relative to its own limit, concatenated in the order of
@@ -166,6 +178,12 @@ def constraint_values(outputs, params_struct, space):
     to first order at the limit. NeuralFoil's confidence is a sigmoid that saturates at zero far outside its
     training data, where the relative form has no gradient; the log tends to the network's logit there, which
     still points back towards the data. relative_margins() maps it back for reporting.
+
+    The structural limit is one constraint per station and condition: 1 - min_safety_factor * stress / allowable
+    (stress_utilisation). One value per station lets the solver size the chord of each station. The largest value
+    of the blade alone has a gradient at one station only. Only the aerodynamic stations have the limit: the hub
+    section and the blend zone follow from hub_chord and hub_cst, which are inputs. Check them with
+    results.structural_summary.
     """
     cfg = params_struct.cfg
     rel_thrust = outputs.thrust / params_struct.thrust_target - 1.0
@@ -174,6 +192,9 @@ def constraint_values(outputs, params_struct, space):
         g.append(geometry.max_thickness(params_struct.cst[0, 1:]) / space.min_tc - 1.0)
     if space.duty_active:
         g.append(1.0 - outputs.duty)
+    if space.stress_active:
+        utilisation = jax.vmap(stress_utilisation, in_axes=(0, 0, None))(params_struct, outputs.V_i, space.layup)
+        g.append(1.0 - space.min_safety_factor * utilisation[:, np.array(space.stress_stations)].ravel())
     if space.confidence_active:
         aero = np.array(space.aero_stations)
         g.append(jax.nn.logsumexp(outputs.log_load_confidence[:, aero], axis=1)
@@ -217,11 +238,11 @@ def problem_values(vars_scaled, params_struct, space):
 def penalty(g, params_struct, space):
     """
     Quadratic penalty on constraint violations for bound-constrained solvers (L-BFGS-B): thrust and motor power
-    weighted by w_thrust, thickness by w_thickness, confidence by w_confidence.
+    stress weighted by w_thrust, thickness by w_thickness, confidence by w_confidence.
     """
     cfg = params_struct.cfg
     weights = {"thrust (upper)": cfg.w_thrust, "thrust (lower)": cfg.w_thrust, "motor power": cfg.w_thrust, "motor duty": cfg.w_thrust,
-               "thickness": cfg.w_thickness, "confidence": cfg.w_confidence}
+               "stress": cfg.w_thrust, "thickness": cfg.w_thickness, "confidence": cfg.w_confidence}
     total, start = 0.0, 0
     for name, size in space.constraint_groups(params_struct.omega.shape[0]):
         shortfall = jax.nn.relu(-g[start:start + size]) ** 2
@@ -281,6 +302,10 @@ class DesignSpace(eqx.Module):
     aero_stations: tuple = eqx.field(static=True)       # radial stations in the aerodynamic zone (r >= r_aero)
     confidence_active: bool = eqx.field(static=True)    # NeuralFoil confidence constraint in use
     duty_active: bool = eqx.field(static=True)          # ESC duty limit in use (Inputs.V_bus > 0)
+    stress_active: bool = eqx.field(static=True)        # structural limit in use (Inputs.min_safety_factor > 0)
+    min_safety_factor: float = eqx.field(static=True)
+    stress_stations: tuple = eqx.field(static=True)     # aerodynamic stations without the tip: the stress constraint
+    layup: structure.Layup                              # section regions for the structural limit
 
     @classmethod
     def build(cls, prop):
@@ -336,6 +361,10 @@ class DesignSpace(eqx.Module):
             aero_stations=tuple(int(i) for i in np.flatnonzero(r >= blade.R_aero)),
             confidence_active=inputs.coeff_method == 3 and inputs.min_confidence > 0,
             duty_active=inputs.V_bus > 0,
+            stress_active=inputs.min_safety_factor > 0,
+            min_safety_factor=float(inputs.min_safety_factor),
+            stress_stations=tuple(int(i) for i in np.flatnonzero(r >= blade.R_aero) if i < len(r) - 1),
+            layup=prop.material(),
         )
 
     def constraint_groups(self, n_cond):
@@ -347,6 +376,8 @@ class DesignSpace(eqx.Module):
             groups.append(("thickness", len(self.seed["cst"])))
         if self.duty_active:
             groups.append(("motor duty", n_cond))
+        if self.stress_active:
+            groups.append(("stress", n_cond * len(self.stress_stations)))
         if self.confidence_active:
             groups.append(("confidence", n_cond))
         return groups
